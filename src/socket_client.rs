@@ -28,6 +28,16 @@ pub fn check_port<T: std::string::ToString>(host: T, port: i32) -> String {
 }
 
 #[inline]
+pub fn check_port_non_empty<T: std::string::ToString>(host: T, port: i32) -> Option<String> {
+    let host = host.to_string();
+    let host = host.trim();
+    if host.is_empty() {
+        return None;
+    }
+    Some(check_port(host, port))
+}
+
+#[inline]
 pub fn increase_port<T: std::string::ToString>(host: T, offset: i32) -> String {
     let host = host.to_string();
     if crate::is_ipv6_str(&host) {
@@ -336,6 +346,12 @@ mod tests {
         assert_eq!(check_port("1.1.1.1", 32), "1.1.1.1:32");
         assert_eq!(check_port("1.1.1.1:32", 32), "1.1.1.1:32");
         assert_eq!(check_port("test.com:32", 0), "test.com:32");
+        assert_eq!(check_port_non_empty("", 32), None);
+        assert_eq!(check_port_non_empty("  ", 32), None);
+        assert_eq!(
+            check_port_non_empty("1.1.1.1", 32),
+            Some("1.1.1.1:32".to_owned())
+        );
         assert_eq!(increase_port("[1:2]:12", 1), "[1:2]:13");
         assert_eq!(increase_port("1.2.2.4:12", 1), "1.2.2.4:13");
         assert_eq!(increase_port("1.2.2.4", 1), "1.2.2.4");

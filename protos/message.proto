@@ -804,6 +804,7 @@ message ElevationRequest {
 
 message SwitchSidesRequest {
   bytes uuid = 1;
+  repeated string direct_endpoints = 2;
 }
 
 message SwitchSidesResponse {
