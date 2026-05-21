@@ -88,6 +88,17 @@ pub fn format_full_version(version: &str) -> String {
     format!("{version} rev {}", rustadmin_revision())
 }
 
+fn read_revision_file<P: AsRef<Path>>(path: P) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn build_rustadmin_revision() -> String {
+    read_revision_file("rustadmin_revision.txt").unwrap_or_else(|| rustadmin_revision().to_owned())
+}
+
 #[inline]
 pub async fn sleep(sec: f32) {
     tokio::time::sleep(time::Duration::from_secs_f32(sec)).await;
@@ -243,7 +254,7 @@ pub fn gen_version() {
     println!("cargo:rerun-if-changed=rustadmin_revision.txt");
     use std::io::prelude::*;
     let mut file = File::create("./src/version.rs").unwrap();
-    let revision = rustadmin_revision();
+    let revision = build_rustadmin_revision();
     for line in read_lines("Cargo.toml").unwrap().flatten() {
         let ab: Vec<&str> = line.split('=').map(|x| x.trim()).collect();
         if ab.len() == 2 && ab[0] == "version" {
@@ -556,6 +567,24 @@ pub fn time_based_rand() -> u32 {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn test_read_revision_file() {
+        let path = std::env::temp_dir().join(format!(
+            "rustadmin_revision_test_{}_{}",
+            std::process::id(),
+            time_based_rand()
+        ));
+
+        std::fs::write(&path, " 123 \n").unwrap();
+        assert_eq!(read_revision_file(&path), Some("123".to_owned()));
+
+        std::fs::write(&path, " \n\t").unwrap();
+        assert_eq!(read_revision_file(&path), None);
+
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(read_revision_file(&path), None);
+    }
 
     #[test]
     fn test_mangle() {
