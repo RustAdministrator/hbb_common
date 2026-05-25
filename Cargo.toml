@@ -30,20 +30,20 @@ serde_derive = "1.0"
 serde = "1.0"
 serde_json = "1.0"
 lazy_static = "1.5"
-confy = { git = "https://github.com/rustdesk-org/confy" }
 dirs-next = "2.0"
 filetime = "0.2"
 sodiumoxide = "0.2"
 regex = "1.11"
-tokio-socks = { git = "https://github.com/rustdesk-org/tokio-socks" }
+tokio-socks = "=0.5.2"
+fast-socks5 = "=1.0.0"
 chrono = "0.4"
 backtrace = "0.3"
 libc = "0.2"
 dlopen = "0.1"
 toml = "0.7"
+toml05 = { package = "toml", version = "=0.5.11" }
 uuid = { version = "1.16", features = ["v4"] }
-# new sysinfo issue: https://github.com/rustdesk/rustdesk/pull/6330#issuecomment-2270871442
-sysinfo = { git = "https://github.com/rustdesk-org/sysinfo", branch = "rlim_max" }
+sysinfo = "=0.29.10"
 # new flexi_logger failed on nightly rustc 1.75 for x86
 thiserror = "1.0"
 httparse = "1.10"
@@ -71,7 +71,7 @@ libloading = "0.8"
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 mac_address = "1.1"
 default_net = { git = "https://github.com/rustdesk-org/default_net" }
-machine-uid = { git = "https://github.com/rustdesk-org/machine-uid" }
+machine-uid = "=0.3.0"
 
 [build-dependencies]
 protobuf-codegen = { version = "3.7" }

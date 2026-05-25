@@ -702,36 +702,80 @@ impl BootstrapConfig {
 pub fn load_path<T: serde::Serialize + serde::de::DeserializeOwned + Default + std::fmt::Debug>(
     file: PathBuf,
 ) -> T {
-    let cfg = match confy::load_path(&file) {
-        Ok(config) => config,
+    let cfg_string = match fs::read_to_string(&file) {
+        Ok(cfg_string) => cfg_string,
         Err(err) => {
-            if let confy::ConfyError::GeneralLoadError(err) = &err {
-                if err.kind() == std::io::ErrorKind::NotFound {
-                    return T::default();
-                }
+            if err.kind() == std::io::ErrorKind::NotFound {
+                return T::default();
             }
-            log::error!("Failed to load config '{}': {}", file.display(), err);
-            T::default()
+            log::error!("Failed to read config '{}': {}", file.display(), err);
+            return T::default();
         }
     };
-    cfg
+    toml05::from_str(&cfg_string).unwrap_or_else(|err| {
+        log::error!("Failed to load config '{}': {}", file.display(), err);
+        T::default()
+    })
 }
 
 #[inline]
 pub fn store_path<T: serde::Serialize>(path: PathBuf, cfg: T) -> crate::ResultType<()> {
+    let cfg = toml05::to_string_pretty(&cfg)?;
     #[cfg(not(windows))]
     {
-        use std::os::unix::fs::PermissionsExt;
-        Ok(confy::store_path_perms(
-            path,
-            cfg,
-            fs::Permissions::from_mode(0o600),
-        )?)
+        store_path_atomic(path, cfg.as_bytes(), Some(0o600))
     }
     #[cfg(windows)]
     {
-        Ok(confy::store_path(path, cfg)?)
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        Ok(fs::write(path, cfg)?)
     }
+}
+
+#[cfg(not(windows))]
+fn store_path_atomic(path: PathBuf, bytes: &[u8], mode: Option<u32>) -> crate::ResultType<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(mode);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+
+    let mut index = 0u32;
+    let mut path_tmp = path.clone();
+    let mut file = loop {
+        index = index.saturating_add(1);
+        let timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|x| x.as_nanos())
+            .unwrap_or(index as u128);
+        path_tmp.set_extension(format!(
+            "{}_{:?}_{}",
+            std::process::id(),
+            std::thread::current().id(),
+            timestamp
+        ));
+        match options.open(&path_tmp) {
+            Ok(file) => break file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && index < 32 => {}
+            Err(err) => return Err(err.into()),
+        }
+    };
+
+    file.write_all(bytes)?;
+    file.flush()?;
+    drop(file);
+    fs::rename(path_tmp, path)?;
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -2129,37 +2173,22 @@ const PEERS: &str = "peers";
 impl PeerConfig {
     pub fn load(id: &str) -> PeerConfig {
         let _lock = CONFIG.read().unwrap();
-        match confy::load_path(Self::path(id)) {
-            Ok(config) => {
-                let mut config: PeerConfig = config;
-                let mut store = false;
-                let (password, _, store2) =
-                    decrypt_vec_or_original(&config.password, PASSWORD_ENC_VERSION);
-                config.password = password;
+        let mut config: PeerConfig = load_path(Self::path(id));
+        let mut store = false;
+        let (password, _, store2) = decrypt_vec_or_original(&config.password, PASSWORD_ENC_VERSION);
+        config.password = password;
+        store = store || store2;
+        for opt in ["rdp_password", "os-username", "os-password"] {
+            if let Some(v) = config.options.get_mut(opt) {
+                let (encrypted, _, store2) = decrypt_str_or_original(v, PASSWORD_ENC_VERSION);
+                *v = encrypted;
                 store = store || store2;
-                for opt in ["rdp_password", "os-username", "os-password"] {
-                    if let Some(v) = config.options.get_mut(opt) {
-                        let (encrypted, _, store2) =
-                            decrypt_str_or_original(v, PASSWORD_ENC_VERSION);
-                        *v = encrypted;
-                        store = store || store2;
-                    }
-                }
-                if store {
-                    config.store_(id);
-                }
-                config
-            }
-            Err(err) => {
-                if let confy::ConfyError::GeneralLoadError(err) = &err {
-                    if err.kind() == std::io::ErrorKind::NotFound {
-                        return Default::default();
-                    }
-                }
-                log::error!("Failed to load peer config '{}': {}", id, err);
-                Default::default()
             }
         }
+        if store {
+            config.store_(id);
+        }
+        config
     }
 
     pub fn store(&self, id: &str) {
@@ -2735,13 +2764,7 @@ pub struct LanPeers {
 impl LanPeers {
     pub fn load() -> LanPeers {
         let _lock = CONFIG.read().unwrap();
-        match confy::load_path(Config::file_("_lan_peers")) {
-            Ok(peers) => peers,
-            Err(err) => {
-                log::error!("Failed to load lan peers: {}", err);
-                Default::default()
-            }
-        }
+        load_path(Config::file_("_lan_peers"))
     }
 
     pub fn store(peers: &[DiscoveryPeer]) {

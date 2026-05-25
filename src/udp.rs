@@ -1,17 +1,23 @@
 use crate::ResultType;
 use anyhow::{anyhow, Context};
 use bytes::{Bytes, BytesMut};
+use fast_socks5::{client::Socks5Datagram, util::target_addr::TargetAddr as FastTargetAddr};
 use futures::{SinkExt, StreamExt};
 use protobuf::Message;
 use socket2::{Domain, Socket, Type};
 use std::net::SocketAddr;
-use tokio::net::{lookup_host, ToSocketAddrs, UdpSocket};
-use tokio_socks::{udp::Socks5UdpFramed, IntoTargetAddr, TargetAddr, ToProxyAddrs};
+use tokio::net::{lookup_host, TcpStream, ToSocketAddrs, UdpSocket};
+use tokio_socks::{IntoTargetAddr, TargetAddr};
 use tokio_util::{codec::BytesCodec, udp::UdpFramed};
 
 pub enum FramedSocket {
     Direct(UdpFramed<BytesCodec>),
-    ProxySocks(Socks5UdpFramed),
+    ProxySocks(Socks5UdpSocket),
+}
+
+pub struct Socks5UdpSocket {
+    framed: Socks5Datagram<TcpStream>,
+    recv_buf: Vec<u8>,
 }
 
 fn new_socket(addr: SocketAddr, reuse: bool, buf_size: usize) -> Result<Socket, std::io::Error> {
@@ -65,19 +71,19 @@ impl FramedSocket {
         )))
     }
 
-    pub async fn new_proxy<'a, 't, P: ToProxyAddrs, T: ToSocketAddrs>(
-        proxy: P,
+    pub async fn new_proxy<'a, T: ToSocketAddrs>(
+        proxy: &str,
         local: T,
         username: &'a str,
         password: &'a str,
         ms_timeout: u64,
     ) -> ResultType<Self> {
         let framed = if username.trim().is_empty() {
-            super::timeout(ms_timeout, Socks5UdpFramed::connect(proxy, Some(local))).await??
+            super::timeout(ms_timeout, Socks5UdpSocket::connect(proxy, local)).await??
         } else {
             super::timeout(
                 ms_timeout,
-                Socks5UdpFramed::connect_with_password(proxy, Some(local), username, password),
+                Socks5UdpSocket::connect_with_password(proxy, local, username, password),
             )
             .await??
         };
@@ -103,7 +109,7 @@ impl FramedSocket {
                     f.send((send_data, addr)).await?
                 }
             }
-            Self::ProxySocks(f) => f.send((send_data, addr)).await?,
+            Self::ProxySocks(f) => f.send(send_data, addr).await?,
         };
         Ok(())
     }
@@ -123,7 +129,7 @@ impl FramedSocket {
                     f.send((Bytes::from(msg), addr)).await?
                 }
             }
-            Self::ProxySocks(f) => f.send((Bytes::from(msg), addr)).await?,
+            Self::ProxySocks(f) => f.send(Bytes::from(msg), addr).await?,
         };
         Ok(())
     }
@@ -138,11 +144,7 @@ impl FramedSocket {
                 Some(Err(e)) => Some(Err(anyhow!(e))),
                 None => None,
             },
-            Self::ProxySocks(f) => match f.next().await {
-                Some(Ok((data, _))) => Some(Ok((data.data, data.dst_addr))),
-                Some(Err(e)) => Some(Err(anyhow!(e))),
-                None => None,
-            },
+            Self::ProxySocks(f) => Some(f.next().await),
         }
     }
 
@@ -161,11 +163,75 @@ impl FramedSocket {
     }
 
     pub fn local_addr(&self) -> Option<SocketAddr> {
-        if let FramedSocket::Direct(x) = self {
-            if let Ok(v) = x.get_ref().local_addr() {
-                return Some(v);
-            }
+        match self {
+            FramedSocket::Direct(x) => x.get_ref().local_addr().ok(),
+            FramedSocket::ProxySocks(x) => x.local_addr().ok(),
         }
-        None
+    }
+}
+
+impl Socks5UdpSocket {
+    async fn connect<T: ToSocketAddrs>(proxy: &str, local: T) -> ResultType<Self> {
+        let stream = TcpStream::connect(proxy).await?;
+        let socket = UdpSocket::bind(local).await?;
+        Ok(Self {
+            framed: Socks5Datagram::use_socket(stream, socket).await?,
+            recv_buf: vec![0; 64 * 1024],
+        })
+    }
+
+    async fn connect_with_password<T: ToSocketAddrs>(
+        proxy: &str,
+        local: T,
+        username: &str,
+        password: &str,
+    ) -> ResultType<Self> {
+        let stream = TcpStream::connect(proxy).await?;
+        let socket = UdpSocket::bind(local).await?;
+        Ok(Self {
+            framed: Socks5Datagram::use_socket_with_password(stream, socket, username, password)
+                .await?,
+            recv_buf: vec![0; 64 * 1024],
+        })
+    }
+
+    async fn send(&self, data: Bytes, addr: TargetAddr<'static>) -> ResultType<()> {
+        self.framed
+            .send_to(&data, to_fast_target_addr(addr)?)
+            .await?;
+        Ok(())
+    }
+
+    async fn next(&mut self) -> ResultType<(BytesMut, TargetAddr<'static>)> {
+        let (len, addr) = self.framed.recv_from(&mut self.recv_buf).await?;
+        Ok((
+            BytesMut::from(&self.recv_buf[..len]),
+            from_fast_target_addr(addr),
+        ))
+    }
+
+    fn socks_addr(&self) -> String {
+        self.framed
+            .proxy_addr()
+            .map(|addr| addr.to_string())
+            .unwrap_or_default()
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.framed.get_ref().local_addr()
+    }
+}
+
+fn to_fast_target_addr(addr: TargetAddr<'static>) -> ResultType<FastTargetAddr> {
+    match addr {
+        TargetAddr::Ip(addr) => Ok(FastTargetAddr::Ip(addr)),
+        TargetAddr::Domain(domain, port) => Ok(FastTargetAddr::Domain(domain.into_owned(), port)),
+    }
+}
+
+fn from_fast_target_addr(addr: FastTargetAddr) -> TargetAddr<'static> {
+    match addr {
+        FastTargetAddr::Ip(addr) => TargetAddr::Ip(addr),
+        FastTargetAddr::Domain(domain, port) => TargetAddr::Domain(domain.into(), port),
     }
 }

@@ -531,7 +531,7 @@ pub const VER_TYPE_RUSTDESK_CLIENT: &str = "rustdesk-client";
 pub const VER_TYPE_RUSTDESK_SERVER: &str = "rustdesk-server";
 
 pub fn version_check_request(typ: String) -> (VersionCheckRequest, String) {
-    use sysinfo::System;
+    use sysinfo::{System, SystemExt};
     let system = System::new();
     let os = system.distribution_id();
     let os_version = system.os_version().unwrap_or_default();
