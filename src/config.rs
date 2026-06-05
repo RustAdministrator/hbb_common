@@ -671,6 +671,27 @@ impl Config2 {
         lock.store();
         true
     }
+
+    pub fn normalize_imported_options(&mut self) {
+        let mut rejected_keys = Vec::new();
+        for (key, value) in self.options.iter_mut() {
+            if !Config::is_encrypted_option(key) || value.is_empty() {
+                continue;
+            }
+            let (plain, decrypted, should_store) =
+                decrypt_str_or_original(value, PASSWORD_ENC_VERSION);
+            if !decrypted && !should_store {
+                continue;
+            }
+            *value = plain;
+            if !Config::maybe_encrypt_option_value(key, value) {
+                rejected_keys.push(key.clone());
+            }
+        }
+        for key in rejected_keys {
+            self.options.remove(&key);
+        }
+    }
 }
 
 impl BootstrapConfig {
@@ -4247,6 +4268,61 @@ mod tests {
         assert_eq!(Config::get_option(&key), original);
 
         *CONFIG2.write().unwrap() = saved_config2;
+    }
+
+    #[test]
+    fn test_normalize_imported_options_encrypts_plaintext_pairing_passphrase() {
+        let _config_guard = lock_test_config();
+
+        let key = keys::OPTION_DIRECT_ACCESS_PAIRING_PASSPHRASE.to_owned();
+        let mut config2 = Config2::default();
+        config2
+            .options
+            .insert(key.clone(), "local-secret".to_owned());
+
+        config2.normalize_imported_options();
+
+        let stored = config2.options.get(&key).cloned().unwrap_or_default();
+        assert_ne!(stored, "local-secret");
+        let mut decrypted = stored;
+        Config::maybe_decrypt_option_value(&key, &mut decrypted);
+        assert_eq!(decrypted, "local-secret");
+    }
+
+    #[test]
+    fn test_normalize_imported_options_reencrypts_decryptable_pairing_passphrase() {
+        let _config_guard = lock_test_config();
+
+        let key = keys::OPTION_PEER_PAIRING_PASSPHRASE.to_owned();
+        let mut config2 = Config2::default();
+        config2.options.insert(
+            key.clone(),
+            encrypt_str_or_original("peer-secret", PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN),
+        );
+
+        config2.normalize_imported_options();
+
+        let mut decrypted = config2.options.get(&key).cloned().unwrap_or_default();
+        Config::maybe_decrypt_option_value(&key, &mut decrypted);
+        assert_eq!(decrypted, "peer-secret");
+    }
+
+    #[test]
+    fn test_normalize_imported_options_keeps_undecryptable_ciphertext() {
+        let _config_guard = lock_test_config();
+
+        let key = keys::OPTION_DIRECT_ACCESS_PAIRING_PASSPHRASE.to_owned();
+        let payload = vec![0u8; sodiumoxide::crypto::secretbox::MACBYTES];
+        let encrypted_looking =
+            PASSWORD_ENC_VERSION.to_owned() + &base64::encode(payload, base64::Variant::Original);
+        let mut config2 = Config2::default();
+        config2
+            .options
+            .insert(key.clone(), encrypted_looking.clone());
+
+        config2.normalize_imported_options();
+
+        assert_eq!(config2.options.get(&key), Some(&encrypted_looking));
     }
 
     #[test]
