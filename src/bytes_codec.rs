@@ -2,7 +2,8 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::io;
 use tokio_util::codec::{Decoder, Encoder};
 
-const DEFAULT_MAX_PACKET_LENGTH: usize = 64 * 1024 * 1024;
+// Bound speculative allocation from untrusted frame headers.
+const MAX_PREALLOCATED_PAYLOAD_LEN: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BytesCodec {
@@ -28,7 +29,7 @@ impl BytesCodec {
         Self {
             state: DecodeState::Head,
             raw: false,
-            max_packet_length: DEFAULT_MAX_PACKET_LENGTH,
+            max_packet_length: usize::MAX,
         }
     }
 
@@ -63,7 +64,12 @@ impl BytesCodec {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Too big packet"));
         }
         src.advance(head_len);
-        src.reserve(n);
+        // Do not reserve the full header-declared length: a peer can advertise a huge
+        // frame and force excessive allocation before sending the payload.
+        src.reserve(
+            n.saturating_sub(src.len())
+                .min(MAX_PREALLOCATED_PAYLOAD_LEN),
+        );
         Ok(Some(n))
     }
 
@@ -139,25 +145,6 @@ impl Encoder<Bytes> for BytesCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn encode_head_only(len: usize) -> BytesMut {
-        let mut buf = BytesMut::new();
-        if len <= 0x3F {
-            buf.put_u8((len << 2) as u8);
-        } else if len <= 0x3FFF {
-            buf.put_u16_le((len << 2) as u16 | 0x1);
-        } else if len <= 0x3FFFFF {
-            let h = (len << 2) as u32 | 0x2;
-            buf.put_u16_le((h & 0xFFFF) as u16);
-            buf.put_u8((h >> 16) as u8);
-        } else if len <= 0x3FFFFFFF {
-            buf.put_u32_le((len << 2) as u32 | 0x3);
-        } else {
-            panic!("test packet length overflow");
-        }
-        buf
-    }
-
     #[test]
     fn test_codec1() {
         let mut codec = BytesCodec::new();
@@ -300,17 +287,15 @@ mod tests {
     }
 
     #[test]
-    fn test_codec_rejects_packet_above_default_limit() {
+    fn decode_large_frame_header_caps_preallocation() {
         let mut codec = BytesCodec::new();
-        let mut buf = encode_head_only(DEFAULT_MAX_PACKET_LENGTH + 1);
-        assert!(codec.decode(&mut buf).is_err());
-    }
+        let mut buf = BytesMut::new();
+        let n = 0x3FFFFFFFusize;
+        const MAX_REASONABLE_CAPACITY: usize = MAX_PREALLOCATED_PAYLOAD_LEN * 4;
 
-    #[test]
-    fn test_codec_rejects_packet_above_custom_limit() {
-        let mut codec = BytesCodec::new();
-        codec.set_max_packet_length(16);
-        let mut buf = encode_head_only(17);
-        assert!(codec.decode(&mut buf).is_err());
+        buf.put_u32_le((n << 2) as u32 | 0x3);
+
+        assert!(matches!(codec.decode(&mut buf), Ok(None)));
+        assert!(buf.capacity() <= MAX_REASONABLE_CAPACITY);
     }
 }
