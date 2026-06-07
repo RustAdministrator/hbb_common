@@ -1228,7 +1228,7 @@ impl Config {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub fn ipc_path_for_uid(uid: u32, postfix: &str) -> String {
         let mut path = ipc_parent_dir_for_uid(uid, postfix);
         path.push(format!("ipc{postfix}"));
@@ -4005,7 +4005,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn test_service_ipc_path_is_shared_across_uids() {
         assert!(is_service_ipc_postfix("_service"));
         assert!(is_service_ipc_postfix("_uinput_keyboard"));
