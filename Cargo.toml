@@ -1,6 +1,6 @@
 [package]
 name = "hbb_common"
-version = "2.0.1"
+version = "2.0.2"
 authors = ["open-trade <info@opentradesolutions.com>"]
 edition = "2018"
 
