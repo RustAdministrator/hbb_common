@@ -722,6 +722,34 @@ message TestDelay {
   uint32 target_bitrate = 4;
 }
 
+message VideoReceiverStats {
+  int32 display = 1;
+  uint64 first_frame_id = 2;
+  uint64 last_frame_id = 3;
+  uint64 frames_received = 4;
+  uint64 frames_decoded = 5;
+  uint64 frames_rendered = 6;
+  uint64 frames_dropped = 7;
+  uint64 bytes_received = 8;
+  uint64 skipped_frame_ids = 9;
+  uint32 decode_queue_len = 10;
+  uint32 render_queue_len = 11;
+  uint32 decode_ms_avg = 12;
+  uint32 decode_ms_p95 = 13;
+  uint64 freeze_count = 14;
+  uint32 last_render_age_ms = 15;
+  uint32 interval_ms = 16;
+  uint64 encoded_frames_received = 17;
+  uint64 keyframes_received = 18;
+  uint64 decode_errors = 19;
+}
+
+message VideoKeyframeRequest {
+  int32 display = 1;
+  uint64 last_frame_id = 2;
+  uint32 reason = 3;
+}
+
 message PublicKey {
   bytes asymmetric_value = 1;
   bytes symmetric_value = 2;
@@ -886,6 +914,8 @@ message Misc {
     DebugEvent debug_event = 39;
     SessionPermissionRequest session_permission_request = 40;
     SessionPermissionResponse session_permission_response = 41;
+    VideoReceiverStats video_receiver_stats = 44;
+    VideoKeyframeRequest video_keyframe_request = 45;
   }
   uint64 video_ack_frame_id = 42;
   int32 video_ack_display = 43;

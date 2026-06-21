@@ -556,6 +556,24 @@ mod tests {
             .iter()
             .all(|len| *len <= TCP_PATH_MTU_WRITE_CHUNK_LIMIT));
     }
+
+    #[test]
+    fn framed_stream_pacing_decision_respects_raw_streams() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let stream = RecordingWrites { writes };
+        let mut framed = FramedStream(
+            Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::new()),
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            0,
+        );
+
+        assert!(!framed.should_send_paced(TCP_PATH_MTU_PACED_WRITE_THRESHOLD));
+        assert!(framed.should_send_paced(TCP_PATH_MTU_PACED_WRITE_THRESHOLD + 1));
+
+        framed.set_raw();
+        assert!(!framed.should_send_paced(TCP_PATH_MTU_PACED_WRITE_THRESHOLD + 1));
+    }
 }
 
 impl Encrypt {
