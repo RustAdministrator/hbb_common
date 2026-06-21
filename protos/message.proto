@@ -33,6 +33,7 @@ message VideoFrame {
     EncodedVideoFrames av1s = 13;
   }
   int32 display = 14;
+  uint64 frame_id = 15;
 }
 
 message IdPk {
@@ -120,6 +121,7 @@ message SupportedEncoding {
   bool vp8 = 3;
   bool av1 = 4;
   CodecAbility i444 = 5;
+  bool av1_vulkan = 6;
 }
 
 message PeerInfo {
@@ -671,6 +673,7 @@ message SupportedDecoding {
     H265 = 3;
     VP8 = 4;
     AV1 = 5;
+    AV1Vulkan = 6;
   }
 
   int32 ability_vp9 = 1;
@@ -884,6 +887,8 @@ message Misc {
     SessionPermissionRequest session_permission_request = 40;
     SessionPermissionResponse session_permission_response = 41;
   }
+  uint64 video_ack_frame_id = 42;
+  int32 video_ack_display = 43;
 }
 
 message VoiceCallRequest {

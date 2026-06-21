@@ -12,17 +12,25 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     ops::{Deref, DerefMut},
     pin::Pin,
+    sync::atomic::{AtomicUsize, Ordering},
     task::{Context, Poll},
+    time::Duration,
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
-    net::{lookup_host, TcpListener, TcpSocket, ToSocketAddrs},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
+    net::{lookup_host, TcpListener, TcpSocket, TcpStream, ToSocketAddrs},
 };
 use tokio_socks::IntoTargetAddr;
 use tokio_util::codec::Framed;
 
 pub trait TcpStreamTrait: AsyncRead + AsyncWrite + Unpin {}
 pub struct DynTcpStream(pub Box<dyn TcpStreamTrait + Send + Sync>);
+
+const TCP_PATH_MTU_WRITE_CHUNK_LIMIT: usize = 1200;
+const TCP_PATH_MTU_MSS_CAP: u32 = TCP_PATH_MTU_WRITE_CHUNK_LIMIT as u32;
+const TCP_PATH_MTU_PACED_WRITE_THRESHOLD: usize = TCP_PATH_MTU_WRITE_CHUNK_LIMIT * 2;
+const TCP_PATH_MTU_PACED_WRITE_DELAY: Duration = Duration::from_millis(1);
+static TCP_PATH_MTU_PACED_WRITE_LOGS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone)]
 pub struct Encrypt(pub Key, pub u64, pub u64);
@@ -99,7 +107,7 @@ impl FramedStream {
                 if let Ok(Ok(stream)) =
                     super::timeout(ms_timeout, socket.connect(remote_addr)).await
                 {
-                    stream.set_nodelay(true).ok();
+                    configure_connected_tcp_stream(&stream, "connect");
                     let addr = stream.local_addr()?;
                     return Ok(Self(
                         Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::new()),
@@ -134,7 +142,8 @@ impl FramedStream {
         self.3 = ms;
     }
 
-    pub fn from(stream: impl TcpStreamTrait + Send + Sync + 'static, addr: SocketAddr) -> Self {
+    pub fn from(stream: TcpStream, addr: SocketAddr) -> Self {
+        configure_connected_tcp_stream(&stream, "accepted");
         Self(
             Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::new()),
             addr,
@@ -169,10 +178,55 @@ impl FramedStream {
 
     #[inline]
     pub async fn send_bytes(&mut self, bytes: Bytes) -> ResultType<()> {
+        if self.should_send_paced(bytes.len()) {
+            if self.3 > 0 {
+                super::timeout(self.3, self.send_bytes_paced(bytes)).await??;
+            } else {
+                self.send_bytes_paced(bytes).await?;
+            }
+            return Ok(());
+        }
         if self.3 > 0 {
             super::timeout(self.3, self.0.send(bytes)).await??;
         } else {
             self.0.send(bytes).await?;
+        }
+        Ok(())
+    }
+
+    fn should_send_paced(&self, len: usize) -> bool {
+        len > TCP_PATH_MTU_PACED_WRITE_THRESHOLD && !self.0.codec().is_raw()
+    }
+
+    async fn send_bytes_paced(&mut self, bytes: Bytes) -> io::Result<()> {
+        self.0.flush().await?;
+
+        let mut framed = BytesMut::with_capacity(bytes.len() + 4);
+        BytesCodec::encode_frame(self.0.codec().is_raw(), bytes, &mut framed)?;
+
+        let total_len = framed.len();
+        let chunk_count = total_len.div_ceil(TCP_PATH_MTU_WRITE_CHUNK_LIMIT);
+        let log_count = TCP_PATH_MTU_PACED_WRITE_LOGS.fetch_add(1, Ordering::Relaxed);
+        if log_count < 32 {
+            log::info!(
+                "tcp path mtu guard paced framed write: total_bytes={}, chunk_limit={}, chunks={}, local={}",
+                total_len,
+                TCP_PATH_MTU_WRITE_CHUNK_LIMIT,
+                chunk_count,
+                self.1
+            );
+        }
+
+        let stream = self.0.get_mut();
+        let mut offset = 0;
+        while offset < total_len {
+            let end = (offset + TCP_PATH_MTU_WRITE_CHUNK_LIMIT).min(total_len);
+            stream.write_all(&framed[offset..end]).await?;
+            stream.flush().await?;
+            offset = end;
+            if offset < total_len {
+                tokio::time::sleep(TCP_PATH_MTU_PACED_WRITE_DELAY).await;
+            }
         }
         Ok(())
     }
@@ -282,7 +336,8 @@ impl AsyncWrite for DynTcpStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        AsyncWrite::poll_write(Pin::new(&mut self.0), cx, buf)
+        let len = buf.len().min(TCP_PATH_MTU_WRITE_CHUNK_LIMIT);
+        AsyncWrite::poll_write(Pin::new(&mut self.0), cx, &buf[..len])
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -295,6 +350,213 @@ impl AsyncWrite for DynTcpStream {
 }
 
 impl<R: AsyncRead + AsyncWrite + Unpin> TcpStreamTrait for R {}
+
+fn configure_connected_tcp_stream(stream: &TcpStream, context: &str) {
+    if let Err(err) = stream.set_nodelay(true) {
+        log::warn!(
+            "tcp path mtu guard: failed to enable TCP_NODELAY: context={context}, err={err}"
+        );
+    }
+
+    let local = stream.local_addr().ok();
+    let peer = stream.peer_addr().ok();
+    if peer.map(|addr| addr.ip().is_loopback()).unwrap_or(false) {
+        return;
+    }
+
+    match set_tcp_maxseg(stream, TCP_PATH_MTU_MSS_CAP) {
+        Ok(()) => log::info!(
+            "tcp path mtu guard enabled: context={context}, write_chunk_cap={}, tcp_mss_cap={}, local={local:?}, peer={peer:?}",
+            TCP_PATH_MTU_WRITE_CHUNK_LIMIT,
+            TCP_PATH_MTU_MSS_CAP
+        ),
+        Err(err) => log::warn!(
+            "tcp path mtu guard write cap active but TCP_MAXSEG unavailable: context={context}, write_chunk_cap={}, tcp_mss_cap={}, local={local:?}, peer={peer:?}, err={err}",
+            TCP_PATH_MTU_WRITE_CHUNK_LIMIT,
+            TCP_PATH_MTU_MSS_CAP
+        ),
+    }
+}
+
+#[cfg(unix)]
+fn set_tcp_maxseg(stream: &TcpStream, mss: u32) -> io::Result<()> {
+    use std::{mem, os::unix::io::AsRawFd};
+
+    let value = mss as libc::c_int;
+    // SAFETY: `stream.as_raw_fd()` is a valid TCP socket fd owned by `stream`;
+    // `value` is passed with its exact size and lives for this call.
+    let rc = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_MAXSEG,
+            &value as *const _ as *const libc::c_void,
+            mem::size_of_val(&value) as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn set_tcp_maxseg(stream: &TcpStream, mss: u32) -> io::Result<()> {
+    use std::{mem, os::windows::io::AsRawSocket};
+    use winapi::{
+        shared::ws2def::IPPROTO_TCP,
+        um::winsock2::{setsockopt, SOCKET_ERROR},
+    };
+
+    const TCP_MAXSEG: i32 = 4;
+
+    let value = mss as i32;
+    // SAFETY: `stream.as_raw_socket()` is a valid TCP socket owned by `stream`;
+    // `value` is passed with its exact size and lives for this call.
+    let rc = unsafe {
+        setsockopt(
+            stream.as_raw_socket() as _,
+            IPPROTO_TCP as i32,
+            TCP_MAXSEG,
+            &value as *const _ as *const i8,
+            mem::size_of_val(&value) as i32,
+        )
+    };
+    if rc == SOCKET_ERROR {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn set_tcp_maxseg(_stream: &TcpStream, _mss: u32) -> io::Result<()> {
+    Err(io::Error::new(
+        ErrorKind::Unsupported,
+        "TCP_MAXSEG is not supported on this platform",
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::task::noop_waker_ref;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+
+    struct RecordingStream {
+        write_len: Arc<AtomicUsize>,
+    }
+
+    impl AsyncRead for RecordingStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for RecordingStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.write_len.store(buf.len(), Ordering::Relaxed);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn dyn_tcp_stream_caps_write_chunks() {
+        let write_len = Arc::new(AtomicUsize::new(0));
+        let mut stream = DynTcpStream(Box::new(RecordingStream {
+            write_len: write_len.clone(),
+        }));
+        let data = vec![0; TCP_PATH_MTU_WRITE_CHUNK_LIMIT + 321];
+        let waker = noop_waker_ref();
+        let mut cx = Context::from_waker(waker);
+
+        match AsyncWrite::poll_write(Pin::new(&mut stream), &mut cx, &data) {
+            Poll::Ready(Ok(n)) => assert_eq!(n, TCP_PATH_MTU_WRITE_CHUNK_LIMIT),
+            Poll::Ready(Err(err)) => panic!("write failed: {}", err),
+            Poll::Pending => panic!("write unexpectedly pending"),
+        }
+        assert_eq!(
+            write_len.load(Ordering::Relaxed),
+            TCP_PATH_MTU_WRITE_CHUNK_LIMIT
+        );
+    }
+
+    struct RecordingWrites {
+        writes: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl AsyncRead for RecordingWrites {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for RecordingWrites {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes.lock().unwrap().push(buf.len());
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn framed_stream_paces_large_writes() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let stream = RecordingWrites {
+            writes: writes.clone(),
+        };
+        let mut framed = FramedStream(
+            Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::new()),
+            "127.0.0.1:0".parse().unwrap(),
+            None,
+            0,
+        );
+        let data = Bytes::from(vec![7; TCP_PATH_MTU_PACED_WRITE_THRESHOLD + 321]);
+
+        framed.send_bytes(data).await.unwrap();
+
+        let writes = writes.lock().unwrap();
+        assert!(writes.len() > 1);
+        assert!(writes
+            .iter()
+            .all(|len| *len <= TCP_PATH_MTU_WRITE_CHUNK_LIMIT));
+    }
+}
 
 impl Encrypt {
     pub fn new(key: Key) -> Self {
