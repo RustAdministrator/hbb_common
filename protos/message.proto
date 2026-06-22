@@ -752,6 +752,11 @@ message VideoReceiverStats {
   uint64 encoded_frames_received = 17;
   uint64 keyframes_received = 18;
   uint64 decode_errors = 19;
+  uint64 video_chunks_received = 20;
+  uint64 video_chunk_bytes_received = 21;
+  uint64 video_chunk_frames_reassembled = 22;
+  uint64 video_chunk_frames_expired = 23;
+  uint64 last_observed_frame_id = 24;
 }
 
 message VideoKeyframeRequest {
