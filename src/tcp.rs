@@ -14,7 +14,6 @@ use std::{
     pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
     task::{Context, Poll},
-    time::Duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
@@ -26,11 +25,13 @@ use tokio_util::codec::Framed;
 pub trait TcpStreamTrait: AsyncRead + AsyncWrite + Unpin {}
 pub struct DynTcpStream(pub Box<dyn TcpStreamTrait + Send + Sync>);
 
-const TCP_PATH_MTU_WRITE_CHUNK_LIMIT: usize = 1200;
-const TCP_PATH_MTU_MSS_CAP: u32 = TCP_PATH_MTU_WRITE_CHUNK_LIMIT as u32;
-const TCP_PATH_MTU_PACED_WRITE_THRESHOLD: usize = TCP_PATH_MTU_WRITE_CHUNK_LIMIT * 2;
-const TCP_PATH_MTU_PACED_WRITE_DELAY: Duration = Duration::from_millis(1);
-static TCP_PATH_MTU_PACED_WRITE_LOGS: AtomicUsize = AtomicUsize::new(0);
+// Keep framed TCP writes below common VPN/tunnel MTUs. This does not force the
+// OS TCP MSS, but it avoids handing large buffers to virtual adapters/offload
+// paths that can stall on some WireGuard/Wintun routes.
+const TCP_FRAMED_WRITE_CHUNK_LIMIT: usize = 1200;
+const TCP_FRAMED_WRITE_MSS_CAP: u32 = TCP_FRAMED_WRITE_CHUNK_LIMIT as u32;
+const TCP_FRAMED_WRITE_THRESHOLD: usize = TCP_FRAMED_WRITE_CHUNK_LIMIT;
+static TCP_FRAMED_WRITE_LOGS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone)]
 pub struct Encrypt(pub Key, pub u64, pub u64);
@@ -178,11 +179,11 @@ impl FramedStream {
 
     #[inline]
     pub async fn send_bytes(&mut self, bytes: Bytes) -> ResultType<()> {
-        if self.should_send_paced(bytes.len()) {
+        if self.should_send_bounded(bytes.len()) {
             if self.3 > 0 {
-                super::timeout(self.3, self.send_bytes_paced(bytes)).await??;
+                super::timeout(self.3, self.send_bytes_bounded(bytes)).await??;
             } else {
-                self.send_bytes_paced(bytes).await?;
+                self.send_bytes_bounded(bytes).await?;
             }
             return Ok(());
         }
@@ -194,41 +195,40 @@ impl FramedStream {
         Ok(())
     }
 
-    fn should_send_paced(&self, len: usize) -> bool {
-        len > TCP_PATH_MTU_PACED_WRITE_THRESHOLD && !self.0.codec().is_raw()
+    fn should_send_bounded(&self, len: usize) -> bool {
+        len > TCP_FRAMED_WRITE_THRESHOLD && !self.0.codec().is_raw()
     }
 
-    async fn send_bytes_paced(&mut self, bytes: Bytes) -> io::Result<()> {
+    async fn send_bytes_bounded(&mut self, bytes: Bytes) -> io::Result<()> {
         self.0.flush().await?;
 
         let mut framed = BytesMut::with_capacity(bytes.len() + 4);
         BytesCodec::encode_frame(self.0.codec().is_raw(), bytes, &mut framed)?;
 
         let total_len = framed.len();
-        let chunk_count = total_len.div_ceil(TCP_PATH_MTU_WRITE_CHUNK_LIMIT);
-        let log_count = TCP_PATH_MTU_PACED_WRITE_LOGS.fetch_add(1, Ordering::Relaxed);
+        let chunk_count = total_len.div_ceil(TCP_FRAMED_WRITE_CHUNK_LIMIT);
+        let log_count = TCP_FRAMED_WRITE_LOGS.fetch_add(1, Ordering::Relaxed);
         if log_count < 32 {
             log::info!(
-                "tcp path mtu guard paced framed write: total_bytes={}, chunk_limit={}, chunks={}, local={}",
+                "tcp large framed write split: total_bytes={}, chunk_limit={}, chunks={}, local={}",
                 total_len,
-                TCP_PATH_MTU_WRITE_CHUNK_LIMIT,
+                TCP_FRAMED_WRITE_CHUNK_LIMIT,
                 chunk_count,
                 self.1
             );
         }
 
+        // TCP still owns segmentation and retransmission. The small write size
+        // prevents large application buffers from entering fragile tunnel/offload
+        // paths as a single write.
         let stream = self.0.get_mut();
         let mut offset = 0;
         while offset < total_len {
-            let end = (offset + TCP_PATH_MTU_WRITE_CHUNK_LIMIT).min(total_len);
+            let end = (offset + TCP_FRAMED_WRITE_CHUNK_LIMIT).min(total_len);
             stream.write_all(&framed[offset..end]).await?;
-            stream.flush().await?;
             offset = end;
-            if offset < total_len {
-                tokio::time::sleep(TCP_PATH_MTU_PACED_WRITE_DELAY).await;
-            }
         }
-        Ok(())
+        stream.flush().await
     }
 
     #[inline]
@@ -336,7 +336,7 @@ impl AsyncWrite for DynTcpStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let len = buf.len().min(TCP_PATH_MTU_WRITE_CHUNK_LIMIT);
+        let len = buf.len().min(TCP_FRAMED_WRITE_CHUNK_LIMIT);
         AsyncWrite::poll_write(Pin::new(&mut self.0), cx, &buf[..len])
     }
 
@@ -354,7 +354,7 @@ impl<R: AsyncRead + AsyncWrite + Unpin> TcpStreamTrait for R {}
 fn configure_connected_tcp_stream(stream: &TcpStream, context: &str) {
     if let Err(err) = stream.set_nodelay(true) {
         log::warn!(
-            "tcp path mtu guard: failed to enable TCP_NODELAY: context={context}, err={err}"
+            "tcp stream configure: failed to enable TCP_NODELAY: context={context}, err={err}"
         );
     }
 
@@ -364,16 +364,16 @@ fn configure_connected_tcp_stream(stream: &TcpStream, context: &str) {
         return;
     }
 
-    match set_tcp_maxseg(stream, TCP_PATH_MTU_MSS_CAP) {
+    match set_tcp_maxseg(stream, TCP_FRAMED_WRITE_MSS_CAP) {
         Ok(()) => log::info!(
-            "tcp path mtu guard enabled: context={context}, write_chunk_cap={}, tcp_mss_cap={}, local={local:?}, peer={peer:?}",
-            TCP_PATH_MTU_WRITE_CHUNK_LIMIT,
-            TCP_PATH_MTU_MSS_CAP
+            "tcp path write guard enabled: context={context}, write_chunk_cap={}, tcp_mss_cap={}, local={local:?}, peer={peer:?}",
+            TCP_FRAMED_WRITE_CHUNK_LIMIT,
+            TCP_FRAMED_WRITE_MSS_CAP
         ),
         Err(err) => log::warn!(
-            "tcp path mtu guard write cap active but TCP_MAXSEG unavailable: context={context}, write_chunk_cap={}, tcp_mss_cap={}, local={local:?}, peer={peer:?}, err={err}",
-            TCP_PATH_MTU_WRITE_CHUNK_LIMIT,
-            TCP_PATH_MTU_MSS_CAP
+            "tcp path write guard active but TCP_MAXSEG unavailable: context={context}, write_chunk_cap={}, tcp_mss_cap={}, local={local:?}, peer={peer:?}, err={err}",
+            TCP_FRAMED_WRITE_CHUNK_LIMIT,
+            TCP_FRAMED_WRITE_MSS_CAP
         ),
     }
 }
@@ -481,23 +481,23 @@ mod tests {
     }
 
     #[test]
-    fn dyn_tcp_stream_caps_write_chunks() {
+    fn dyn_tcp_stream_caps_socket_write_chunks() {
         let write_len = Arc::new(AtomicUsize::new(0));
         let mut stream = DynTcpStream(Box::new(RecordingStream {
             write_len: write_len.clone(),
         }));
-        let data = vec![0; TCP_PATH_MTU_WRITE_CHUNK_LIMIT + 321];
+        let data = vec![0; TCP_FRAMED_WRITE_CHUNK_LIMIT + 321];
         let waker = noop_waker_ref();
         let mut cx = Context::from_waker(waker);
 
         match AsyncWrite::poll_write(Pin::new(&mut stream), &mut cx, &data) {
-            Poll::Ready(Ok(n)) => assert_eq!(n, TCP_PATH_MTU_WRITE_CHUNK_LIMIT),
+            Poll::Ready(Ok(n)) => assert_eq!(n, TCP_FRAMED_WRITE_CHUNK_LIMIT),
             Poll::Ready(Err(err)) => panic!("write failed: {}", err),
             Poll::Pending => panic!("write unexpectedly pending"),
         }
         assert_eq!(
             write_len.load(Ordering::Relaxed),
-            TCP_PATH_MTU_WRITE_CHUNK_LIMIT
+            TCP_FRAMED_WRITE_CHUNK_LIMIT
         );
     }
 
@@ -535,7 +535,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn framed_stream_paces_large_writes() {
+    async fn framed_stream_splits_large_writes_into_path_safe_chunks() {
         let writes = Arc::new(Mutex::new(Vec::new()));
         let stream = RecordingWrites {
             writes: writes.clone(),
@@ -546,7 +546,8 @@ mod tests {
             None,
             0,
         );
-        let data = Bytes::from(vec![7; TCP_PATH_MTU_PACED_WRITE_THRESHOLD + 321]);
+        let data = Bytes::from(vec![7; 64 * 1024 + 321]);
+        let expected_payload_len = data.len();
 
         framed.send_bytes(data).await.unwrap();
 
@@ -554,11 +555,12 @@ mod tests {
         assert!(writes.len() > 1);
         assert!(writes
             .iter()
-            .all(|len| *len <= TCP_PATH_MTU_WRITE_CHUNK_LIMIT));
+            .all(|len| *len <= TCP_FRAMED_WRITE_CHUNK_LIMIT));
+        assert!(writes.iter().sum::<usize>() >= expected_payload_len);
     }
 
     #[test]
-    fn framed_stream_pacing_decision_respects_raw_streams() {
+    fn framed_stream_bounded_write_decision_respects_raw_streams() {
         let writes = Arc::new(Mutex::new(Vec::new()));
         let stream = RecordingWrites { writes };
         let mut framed = FramedStream(
@@ -568,11 +570,11 @@ mod tests {
             0,
         );
 
-        assert!(!framed.should_send_paced(TCP_PATH_MTU_PACED_WRITE_THRESHOLD));
-        assert!(framed.should_send_paced(TCP_PATH_MTU_PACED_WRITE_THRESHOLD + 1));
+        assert!(!framed.should_send_bounded(TCP_FRAMED_WRITE_THRESHOLD));
+        assert!(framed.should_send_bounded(TCP_FRAMED_WRITE_THRESHOLD + 1));
 
         framed.set_raw();
-        assert!(!framed.should_send_paced(TCP_PATH_MTU_PACED_WRITE_THRESHOLD + 1));
+        assert!(!framed.should_send_bounded(TCP_FRAMED_WRITE_THRESHOLD + 1));
     }
 }
 
