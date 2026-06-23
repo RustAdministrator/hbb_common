@@ -3389,6 +3389,7 @@ pub mod keys {
     pub const OPTION_CUSTOM_FPS: &str = "custom-fps";
     pub const OPTION_CUSTOM_FPS_MODE: &str = "custom-fps-mode";
     pub const OPTION_CODEC_PREFERENCE: &str = "codec-preference";
+    pub const OPTION_CAPTURE_BACKEND: &str = "capture-backend";
     pub const OPTION_SYNC_INIT_CLIPBOARD: &str = "sync-init-clipboard";
     pub const OPTION_THEME: &str = "theme";
     pub const OPTION_LANGUAGE: &str = "lang";
