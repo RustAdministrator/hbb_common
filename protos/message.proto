@@ -717,6 +717,9 @@ message TestDelay {
   bool from_client = 2;
   uint32 last_delay = 3;
   uint32 target_bitrate = 4;
+  string capture_backend = 5;
+  string encoder_backend = 6;
+  string encoder_input = 7;
 }
 
 message PublicKey {
