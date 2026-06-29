@@ -723,6 +723,7 @@ message TestDelay {
   string capture_backend = 5;
   string encoder_backend = 6;
   string encoder_input = 7;
+  string capture_frame = 8;
 }
 
 message PublicKey {
