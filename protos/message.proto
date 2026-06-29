@@ -120,6 +120,7 @@ message SupportedEncoding {
   bool vp8 = 3;
   bool av1 = 4;
   CodecAbility i444 = 5;
+  bool av1_hw = 6;
 }
 
 message PeerInfo {
@@ -671,6 +672,8 @@ message SupportedDecoding {
     H265 = 3;
     VP8 = 4;
     AV1 = 5;
+    AV1_SW = 6;
+    AV1_HW = 7;
   }
 
   int32 ability_vp9 = 1;
