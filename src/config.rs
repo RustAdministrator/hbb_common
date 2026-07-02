@@ -2846,9 +2846,11 @@ impl UserDefaultConfig {
             keys::OPTION_IMAGE_QUALITY => {
                 self.get_string(key, "balanced", vec!["best", "low", "custom"])
             }
-            keys::OPTION_CODEC_PREFERENCE => {
-                self.get_string(key, "auto", vec!["vp8", "vp9", "av1", "h264", "h265"])
-            }
+            keys::OPTION_CODEC_PREFERENCE => self.get_string(
+                key,
+                "auto",
+                vec!["vp8", "vp9", "av1", "av1-hw", "h264", "h265"],
+            ),
             keys::OPTION_CUSTOM_IMAGE_QUALITY => self.get_num_string(key, 50.0, 10.0, 0xFFF as f64),
             keys::OPTION_CUSTOM_FPS => self.get_num_string(key, 30.0, 5.0, 120.0),
             keys::OPTION_CUSTOM_FPS_MODE => self.get_string(key, "adaptive", vec!["fixed"]),
@@ -3804,6 +3806,17 @@ mod tests {
         let cfg: PeerConfig = Default::default();
         let res = toml::to_string_pretty(&cfg);
         assert!(res.is_ok());
+    }
+
+    #[test]
+    fn test_codec_preference_accepts_av1_hardware() {
+        let mut cfg = UserDefaultConfig::default();
+        cfg.options.insert(
+            keys::OPTION_CODEC_PREFERENCE.to_owned(),
+            "av1-hw".to_owned(),
+        );
+
+        assert_eq!(cfg.get(keys::OPTION_CODEC_PREFERENCE), "av1-hw");
     }
 
     #[test]
