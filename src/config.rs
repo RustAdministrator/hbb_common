@@ -135,6 +135,8 @@ pub(crate) struct TestConfigGuard {
     _guard: std::sync::MutexGuard<'static, ()>,
     config: Config,
     config2: Config2,
+    key_pair: Option<KeyPair>,
+    paired_viewers: (Vec<PairedViewer>, bool),
     bootstrap_config: BootstrapConfig,
     local_config: LocalConfig,
     user_default_config: UserDefaultConfig,
@@ -155,8 +157,10 @@ pub(crate) struct TestConfigGuard {
 impl Drop for TestConfigGuard {
     fn drop(&mut self) {
         *CONFIG.write().unwrap() = self.config.clone();
+        *KEY_PAIR.lock().unwrap() = self.key_pair.clone();
         let config2_changed = CONFIG2.read().unwrap().clone() != self.config2;
         *CONFIG2.write().unwrap() = self.config2.clone();
+        *PAIRED_VIEWERS.write().unwrap() = self.paired_viewers.clone();
         if config2_changed {
             CONFIG2.read().unwrap().store();
         }
@@ -186,6 +190,8 @@ pub(crate) fn lock_test_config() -> TestConfigGuard {
         _guard: guard,
         config: CONFIG.read().unwrap().clone(),
         config2: CONFIG2.read().unwrap().clone(),
+        key_pair: KEY_PAIR.lock().unwrap().clone(),
+        paired_viewers: PAIRED_VIEWERS.read().unwrap().clone(),
         bootstrap_config: BOOTSTRAP_CONFIG.read().unwrap().clone(),
         local_config: LOCAL_CONFIG.read().unwrap().clone(),
         user_default_config: USER_DEFAULT_CONFIG.read().unwrap().0.clone(),
@@ -1483,26 +1489,32 @@ impl Config {
     }
 
     pub fn get_key_pair() -> KeyPair {
-        // lock here to make sure no gen_keypair more than once
-        // no use of CONFIG directly here to ensure no recursive calling in Config::load because of password dec which calling this function
+        // Hold KEY_PAIR while loading/generating so only one identity is created.
+        // Do not access CONFIG until this lock is published and released: storing
+        // CONFIG can re-enter this function through the encryption fallback.
         let mut lock = KEY_PAIR.lock().unwrap();
         if let Some(p) = lock.as_ref() {
             return p.clone();
         }
         let mut config = Config::load_::<Config>("");
+        let mut generated = false;
         if config.key_pair.0.is_empty() {
             log::info!("Generated new keypair for id: {}", config.id);
             let (pk, sk) = sign::gen_keypair();
-            let key_pair = (sk.0.to_vec(), pk.0.into());
-            config.key_pair = key_pair.clone();
-            std::thread::spawn(|| {
-                let mut config = CONFIG.write().unwrap();
-                config.key_pair = key_pair;
-                config.store();
-            });
+            config.key_pair = (sk.0.to_vec(), pk.0.into());
+            generated = true;
         }
-        *lock = Some(config.key_pair.clone());
-        config.key_pair
+        let key_pair = config.key_pair.clone();
+        *lock = Some(key_pair.clone());
+        // Publish the cache before storing. If machine UID lookup fails while
+        // encrypting, symmetric_crypt() can safely reuse this cached key.
+        drop(lock);
+        if generated {
+            let mut config = CONFIG.write().unwrap();
+            config.key_pair = key_pair.clone();
+            config.store();
+        }
+        key_pair
     }
 
     pub fn get_cached_pk() -> Option<Vec<u8>> {
@@ -1615,6 +1627,16 @@ impl Config {
         let previous_options = CONFIG2.read().unwrap().options.clone();
         let mut rejected_keys = Vec::new();
         for (key, value) in v.iter_mut() {
+            if Self::is_encrypted_option(key) && !value.is_empty() {
+                let plain = Self::plaintext_option_value(key, value);
+                if let Some(previous) = previous_options.get(key) {
+                    if Self::plaintext_option_value(key, previous) == plain {
+                        *value = previous.clone();
+                        continue;
+                    }
+                }
+                *value = plain;
+            }
             if !Self::maybe_encrypt_option_value(key, value) {
                 rejected_keys.push(key.clone());
             }
@@ -1626,8 +1648,12 @@ impl Config {
                 v.remove(&key);
             }
         }
-        let direct_pairing_changed = v.get(keys::OPTION_DIRECT_ACCESS_PAIRING_PASSPHRASE)
-            != previous_options.get(keys::OPTION_DIRECT_ACCESS_PAIRING_PASSPHRASE);
+        let direct_pairing_changed =
+            Self::plaintext_option_from_map(&v, keys::OPTION_DIRECT_ACCESS_PAIRING_PASSPHRASE)
+                != Self::plaintext_option_from_map(
+                    &previous_options,
+                    keys::OPTION_DIRECT_ACCESS_PAIRING_PASSPHRASE,
+                );
         let mut config = CONFIG2.write().unwrap();
         if config.options == v {
             return;
@@ -1669,8 +1695,18 @@ impl Config {
             }
             return;
         }
+        let plain = Self::plaintext_option_value(&k, &v);
         let mut config = CONFIG2.write().unwrap();
-        let mut stored = v;
+        let previous_plain = config
+            .options
+            .get(&k)
+            .filter(|value| !value.is_empty())
+            .map(|value| Self::plaintext_option_value(&k, value));
+        let requested_plain = (!plain.is_empty()).then_some(plain.as_str());
+        if previous_plain.as_deref() == requested_plain {
+            return;
+        }
+        let mut stored = plain;
         if !Self::maybe_encrypt_option_value(&k, &mut stored) {
             return;
         }
@@ -1706,6 +1742,19 @@ impl Config {
         }
         let (plain, _, _) = decrypt_str_or_original(v, PASSWORD_ENC_VERSION);
         *v = plain;
+    }
+
+    fn plaintext_option_value(k: &str, value: &str) -> String {
+        let mut value = value.to_owned();
+        Self::maybe_decrypt_option_value(k, &mut value);
+        value
+    }
+
+    fn plaintext_option_from_map(options: &HashMap<String, String>, key: &str) -> Option<String> {
+        options
+            .get(key)
+            .filter(|value| !value.is_empty())
+            .map(|value| Self::plaintext_option_value(key, value))
     }
 
     fn maybe_encrypt_option_value(k: &str, v: &mut String) -> bool {
@@ -2147,17 +2196,17 @@ impl Config {
     // TODO: `Config::set()` does not invalidate trusted devices when permanent password/salt changes.
     // This matches historical behavior, but may need revisiting in a separate PR.
     pub fn set(cfg: Config) -> bool {
+        let new_key_pair = cfg.key_pair.clone();
         let mut lock = CONFIG.write().unwrap();
         if *lock == cfg {
+            drop(lock);
+            Self::invalidate_key_pair_cache_if_changed(&new_key_pair);
             return false;
         }
         *lock = cfg;
         lock.store();
         // Drop CONFIG lock before acquiring KEY_PAIR lock to avoid potential deadlock.
-        #[cfg(target_os = "macos")]
-        let new_key_pair = lock.key_pair.clone();
         drop(lock);
-        #[cfg(target_os = "macos")]
         Self::invalidate_key_pair_cache_if_changed(&new_key_pair);
         true
     }
@@ -2167,7 +2216,6 @@ impl Config {
     /// If we use Some with an empty key_pair, get_key_pair() would always return
     /// the empty key_pair from cache without regenerating.
     /// By clearing the cache, get_key_pair() will reload and regenerate if needed.
-    #[cfg(target_os = "macos")]
     fn invalidate_key_pair_cache_if_changed(new_key_pair: &KeyPair) {
         let mut key_pair_cache = KEY_PAIR.lock().unwrap();
         if let Some(cached) = key_pair_cache.as_ref() {
@@ -4281,6 +4329,105 @@ mod tests {
         assert_eq!(Config::get_option(&key), original);
 
         *CONFIG2.write().unwrap() = saved_config2;
+    }
+
+    #[test]
+    fn test_reapplying_direct_pairing_passphrase_keeps_paired_viewers() {
+        let _config_guard = lock_test_config();
+
+        let key = keys::OPTION_DIRECT_ACCESS_PAIRING_PASSPHRASE.to_owned();
+        let passphrase = "same-direct-passphrase";
+        let encrypted = encrypt_str_or_original(passphrase, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        {
+            let mut config2 = CONFIG2.write().unwrap();
+            config2.options.clear();
+            config2.options.insert(key.clone(), encrypted.clone());
+            config2.paired_viewers = "paired-viewers-sentinel".to_owned();
+        }
+
+        Config::set_option(key.clone(), passphrase.to_owned());
+
+        let config2 = CONFIG2.read().unwrap();
+        assert_eq!(config2.options.get(&key), Some(&encrypted));
+        assert_eq!(config2.paired_viewers, "paired-viewers-sentinel");
+    }
+
+    #[test]
+    fn test_bulk_reapplying_direct_pairing_passphrase_keeps_paired_viewers() {
+        let _config_guard = lock_test_config();
+
+        let key = keys::OPTION_DIRECT_ACCESS_PAIRING_PASSPHRASE.to_owned();
+        let passphrase = "same-direct-passphrase";
+        let encrypted = encrypt_str_or_original(passphrase, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        {
+            let mut config2 = CONFIG2.write().unwrap();
+            config2.options.clear();
+            config2.options.insert(key.clone(), encrypted.clone());
+            config2.paired_viewers = "paired-viewers-sentinel".to_owned();
+        }
+        let mut options = HashMap::new();
+        options.insert(key.clone(), passphrase.to_owned());
+
+        Config::set_options(options);
+
+        let config2 = CONFIG2.read().unwrap();
+        assert_eq!(config2.options.get(&key), Some(&encrypted));
+        assert_eq!(config2.paired_viewers, "paired-viewers-sentinel");
+    }
+
+    #[test]
+    fn test_changing_direct_pairing_passphrase_clears_paired_viewers() {
+        let _config_guard = lock_test_config();
+
+        let key = keys::OPTION_DIRECT_ACCESS_PAIRING_PASSPHRASE.to_owned();
+        let encrypted =
+            encrypt_str_or_original("old-passphrase", PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
+        {
+            let mut config2 = CONFIG2.write().unwrap();
+            config2.options.clear();
+            config2.options.insert(key.clone(), encrypted);
+            config2.paired_viewers = "paired-viewers-sentinel".to_owned();
+        }
+
+        Config::set_option(key.clone(), "new-passphrase".to_owned());
+
+        let config2 = CONFIG2.read().unwrap();
+        assert!(config2.paired_viewers.is_empty());
+        drop(config2);
+        assert_eq!(Config::get_option(&key), "new-passphrase");
+    }
+
+    #[test]
+    fn test_generated_key_pair_is_persisted_before_return() {
+        let _config_guard = lock_test_config();
+
+        {
+            let mut config = CONFIG.write().unwrap();
+            config.key_pair = Default::default();
+            config.store();
+        }
+        *KEY_PAIR.lock().unwrap() = None;
+
+        let key_pair = Config::get_key_pair();
+
+        assert!(!key_pair.0.is_empty());
+        assert!(!key_pair.1.is_empty());
+        assert_eq!(CONFIG.read().unwrap().key_pair, key_pair);
+        let stored: Config = load_path(Config::file());
+        assert_eq!(stored.key_pair, key_pair);
+    }
+
+    #[test]
+    fn test_set_config_invalidates_stale_key_pair_cache() {
+        let _config_guard = lock_test_config();
+
+        let config = Config::get();
+        let stale = (vec![1; sign::SECRETKEYBYTES], vec![2; sign::PUBLICKEYBYTES]);
+        assert_ne!(config.key_pair, stale);
+        *KEY_PAIR.lock().unwrap() = Some(stale);
+
+        assert!(!Config::set(config));
+        assert!(KEY_PAIR.lock().unwrap().is_none());
     }
 
     #[test]
