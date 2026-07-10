@@ -121,6 +121,8 @@ message SupportedEncoding {
   bool av1 = 4;
   CodecAbility i444 = 5;
   bool av1_hw = 6;
+  bool h264_hq = 7;
+  bool h265_hq = 8;
 }
 
 message PeerInfo {
@@ -674,6 +676,8 @@ message SupportedDecoding {
     AV1 = 5;
     AV1_SW = 6;
     AV1_HW = 7;
+    H264_HQ = 8;
+    H265_HQ = 9;
   }
 
   int32 ability_vp9 = 1;

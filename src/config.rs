@@ -2897,7 +2897,9 @@ impl UserDefaultConfig {
             keys::OPTION_CODEC_PREFERENCE => self.get_string(
                 key,
                 "auto",
-                vec!["vp8", "vp9", "av1", "av1-hw", "h264", "h265"],
+                vec![
+                    "vp8", "vp9", "av1", "av1-hw", "h264", "h265", "h264-hq", "h265-hq",
+                ],
             ),
             keys::OPTION_CUSTOM_IMAGE_QUALITY => self.get_num_string(key, 50.0, 10.0, 0xFFF as f64),
             keys::OPTION_CUSTOM_FPS => self.get_num_string(key, 30.0, 5.0, 120.0),
@@ -3865,6 +3867,17 @@ mod tests {
         );
 
         assert_eq!(cfg.get(keys::OPTION_CODEC_PREFERENCE), "av1-hw");
+    }
+
+    #[test]
+    fn test_codec_preference_accepts_high_quality_hardware() {
+        for codec in ["h264-hq", "h265-hq"] {
+            let mut cfg = UserDefaultConfig::default();
+            cfg.options
+                .insert(keys::OPTION_CODEC_PREFERENCE.to_owned(), codec.to_owned());
+
+            assert_eq!(cfg.get(keys::OPTION_CODEC_PREFERENCE), codec);
+        }
     }
 
     #[test]
