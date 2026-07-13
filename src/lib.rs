@@ -567,6 +567,50 @@ pub fn time_based_rand() -> u32 {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::{
+        message_proto::{message, misc, Message, Misc, VideoFeedback, VideoFrame},
+        protobuf::Message as _,
+    };
+
+    #[test]
+    fn video_frame_metadata_and_feedback_round_trip() {
+        let mut frame_message = Message::new();
+        frame_message.set_video_frame(VideoFrame {
+            display: 2,
+            stream_id: 7,
+            frame_id: 11,
+            capture_time_ms: 23,
+            ..Default::default()
+        });
+        let decoded = Message::parse_from_bytes(&frame_message.write_to_bytes().unwrap()).unwrap();
+        let Some(message::Union::VideoFrame(frame)) = decoded.union else {
+            panic!("missing video frame");
+        };
+        assert_eq!((frame.display, frame.stream_id, frame.frame_id), (2, 7, 11));
+        assert_eq!(frame.capture_time_ms, 23);
+
+        let mut misc_message = Misc::new();
+        misc_message.set_video_feedback(VideoFeedback {
+            stream_id: 7,
+            display: 2,
+            received_frame_id: 11,
+            decoded_frame_id: 10,
+            render_submitted_frame_id: 10,
+            ..Default::default()
+        });
+        let mut feedback_message = Message::new();
+        feedback_message.set_misc(misc_message);
+        let decoded =
+            Message::parse_from_bytes(&feedback_message.write_to_bytes().unwrap()).unwrap();
+        let Some(message::Union::Misc(misc)) = decoded.union else {
+            panic!("missing misc message");
+        };
+        let Some(misc::Union::VideoFeedback(feedback)) = misc.union else {
+            panic!("missing video feedback");
+        };
+        assert_eq!(feedback.stream_id, 7);
+        assert_eq!(feedback.render_submitted_frame_id, 10);
+    }
 
     #[test]
     fn test_read_revision_file() {
