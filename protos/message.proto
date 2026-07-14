@@ -698,6 +698,8 @@ message SupportedDecoding {
   int32 ability_av1 = 6;
   CodecAbility i444 = 7;
   Chroma prefer_chroma = 8;
+  // Viewer reports end-to-end receive/decode/render-submission progress.
+  bool video_feedback = 9;
 }
 
 message OptionMessage {

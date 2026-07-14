@@ -568,7 +568,9 @@ pub fn time_based_rand() -> u32 {
 mod test {
     use super::*;
     use crate::{
-        message_proto::{message, misc, Message, Misc, VideoFeedback, VideoFrame},
+        message_proto::{
+            message, misc, Message, Misc, SupportedDecoding, VideoFeedback, VideoFrame,
+        },
         protobuf::Message as _,
     };
 
@@ -610,6 +612,14 @@ mod test {
         };
         assert_eq!(feedback.stream_id, 7);
         assert_eq!(feedback.render_submitted_frame_id, 10);
+
+        let decoding = SupportedDecoding {
+            video_feedback: true,
+            ..Default::default()
+        };
+        let decoded =
+            SupportedDecoding::parse_from_bytes(&decoding.write_to_bytes().unwrap()).unwrap();
+        assert!(decoded.video_feedback);
     }
 
     #[test]
