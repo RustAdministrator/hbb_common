@@ -740,6 +740,9 @@ message TestDelay {
   string encoder_backend = 6;
   string encoder_input = 7;
   string capture_frame = 8;
+  string video_delivery_phase = 9;
+  uint64 video_recovery_count = 10;
+  uint64 video_stall_ms = 11;
 }
 
 message PublicKey {

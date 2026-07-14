@@ -569,7 +569,7 @@ mod test {
     use super::*;
     use crate::{
         message_proto::{
-            message, misc, Message, Misc, SupportedDecoding, VideoFeedback, VideoFrame,
+            message, misc, Message, Misc, SupportedDecoding, TestDelay, VideoFeedback, VideoFrame,
         },
         protobuf::Message as _,
     };
@@ -620,6 +620,17 @@ mod test {
         let decoded =
             SupportedDecoding::parse_from_bytes(&decoding.write_to_bytes().unwrap()).unwrap();
         assert!(decoded.video_feedback);
+
+        let delay = TestDelay {
+            video_delivery_phase: "recovering".to_owned(),
+            video_recovery_count: 3,
+            video_stall_ms: 750,
+            ..Default::default()
+        };
+        let decoded = TestDelay::parse_from_bytes(&delay.write_to_bytes().unwrap()).unwrap();
+        assert_eq!(decoded.video_delivery_phase, "recovering");
+        assert_eq!(decoded.video_recovery_count, 3);
+        assert_eq!(decoded.video_stall_ms, 750);
     }
 
     #[test]
