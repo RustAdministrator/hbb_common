@@ -708,6 +708,14 @@ message OptionMessage {
     No = 1;
     Yes = 2;
   }
+  enum CaptureBackend {
+    CaptureBackendNotSet = 0;
+    CaptureBackendAuto = 1;
+    CaptureBackendDxgi = 2;
+    CaptureBackendWgc = 3;
+    CaptureBackendWinMag = 4;
+    CaptureBackendGdi = 5;
+  }
   ImageQuality image_quality = 1;
   BoolOption lock_after_session_end = 2;
   BoolOption show_remote_cursor = 3;
@@ -729,6 +737,7 @@ message OptionMessage {
   BoolOption disable_camera = 17;
   BoolOption terminal_persistent = 18;
   BoolOption show_my_cursor = 19;
+  CaptureBackend capture_backend = 20;
 }
 
 message TestDelay {
