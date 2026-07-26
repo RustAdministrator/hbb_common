@@ -100,8 +100,15 @@ lazy_static::lazy_static! {
 type Size = (i32, i32, i32, i32);
 type KeyPair = (Vec<u8>, Vec<u8>);
 
+static CONFIG_INITIALIZED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 lazy_static::lazy_static! {
-    static ref CONFIG: RwLock<Config> = RwLock::new(Config::load());
+    static ref CONFIG: RwLock<Config> = {
+        let config = Config::load();
+        CONFIG_INITIALIZED.store(true, std::sync::atomic::Ordering::Release);
+        RwLock::new(config)
+    };
     static ref CONFIG2: RwLock<Config2> = RwLock::new(Config2::load());
     static ref BOOTSTRAP_CONFIG: RwLock<BootstrapConfig> = RwLock::new(BootstrapConfig::load());
     static ref LOCAL_CONFIG: RwLock<LocalConfig> = RwLock::new(LocalConfig::load());
@@ -1002,7 +1009,10 @@ impl Config {
 
     fn load() -> Config {
         let mut config = Config::load_::<Config>("");
-        let mut store = false;
+        // Android derives its encryption key from this identity. Publish it before
+        // decrypting or storing anything so get_uuid() cannot re-enter CONFIG while
+        // this lazy initializer is still running.
+        let mut store = Self::ensure_key_pair(&mut config);
         store |= Self::migrate_permanent_password_to_hashed_storage(&mut config);
         let mut id_valid = false;
         let (id, encrypted, store2) = decrypt_str_or_original(&config.enc_id, PASSWORD_ENC_VERSION);
@@ -1489,32 +1499,44 @@ impl Config {
     }
 
     pub fn get_key_pair() -> KeyPair {
-        // Hold KEY_PAIR while loading/generating so only one identity is created.
-        // Do not access CONFIG until this lock is published and released: storing
-        // CONFIG can re-enter this function through the encryption fallback.
-        let mut lock = KEY_PAIR.lock().unwrap();
-        if let Some(p) = lock.as_ref() {
+        if let Some(p) = KEY_PAIR.lock().unwrap().as_ref() {
             return p.clone();
         }
+
         let mut config = Config::load_::<Config>("");
-        let mut generated = false;
-        if config.key_pair.0.is_empty() {
-            log::info!("Generated new keypair for id: {}", config.id);
-            let (pk, sk) = sign::gen_keypair();
-            config.key_pair = (sk.0.to_vec(), pk.0.into());
-            generated = true;
-        }
+        let changed = Self::ensure_key_pair(&mut config);
         let key_pair = config.key_pair.clone();
-        *lock = Some(key_pair.clone());
-        // Publish the cache before storing. If machine UID lookup fails while
-        // encrypting, symmetric_crypt() can safely reuse this cached key.
-        drop(lock);
-        if generated {
+
+        if changed && CONFIG_INITIALIZED.load(std::sync::atomic::Ordering::Acquire) {
             let mut config = CONFIG.write().unwrap();
             config.key_pair = key_pair.clone();
             config.store();
+        } else if changed {
+            // CONFIG may be in its lazy initializer on this thread. The cache is
+            // already published, so storing this raw copy cannot recurse into it.
+            config.store();
         }
         key_pair
+    }
+
+    fn ensure_key_pair(config: &mut Config) -> bool {
+        let mut cache = KEY_PAIR.lock().unwrap();
+        if let Some(key_pair) = cache.as_ref() {
+            if config.key_pair != *key_pair {
+                config.key_pair = key_pair.clone();
+                return true;
+            }
+            return false;
+        }
+
+        let generated = config.key_pair.0.is_empty();
+        if generated {
+            log::info!("Generated new keypair for id: {}", config.id);
+            let (pk, sk) = sign::gen_keypair();
+            config.key_pair = (sk.0.to_vec(), pk.0.into());
+        }
+        *cache = Some(config.key_pair.clone());
+        generated
     }
 
     pub fn get_cached_pk() -> Option<Vec<u8>> {
@@ -4429,6 +4451,22 @@ mod tests {
         assert_eq!(CONFIG.read().unwrap().key_pair, key_pair);
         let stored: Config = load_path(Config::file());
         assert_eq!(stored.key_pair, key_pair);
+    }
+
+    #[test]
+    fn test_key_pair_is_published_before_config_encryption() {
+        let _config_guard = lock_test_config();
+        *KEY_PAIR.lock().unwrap() = None;
+        let mut config = Config::default();
+
+        assert!(Config::ensure_key_pair(&mut config));
+        assert!(!config.key_pair.0.is_empty());
+        assert!(!config.key_pair.1.is_empty());
+        assert_eq!(KEY_PAIR.lock().unwrap().as_ref(), Some(&config.key_pair));
+
+        // Android's encryption path calls get_uuid(), which must now return from
+        // KEY_PAIR without trying to initialize CONFIG recursively.
+        assert_eq!(Config::get_key_pair(), config.key_pair);
     }
 
     #[test]
