@@ -145,7 +145,7 @@ impl Stream {
 
     #[inline]
     pub fn from(stream: TcpStream, stream_addr: SocketAddr) -> Self {
-        Self::Tcp(tcp::FramedStream::from(stream, stream_addr))
+        Self::Tcp(tcp::FramedStream::from_tcp(stream, stream_addr))
     }
 
     #[inline]

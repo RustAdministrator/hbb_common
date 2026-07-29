@@ -365,7 +365,7 @@ impl Proxy {
             crate::tcp::new_socket(local, true)?.connect(proxy),
         )
         .await??;
-        stream.set_nodelay(true).ok();
+        crate::tcp::configure_connected_tcp_stream(&stream, "proxy");
         Ok(stream)
     }
 

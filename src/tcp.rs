@@ -12,17 +12,26 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     ops::{Deref, DerefMut},
     pin::Pin,
+    sync::atomic::{AtomicUsize, Ordering},
     task::{Context, Poll},
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
-    net::{lookup_host, TcpListener, TcpSocket, ToSocketAddrs},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
+    net::{lookup_host, TcpListener, TcpSocket, TcpStream, ToSocketAddrs},
 };
 use tokio_socks::IntoTargetAddr;
 use tokio_util::codec::Framed;
 
 pub trait TcpStreamTrait: AsyncRead + AsyncWrite + Unpin {}
 pub struct DynTcpStream(pub Box<dyn TcpStreamTrait + Send + Sync>);
+
+// Keep a single framed write below common VPN and tunnel MTUs. TCP still owns
+// ordering and retransmission; this only avoids large writes entering fragile
+// virtual-adapter/offload paths as one application buffer.
+const TCP_FRAMED_WRITE_CHUNK_LIMIT: usize = 1200;
+const TCP_FRAMED_WRITE_MSS_CAP: u32 = TCP_FRAMED_WRITE_CHUNK_LIMIT as u32;
+const TCP_FRAMED_WRITE_LOG_LIMIT: usize = 32;
+static TCP_FRAMED_WRITE_LOGS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone)]
 pub struct Encrypt(pub Key, pub u64, pub u64);
@@ -99,7 +108,7 @@ impl FramedStream {
                 if let Ok(Ok(stream)) =
                     super::timeout(ms_timeout, socket.connect(remote_addr)).await
                 {
-                    stream.set_nodelay(true).ok();
+                    configure_connected_tcp_stream(&stream, "connect");
                     let addr = stream.local_addr()?;
                     return Ok(Self(
                         Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::new()),
@@ -143,6 +152,11 @@ impl FramedStream {
         )
     }
 
+    pub fn from_tcp(stream: TcpStream, addr: SocketAddr) -> Self {
+        configure_connected_tcp_stream(&stream, "accepted");
+        Self::from(stream, addr)
+    }
+
     pub fn set_raw(&mut self) {
         self.0.codec_mut().set_raw();
         self.2 = None;
@@ -169,12 +183,53 @@ impl FramedStream {
 
     #[inline]
     pub async fn send_bytes(&mut self, bytes: Bytes) -> ResultType<()> {
+        if self.should_send_bounded(bytes.len()) {
+            if self.3 > 0 {
+                super::timeout(self.3, self.send_bytes_bounded(bytes)).await??;
+            } else {
+                self.send_bytes_bounded(bytes).await?;
+            }
+            return Ok(());
+        }
         if self.3 > 0 {
             super::timeout(self.3, self.0.send(bytes)).await??;
         } else {
             self.0.send(bytes).await?;
         }
         Ok(())
+    }
+
+    fn should_send_bounded(&self, len: usize) -> bool {
+        len > TCP_FRAMED_WRITE_CHUNK_LIMIT && !self.0.codec().is_raw()
+    }
+
+    async fn send_bytes_bounded(&mut self, bytes: Bytes) -> io::Result<()> {
+        self.0.flush().await?;
+
+        let mut framed = BytesMut::with_capacity(bytes.len() + 4);
+        BytesCodec::encode_frame(self.0.codec().is_raw(), bytes, &mut framed)?;
+
+        let total_len = framed.len();
+        let chunk_count = total_len.div_ceil(TCP_FRAMED_WRITE_CHUNK_LIMIT);
+        let log_count = TCP_FRAMED_WRITE_LOGS.fetch_add(1, Ordering::Relaxed);
+        if log_count < TCP_FRAMED_WRITE_LOG_LIMIT {
+            log::info!(
+                "tcp large framed write split: total_bytes={}, chunk_limit={}, chunks={}, local={}",
+                total_len,
+                TCP_FRAMED_WRITE_CHUNK_LIMIT,
+                chunk_count,
+                self.1
+            );
+        }
+
+        let stream = self.0.get_mut();
+        let mut offset = 0;
+        while offset < total_len {
+            let end = (offset + TCP_FRAMED_WRITE_CHUNK_LIMIT).min(total_len);
+            stream.write_all(&framed[offset..end]).await?;
+            offset = end;
+        }
+        stream.flush().await
     }
 
     #[inline]
@@ -295,6 +350,163 @@ impl AsyncWrite for DynTcpStream {
 }
 
 impl<R: AsyncRead + AsyncWrite + Unpin> TcpStreamTrait for R {}
+
+pub(crate) fn configure_connected_tcp_stream(stream: &TcpStream, context: &str) {
+    if let Err(err) = stream.set_nodelay(true) {
+        log::warn!(
+            "tcp stream configure: failed to enable TCP_NODELAY: context={context}, err={err}"
+        );
+    }
+
+    let local = stream.local_addr().ok();
+    let peer = stream.peer_addr().ok();
+    if peer.map(|addr| addr.ip().is_loopback()).unwrap_or(false) {
+        return;
+    }
+
+    match set_tcp_maxseg(stream, TCP_FRAMED_WRITE_MSS_CAP) {
+        Ok(()) => log::info!(
+            "tcp path write guard enabled: context={context}, write_chunk_cap={}, tcp_mss_cap={}, local={local:?}, peer={peer:?}",
+            TCP_FRAMED_WRITE_CHUNK_LIMIT,
+            TCP_FRAMED_WRITE_MSS_CAP
+        ),
+        Err(err) => log::warn!(
+            "tcp path write guard active but TCP_MAXSEG unavailable: context={context}, write_chunk_cap={}, tcp_mss_cap={}, local={local:?}, peer={peer:?}, err={err}",
+            TCP_FRAMED_WRITE_CHUNK_LIMIT,
+            TCP_FRAMED_WRITE_MSS_CAP
+        ),
+    }
+}
+
+#[cfg(unix)]
+fn set_tcp_maxseg(stream: &TcpStream, mss: u32) -> io::Result<()> {
+    use std::{mem, os::unix::io::AsRawFd};
+
+    let value = mss as libc::c_int;
+    // SAFETY: the fd belongs to `stream`, and `value` has the exact size
+    // supplied to setsockopt for the duration of this call.
+    let rc = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_MAXSEG,
+            &value as *const _ as *const libc::c_void,
+            mem::size_of_val(&value) as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn set_tcp_maxseg(stream: &TcpStream, mss: u32) -> io::Result<()> {
+    use std::{mem, os::windows::io::AsRawSocket};
+    use winapi::{
+        shared::ws2def::IPPROTO_TCP,
+        um::winsock2::{setsockopt, SOCKET_ERROR},
+    };
+
+    const TCP_MAXSEG: i32 = 4;
+    let value = mss as i32;
+    // SAFETY: the socket belongs to `stream`, and `value` has the exact size
+    // supplied to setsockopt for the duration of this call.
+    let rc = unsafe {
+        setsockopt(
+            stream.as_raw_socket() as _,
+            IPPROTO_TCP as i32,
+            TCP_MAXSEG,
+            &value as *const _ as *const i8,
+            mem::size_of_val(&value) as i32,
+        )
+    };
+    if rc == SOCKET_ERROR {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn set_tcp_maxseg(_stream: &TcpStream, _mss: u32) -> io::Result<()> {
+    Err(io::Error::new(
+        ErrorKind::Unsupported,
+        "TCP_MAXSEG is not supported on this platform",
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct RecordingWrites {
+        writes: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl AsyncRead for RecordingWrites {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for RecordingWrites {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes.lock().unwrap().push(buf.len());
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn framed_stream_splits_large_writes_into_path_safe_chunks() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let stream = RecordingWrites {
+            writes: writes.clone(),
+        };
+        let mut framed = FramedStream::from(stream, "127.0.0.1:0".parse().unwrap());
+        let data = Bytes::from(vec![7; 64 * 1024 + 321]);
+        let expected_payload_len = data.len();
+
+        framed.send_bytes(data).await.unwrap();
+
+        let writes = writes.lock().unwrap();
+        assert!(writes.len() > 1);
+        assert!(writes
+            .iter()
+            .all(|len| *len <= TCP_FRAMED_WRITE_CHUNK_LIMIT));
+        assert!(writes.iter().sum::<usize>() >= expected_payload_len);
+    }
+
+    #[test]
+    fn bounded_write_decision_excludes_small_and_raw_messages() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let stream = RecordingWrites { writes };
+        let mut framed = FramedStream::from(stream, "127.0.0.1:0".parse().unwrap());
+
+        assert!(!framed.should_send_bounded(TCP_FRAMED_WRITE_CHUNK_LIMIT));
+        assert!(framed.should_send_bounded(TCP_FRAMED_WRITE_CHUNK_LIMIT + 1));
+        framed.set_raw();
+        assert!(!framed.should_send_bounded(TCP_FRAMED_WRITE_CHUNK_LIMIT + 1));
+    }
+}
 
 impl Encrypt {
     pub fn new(key: Key) -> Self {
