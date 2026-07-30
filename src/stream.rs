@@ -590,6 +590,14 @@ impl Stream {
         }
     }
 
+    #[cfg(feature = "quic-transport")]
+    pub fn quic_peer_binding(&self) -> Option<&crate::transport::quic::QuicPeerBinding> {
+        match self {
+            Self::Quic(stream) => Some(stream.peer_binding()),
+            _ => None,
+        }
+    }
+
     #[inline]
     pub fn has_secure_transport(&self) -> bool {
         match self {

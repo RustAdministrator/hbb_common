@@ -4,7 +4,7 @@ use super::{
     datagram::{DatagramReceiveEvent, QuicDatagramReceiver, QuicDatagramSender},
     input::MouseMovementMode,
     protocol::{MessageType, PROTOCOL_VERSION},
-    quic::{AuthenticatedControlChannel, QuicConnectionStats, QuicTransportError},
+    quic::{AuthenticatedControlChannel, QuicConnectionStats, QuicPeerBinding, QuicTransportError},
     reliable::{
         ReliableChannel, ReliableChannelKind, ReliableChannelReceiver, ReliableChannelSender,
     },
@@ -186,6 +186,7 @@ impl<T> LatestSlot<T> {
 pub struct QuicApplicationStream {
     connection: Connection,
     _authentication: AuthenticatedControlChannel,
+    peer_binding: QuicPeerBinding,
     inbound: mpsc::Receiver<Result<BytesMut, Error>>,
     control: mpsc::Sender<ReliableOutbound>,
     input: mpsc::Sender<ReliableOutbound>,
@@ -213,6 +214,7 @@ impl QuicApplicationStream {
     ) -> Result<Self, QuicTransportError> {
         let connection = authentication.connection();
         let session_id = authentication.session_id();
+        let peer_binding = QuicPeerBinding::capture(&authentication)?;
         let agreement = negotiate_application_session(&mut authentication, role).await?;
         let channels = tokio::time::timeout(
             CHANNEL_SETUP_TIMEOUT,
@@ -323,6 +325,7 @@ impl QuicApplicationStream {
         Ok(Self {
             connection,
             _authentication: authentication,
+            peer_binding,
             inbound,
             control,
             input,
@@ -473,6 +476,10 @@ impl QuicApplicationStream {
 
     pub fn stats(&self) -> QuicConnectionStats {
         QuicConnectionStats::capture(&self.connection)
+    }
+
+    pub fn peer_binding(&self) -> &QuicPeerBinding {
+        &self.peer_binding
     }
 
     pub fn keep_endpoint_alive(&mut self, endpoint: Endpoint) {
