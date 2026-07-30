@@ -3550,6 +3550,14 @@ pub mod keys {
     /// - If unset, negative, or non-integer, no explicit limit is enforced for backward compatibility.
     pub const OPTION_FILE_TRANSFER_MAX_FILES: &str = "file-transfer-max-files";
     pub const OPTION_DISABLE_UDP: &str = "disable-udp";
+    pub const OPTION_TCP_WRITE_PACING: &str = "tcp-write-pacing";
+    pub const OPTION_REMOTE_TRANSPORT: &str = "remote-transport";
+    pub const OPTION_QUIC_LISTEN_ADDRESS: &str = "quic-listen-address";
+    pub const OPTION_QUIC_LISTEN_PORT: &str = "quic-listen-port";
+    pub const OPTION_QUIC_CONNECT_TIMEOUT_MS: &str = "quic-connect-timeout-ms";
+    pub const OPTION_QUIC_KEEPALIVE_INTERVAL_MS: &str = "quic-keepalive-interval-ms";
+    pub const OPTION_QUIC_ENABLE_IPV6: &str = "quic-enable-ipv6";
+    pub const OPTION_QUIC_FILE_BANDWIDTH_MBPS: &str = "quic-file-bandwidth-mbps";
     pub const OPTION_ALLOW_INSECURE_TLS_FALLBACK: &str = "allow-insecure-tls-fallback";
     pub const OPTION_SHOW_VIRTUAL_MOUSE: &str = "show-virtual-mouse";
     // joystick is the virtual mouse.
@@ -3776,6 +3784,14 @@ pub mod keys {
         OPTION_RELAY_SERVER,
         OPTION_ICE_SERVERS,
         OPTION_DISABLE_UDP,
+        OPTION_TCP_WRITE_PACING,
+        OPTION_REMOTE_TRANSPORT,
+        OPTION_QUIC_LISTEN_ADDRESS,
+        OPTION_QUIC_LISTEN_PORT,
+        OPTION_QUIC_CONNECT_TIMEOUT_MS,
+        OPTION_QUIC_KEEPALIVE_INTERVAL_MS,
+        OPTION_QUIC_ENABLE_IPV6,
+        OPTION_QUIC_FILE_BANDWIDTH_MBPS,
         OPTION_ALLOW_INSECURE_TLS_FALLBACK,
         OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS,
         OPTION_ALLOW_AUTO_UPDATE,

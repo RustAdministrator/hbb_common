@@ -1,4 +1,10 @@
-use crate::{bail, bytes_codec::BytesCodec, config::Socks5Server, proxy::Proxy, ResultType};
+use crate::{
+    bail,
+    bytes_codec::BytesCodec,
+    config::{keys, Config, Socks5Server},
+    proxy::Proxy,
+    ResultType,
+};
 use anyhow::Context as AnyhowCtx;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
@@ -14,6 +20,7 @@ use std::{
     pin::Pin,
     sync::atomic::{AtomicUsize, Ordering},
     task::{Context, Poll},
+    time::Instant,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf},
@@ -30,8 +37,261 @@ pub struct DynTcpStream(pub Box<dyn TcpStreamTrait + Send + Sync>);
 // virtual-adapter/offload paths as one application buffer.
 const TCP_FRAMED_WRITE_CHUNK_LIMIT: usize = 1200;
 const TCP_FRAMED_WRITE_MSS_CAP: u32 = TCP_FRAMED_WRITE_CHUNK_LIMIT as u32;
+const TCP_FRAMED_WRITE_PACING_INTERVAL: usize = 4;
+const TCP_FRAMED_WRITE_PACING_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
 const TCP_FRAMED_WRITE_LOG_LIMIT: usize = 32;
 static TCP_FRAMED_WRITE_LOGS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TcpInfoSnapshot {
+    pub state: i32,
+    pub mss: u32,
+    pub rtt_us: u32,
+    pub rtt_var_us: u32,
+    pub bytes_in_flight: u32,
+    pub congestion_window_bytes: u32,
+    pub send_window_bytes: u32,
+    pub receive_window_bytes: u32,
+    pub unacked_packets: u32,
+    pub lost_packets: u32,
+    pub retransmit_packets: u32,
+    pub retransmitted_bytes: u64,
+    pub timeout_episodes: u32,
+    pub path_mtu: u32,
+}
+
+impl std::fmt::Display for TcpInfoSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "state={}, mss={}, rtt_us={}, rtt_var_us={}, bytes_in_flight={}, cwnd_bytes={}, send_window_bytes={}, receive_window_bytes={}, unacked_packets={}, lost_packets={}, retransmit_packets={}, retransmitted_bytes={}, timeout_episodes={}, path_mtu={}",
+            self.state,
+            self.mss,
+            self.rtt_us,
+            self.rtt_var_us,
+            self.bytes_in_flight,
+            self.congestion_window_bytes,
+            self.send_window_bytes,
+            self.receive_window_bytes,
+            self.unacked_packets,
+            self.lost_packets,
+            self.retransmit_packets,
+            self.retransmitted_bytes,
+            self.timeout_episodes,
+            self.path_mtu
+        )
+    }
+}
+
+// Android's libc crate does not expose `tcp_info`. This is the stable Linux
+// UAPI prefix through `tcpi_total_retrans`; newer kernels may return more data,
+// which `getsockopt` safely truncates to this caller-provided buffer.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[repr(C)]
+#[derive(Default)]
+struct LinuxTcpInfo {
+    state: u8,
+    _ca_state: u8,
+    retransmits: u8,
+    _probes: u8,
+    _backoff: u8,
+    _options: u8,
+    _window_scales: u8,
+    _delivery_rate_flags: u8,
+    _rto: u32,
+    _ato: u32,
+    snd_mss: u32,
+    _rcv_mss: u32,
+    unacked: u32,
+    _sacked: u32,
+    lost: u32,
+    _retrans: u32,
+    _fackets: u32,
+    _last_data_sent: u32,
+    _last_ack_sent: u32,
+    _last_data_recv: u32,
+    _last_ack_recv: u32,
+    pmtu: u32,
+    _rcv_ssthresh: u32,
+    rtt: u32,
+    rtt_var: u32,
+    _snd_ssthresh: u32,
+    snd_cwnd: u32,
+    _advmss: u32,
+    _reordering: u32,
+    _rcv_rtt: u32,
+    rcv_space: u32,
+    total_retrans: u32,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[derive(Clone)]
+pub(crate) struct TcpSocketDiagnostics {
+    fd: std::os::unix::io::RawFd,
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+pub(crate) struct TcpSocketDiagnostics {
+    socket: std::os::windows::io::RawSocket,
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
+#[derive(Clone)]
+pub(crate) struct TcpSocketDiagnostics;
+
+impl TcpSocketDiagnostics {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn from_stream(stream: &TcpStream) -> Option<Self> {
+        use std::os::unix::io::AsRawFd;
+        Some(Self {
+            fd: stream.as_raw_fd(),
+        })
+    }
+
+    #[cfg(windows)]
+    fn from_stream(stream: &TcpStream) -> Option<Self> {
+        use std::os::windows::io::AsRawSocket;
+        Some(Self {
+            socket: stream.as_raw_socket(),
+        })
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
+    fn from_stream(_stream: &TcpStream) -> Option<Self> {
+        None
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fn snapshot(&self) -> io::Result<TcpInfoSnapshot> {
+        use std::mem;
+
+        let mut info = LinuxTcpInfo::default();
+        let mut len = mem::size_of::<LinuxTcpInfo>() as libc::socklen_t;
+        // SAFETY: `info` points to a buffer sized for `tcp_info`, and `fd`
+        // remains owned by the live framed stream while snapshots are taken.
+        let rc = unsafe {
+            libc::getsockopt(
+                self.fd,
+                libc::SOL_TCP,
+                libc::TCP_INFO,
+                &mut info as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if (len as usize) < mem::size_of::<LinuxTcpInfo>() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("TCP_INFO returned only {len} bytes"),
+            ));
+        }
+        let bytes_in_flight = info.unacked.saturating_mul(info.snd_mss);
+        Ok(TcpInfoSnapshot {
+            state: i32::from(info.state),
+            mss: info.snd_mss,
+            rtt_us: info.rtt,
+            rtt_var_us: info.rtt_var,
+            bytes_in_flight,
+            congestion_window_bytes: info.snd_cwnd.saturating_mul(info.snd_mss),
+            send_window_bytes: 0,
+            receive_window_bytes: info.rcv_space,
+            unacked_packets: info.unacked,
+            lost_packets: info.lost,
+            retransmit_packets: info.total_retrans,
+            retransmitted_bytes: 0,
+            timeout_episodes: u32::from(info.retransmits),
+            path_mtu: info.pmtu,
+        })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn snapshot(&self) -> io::Result<TcpInfoSnapshot> {
+        use std::{mem, ptr};
+        use winapi::{
+            shared::mstcpip::SIO_TCP_INFO,
+            um::winsock2::{WSAIoctl, SOCKET_ERROR},
+        };
+
+        #[repr(C)]
+        #[derive(Default)]
+        struct WindowsTcpInfoV1 {
+            state: i32,
+            mss: u32,
+            connection_time_ms: u64,
+            timestamps_enabled: u8,
+            rtt_us: u32,
+            min_rtt_us: u32,
+            bytes_in_flight: u32,
+            cwnd: u32,
+            send_window: u32,
+            receive_window: u32,
+            receive_buffer: u32,
+            bytes_out: u64,
+            bytes_in: u64,
+            bytes_reordered: u32,
+            bytes_retransmitted: u32,
+            fast_retransmit: u32,
+            duplicate_acks_in: u32,
+            timeout_episodes: u32,
+            syn_retransmit: u8,
+            send_limit_transitions_receive_window: u32,
+            send_limit_time_receive_window: u32,
+            send_limit_bytes_receive_window: u64,
+            send_limit_transitions_cwnd: u32,
+            send_limit_time_cwnd: u32,
+            send_limit_bytes_cwnd: u64,
+            send_limit_transitions_sender: u32,
+            send_limit_time_sender: u32,
+            send_limit_bytes_sender: u64,
+        }
+
+        let mut version = 1u32;
+        let mut info = WindowsTcpInfoV1::default();
+        let mut returned = 0u32;
+        // SAFETY: all pointers refer to live, correctly sized buffers and no
+        // overlapped operation is requested.
+        let rc = unsafe {
+            WSAIoctl(
+                self.socket as _,
+                SIO_TCP_INFO,
+                &mut version as *mut _ as _,
+                mem::size_of_val(&version) as u32,
+                &mut info as *mut _ as _,
+                mem::size_of::<WindowsTcpInfoV1>() as u32,
+                &mut returned,
+                ptr::null_mut(),
+                None,
+            )
+        };
+        if rc == SOCKET_ERROR {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(TcpInfoSnapshot {
+            state: info.state,
+            mss: info.mss,
+            rtt_us: info.rtt_us,
+            bytes_in_flight: info.bytes_in_flight,
+            congestion_window_bytes: info.cwnd,
+            send_window_bytes: info.send_window,
+            receive_window_bytes: info.receive_window,
+            retransmit_packets: info.fast_retransmit,
+            retransmitted_bytes: u64::from(info.bytes_retransmitted),
+            timeout_episodes: info.timeout_episodes,
+            ..Default::default()
+        })
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android", windows)))]
+    pub(crate) fn snapshot(&self) -> io::Result<TcpInfoSnapshot> {
+        Err(io::Error::new(
+            ErrorKind::Unsupported,
+            "TCP_INFO is not supported on this platform",
+        ))
+    }
+}
 
 #[derive(Clone)]
 pub struct Encrypt(pub Key, pub u64, pub u64);
@@ -41,6 +301,8 @@ pub struct FramedStream(
     pub SocketAddr,
     pub Option<Encrypt>,
     pub u64,
+    pub(crate) Option<TcpSocketDiagnostics>,
+    pub(crate) bool,
 );
 
 pub struct FramedReadHalf {
@@ -54,6 +316,8 @@ pub struct FramedWriteHalf {
     raw: bool,
     send_timeout: u64,
     pending: BytesMut,
+    diagnostics: Option<TcpSocketDiagnostics>,
+    write_pacing_enabled: bool,
 }
 
 impl Deref for FramedStream {
@@ -106,8 +370,19 @@ pub(crate) fn new_socket(
 }
 
 impl FramedStream {
+    pub fn from_dyn(stream: DynTcpStream, addr: SocketAddr) -> Self {
+        Self(
+            Framed::new(stream, BytesCodec::new()),
+            addr,
+            None,
+            0,
+            None,
+            tcp_write_pacing_enabled(),
+        )
+    }
+
     pub fn into_split(self) -> (FramedReadHalf, FramedWriteHalf) {
-        let Self(stream, _addr, encrypt, send_timeout) = self;
+        let Self(stream, _addr, encrypt, send_timeout, diagnostics, write_pacing_enabled) = self;
         let parts = stream.into_parts();
         let raw = parts.codec.is_raw();
         let (read_io, write_io) = tokio::io::split(parts.io);
@@ -124,6 +399,8 @@ impl FramedStream {
                 raw,
                 send_timeout,
                 pending: parts.write_buf,
+                diagnostics,
+                write_pacing_enabled,
             },
         )
     }
@@ -145,11 +422,14 @@ impl FramedStream {
                 {
                     configure_connected_tcp_stream(&stream, "connect");
                     let addr = stream.local_addr()?;
+                    let diagnostics = TcpSocketDiagnostics::from_stream(&stream);
                     return Ok(Self(
                         Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::new()),
                         addr,
                         None,
                         0,
+                        diagnostics,
+                        tcp_write_pacing_enabled(),
                     ));
                 }
             }
@@ -184,12 +464,22 @@ impl FramedStream {
             addr,
             None,
             0,
+            None,
+            tcp_write_pacing_enabled(),
         )
     }
 
     pub fn from_tcp(stream: TcpStream, addr: SocketAddr) -> Self {
         configure_connected_tcp_stream(&stream, "accepted");
-        Self::from(stream, addr)
+        let diagnostics = TcpSocketDiagnostics::from_stream(&stream);
+        Self(
+            Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::new()),
+            addr,
+            None,
+            0,
+            diagnostics,
+            tcp_write_pacing_enabled(),
+        )
     }
 
     pub fn set_raw(&mut self) {
@@ -257,14 +547,24 @@ impl FramedStream {
             );
         }
 
-        let stream = self.0.get_mut();
-        let mut offset = 0;
-        while offset < total_len {
-            let end = (offset + TCP_FRAMED_WRITE_CHUNK_LIMIT).min(total_len);
-            stream.write_all(&framed[offset..end]).await?;
-            offset = end;
+        let pacing_enabled = self.5;
+        let started = Instant::now();
+        let paced_delays =
+            write_wire_bytes(self.0.get_mut(), &framed, true, pacing_enabled).await?;
+        if pacing_enabled
+            && (log_count < TCP_FRAMED_WRITE_LOG_LIMIT || started.elapsed().as_millis() >= 250)
+        {
+            log::info!(
+                "tcp paced framed write: total_bytes={}, chunks={}, paced_delays={}, pacing_delay_ms={}, elapsed_ms={}, local={}",
+                total_len,
+                chunk_count,
+                paced_delays,
+                TCP_FRAMED_WRITE_PACING_DELAY.as_millis(),
+                started.elapsed().as_millis(),
+                self.1
+            );
         }
-        stream.flush().await
+        self.0.get_mut().flush().await
     }
 
     #[inline]
@@ -282,11 +582,7 @@ impl FramedStream {
 
     #[inline]
     pub async fn next_timeout(&mut self, ms: u64) -> Option<Result<BytesMut, Error>> {
-        if let Ok(res) = super::timeout(ms, self.next()).await {
-            res
-        } else {
-            None
-        }
+        super::timeout(ms, self.next()).await.unwrap_or_default()
     }
 
     pub fn set_key(&mut self, key: Key) {
@@ -339,26 +635,76 @@ impl FramedWriteHalf {
     async fn send_bytes_inner(&mut self, bytes: Bytes) -> io::Result<()> {
         if !self.pending.is_empty() {
             let pending = self.pending.split().freeze();
-            self.write_wire_bytes(&pending, !self.raw).await?;
+            let bounded = !self.raw;
+            self.write_wire_bytes(&pending, bounded, bounded && self.write_pacing_enabled)
+                .await?;
         }
 
         let bounded = bytes.len() > TCP_FRAMED_WRITE_CHUNK_LIMIT && !self.raw;
         let mut framed = BytesMut::with_capacity(bytes.len() + 4);
         BytesCodec::encode_frame(self.raw, bytes, &mut framed)?;
-        self.write_wire_bytes(&framed, bounded).await?;
+        let pacing_enabled = bounded && self.write_pacing_enabled;
+        let started = Instant::now();
+        let paced_delays = self
+            .write_wire_bytes(&framed, bounded, pacing_enabled)
+            .await?;
+        if pacing_enabled && started.elapsed().as_millis() >= 250 {
+            log::info!(
+                "tcp split writer pacing summary: total_bytes={}, paced_delays={}, pacing_delay_ms={}, elapsed_ms={}",
+                framed.len(),
+                paced_delays,
+                TCP_FRAMED_WRITE_PACING_DELAY.as_millis(),
+                started.elapsed().as_millis()
+            );
+        }
         self.stream.flush().await
     }
 
-    async fn write_wire_bytes(&mut self, bytes: &[u8], bounded: bool) -> io::Result<()> {
-        if bounded {
-            for chunk in bytes.chunks(TCP_FRAMED_WRITE_CHUNK_LIMIT) {
-                self.stream.write_all(chunk).await?;
-            }
-        } else {
-            self.stream.write_all(bytes).await?;
-        }
-        Ok(())
+    async fn write_wire_bytes(
+        &mut self,
+        bytes: &[u8],
+        bounded: bool,
+        pacing_enabled: bool,
+    ) -> io::Result<usize> {
+        write_wire_bytes(&mut self.stream, bytes, bounded, pacing_enabled).await
     }
+
+    pub(crate) fn tcp_diagnostics(&self) -> Option<TcpSocketDiagnostics> {
+        // The raw identifier remains valid because the returned clone is used
+        // only inside the writer task while this write half owns the socket.
+        self.diagnostics.clone()
+    }
+}
+
+pub(crate) fn tcp_write_pacing_enabled() -> bool {
+    Config::get_option(keys::OPTION_TCP_WRITE_PACING) == "Y"
+}
+
+async fn write_wire_bytes<W: AsyncWrite + Unpin>(
+    stream: &mut W,
+    bytes: &[u8],
+    bounded: bool,
+    pacing_enabled: bool,
+) -> io::Result<usize> {
+    if !bounded {
+        stream.write_all(bytes).await?;
+        return Ok(0);
+    }
+
+    let chunks = bytes.chunks(TCP_FRAMED_WRITE_CHUNK_LIMIT);
+    let chunk_count = chunks.len();
+    let mut paced_delays = 0;
+    for (index, chunk) in chunks.enumerate() {
+        stream.write_all(chunk).await?;
+        if pacing_enabled
+            && index + 1 < chunk_count
+            && (index + 1) % TCP_FRAMED_WRITE_PACING_INTERVAL == 0
+        {
+            tokio::time::sleep(TCP_FRAMED_WRITE_PACING_DELAY).await;
+            paced_delays += 1;
+        }
+    }
+    Ok(paced_delays)
 }
 
 const DEFAULT_BACKLOG: u32 = 128;
@@ -614,6 +960,56 @@ mod tests {
         assert!(writes
             .iter()
             .all(|len| *len <= TCP_FRAMED_WRITE_CHUNK_LIMIT));
+    }
+
+    #[tokio::test]
+    async fn paced_writer_delays_after_each_four_chunks_except_the_last() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let mut stream = RecordingWrites {
+            writes: writes.clone(),
+        };
+        let data = vec![3; TCP_FRAMED_WRITE_CHUNK_LIMIT * 10];
+
+        let paced_delays = write_wire_bytes(&mut stream, &data, true, true)
+            .await
+            .unwrap();
+
+        assert_eq!(paced_delays, 2);
+        assert_eq!(writes.lock().unwrap().len(), 10);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn native_tcp_info_snapshot_reports_live_socket_state() {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("loopback bind failed: {}", error),
+        };
+        let address = listener.local_addr().unwrap();
+        let connect = TcpStream::connect(address);
+        let accept = listener.accept();
+        let (client, accepted) = tokio::join!(connect, accept);
+        let client = match client {
+            Ok(client) => client,
+            Err(error) if error.kind() == ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("loopback connect failed: {}", error),
+        };
+        let (_server, _) = match accepted {
+            Ok(accepted) => accepted,
+            Err(error) if error.kind() == ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("loopback accept failed: {}", error),
+        };
+        let diagnostics = TcpSocketDiagnostics::from_stream(&client).unwrap();
+
+        let snapshot = match diagnostics.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) if error.kind() == ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("TCP_INFO snapshot failed: {}", error),
+        };
+
+        assert!(snapshot.state > 0);
+        assert!(snapshot.mss > 0);
     }
 
     struct ReadableBlockedWrite {

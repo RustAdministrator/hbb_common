@@ -9,6 +9,7 @@ edition = "2018"
 [features]
 default = []
 webrtc = ["dep:webrtc"]
+quic-transport = ["dep:quinn"]
 
 [dependencies]
 # new flexi_logger failed on rustc 1.75
@@ -51,6 +52,7 @@ base64 = "0.22"
 url = "2.5"
 sha2 = "0.10"
 whoami = "1.5"
+quinn = { version = "=0.11.9", optional = true, default-features = false, features = ["log", "runtime-tokio", "rustls-ring"] }
 
 tokio-rustls = { version = "0.26", features = [
     "logging",
@@ -78,6 +80,7 @@ protobuf-codegen = { version = "3.7" }
 
 [dev-dependencies]
 clap = "4.5.51"
+rcgen = "0.13.2"
 webrtc = "0.14.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]
@@ -89,6 +92,7 @@ winapi = { version = "0.3", features = [
     "sysinfoapi",
     "winsock2",
     "ws2def",
+    "mstcpip",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
