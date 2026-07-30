@@ -79,6 +79,19 @@ struct VideoOutbound {
     ordering_epoch: u64,
 }
 
+impl VideoOutbound {
+    fn is_keyframe(&self) -> bool {
+        self.metadata.flags & FLAG_KEYFRAME != 0
+    }
+}
+
+fn should_replace_pending_video(pending: &VideoOutbound, incoming: &VideoOutbound) -> bool {
+    if incoming.ordering_epoch != pending.ordering_epoch {
+        return incoming.ordering_epoch > pending.ordering_epoch;
+    }
+    !pending.is_keyframe() || incoming.is_keyframe()
+}
+
 struct AudioOutbound {
     capture_timestamp_us: u64,
     channels: u8,
@@ -164,12 +177,21 @@ impl<T> LatestSlot<T> {
     }
 
     fn replace(&self, value: T) {
+        self.replace_when(value, |_, _| true);
+    }
+
+    fn replace_when(&self, value: T, should_replace: impl FnOnce(&T, &T) -> bool) -> bool {
         let mut slot = self.value.lock().unwrap();
-        if slot.replace(value).is_some() {
+        if let Some(pending) = slot.as_ref() {
+            if !should_replace(pending, &value) {
+                return false;
+            }
             self.replacements.fetch_add(1, Ordering::Relaxed);
         }
+        *slot = Some(value);
         drop(slot);
         self.notify.notify_one();
+        true
     }
 
     async fn take(&self) -> T {
@@ -390,11 +412,14 @@ impl QuicApplicationStream {
                             "transport video frame identifier exhausted".to_owned(),
                         )
                     })?;
-                self.latest_video.replace(VideoOutbound {
-                    metadata,
-                    payload,
-                    ordering_epoch: self.video_ordering.current_epoch(),
-                });
+                self.latest_video.replace_when(
+                    VideoOutbound {
+                        metadata,
+                        payload,
+                        ordering_epoch: self.video_ordering.current_epoch(),
+                    },
+                    should_replace_pending_video,
+                );
                 Ok(())
             }
             ApplicationClass::Audio => self.enqueue_audio(payload),
@@ -832,7 +857,11 @@ async fn run_video_writer(
         while !video_ordering.is_open(item.ordering_epoch) {
             tokio::select! {
                 _ = video_ordering.wait(item.ordering_epoch) => {},
-                newer = video.take() => item = newer,
+                newer = video.take() => {
+                    if should_replace_pending_video(&item, &newer) {
+                        item = newer;
+                    }
+                },
             }
         }
         if let Err(error) = sender
@@ -1337,6 +1366,50 @@ mod tests {
                 presentation_timestamp_us: 17_000,
             })
         );
+    }
+
+    fn outbound_video(frame_id: u64, keyframe: bool, ordering_epoch: u64) -> VideoOutbound {
+        VideoOutbound {
+            metadata: VideoFrameMetadata {
+                frame_id,
+                codec: VideoCodec::H264,
+                flags: if keyframe { FLAG_KEYFRAME } else { 0 },
+                presentation_timestamp_us: frame_id * 1_000,
+            },
+            payload: Bytes::from(vec![frame_id as u8]),
+            ordering_epoch,
+        }
+    }
+
+    #[tokio::test]
+    async fn latest_video_slot_preserves_pending_keyframe_from_same_epoch_delta() {
+        let slot = LatestSlot::new();
+        assert!(slot.replace_when(outbound_video(1, true, 4), should_replace_pending_video));
+        assert!(!slot.replace_when(outbound_video(2, false, 4), should_replace_pending_video));
+
+        let pending = slot.take().await;
+        assert_eq!(pending.metadata.frame_id, 1);
+        assert!(pending.is_keyframe());
+    }
+
+    #[test]
+    fn pending_video_selection_keeps_latency_and_ordering_semantics() {
+        assert!(should_replace_pending_video(
+            &outbound_video(2, false, 4),
+            &outbound_video(3, false, 4)
+        ));
+        assert!(should_replace_pending_video(
+            &outbound_video(1, true, 4),
+            &outbound_video(4, true, 4)
+        ));
+        assert!(should_replace_pending_video(
+            &outbound_video(1, true, 4),
+            &outbound_video(5, false, 5)
+        ));
+        assert!(!should_replace_pending_video(
+            &outbound_video(5, false, 5),
+            &outbound_video(1, true, 4)
+        ));
     }
 
     #[test]
