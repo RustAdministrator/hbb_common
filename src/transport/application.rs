@@ -3,8 +3,11 @@ use super::{
     configuration::NetworkTransportConfig,
     datagram::{DatagramReceiveEvent, QuicDatagramReceiver, QuicDatagramSender},
     input::MouseMovementMode,
-    protocol::{MessageType, PROTOCOL_VERSION},
-    quic::{AuthenticatedControlChannel, QuicConnectionStats, QuicPeerBinding, QuicTransportError},
+    protocol::MessageType,
+    quic::{
+        negotiated_application_protocol, AuthenticatedControlChannel, QuicApplicationProtocol,
+        QuicConnectionStats, QuicPeerBinding, QuicTransportError,
+    },
     reliable::{
         ReliableChannel, ReliableChannelKind, ReliableChannelReceiver, ReliableChannelSender,
     },
@@ -12,8 +15,8 @@ use super::{
         decode_session_acceptance, decode_session_offer, encode_session_acceptance,
         encode_session_offer, negotiate_session, validate_session_acceptance, LatencyMode,
         SessionAgreement, SessionOffer, CAP_CLIPBOARD_RECEIVE, CAP_CLIPBOARD_SEND,
-        CAP_FILE_TRANSFER, CAP_INPUT_RECEIVE, CAP_INPUT_SEND, COLOR_I420, COLOR_I444, COLOR_NV12,
-        COLOR_P010,
+        CAP_FILE_TRANSFER, CAP_INPUT_RECEIVE, CAP_INPUT_SEND, CAP_RELIABLE_KEYFRAMES, COLOR_I420,
+        COLOR_I444, COLOR_NV12, COLOR_P010,
     },
     video_datagram::{VideoCodec, VideoFrameMetadata, VideoReassemblyConfig, FLAG_KEYFRAME},
 };
@@ -44,6 +47,7 @@ const FILE_OUTBOUND_CAPACITY: usize = 32;
 const DIAGNOSTICS_OUTBOUND_CAPACITY: usize = 64;
 const AUDIO_OUTBOUND_CAPACITY: usize = 64;
 const CHANNEL_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+const V2_MAX_APPLICATION_DATAGRAM_SIZE: usize = 1300;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApplicationQuicRole {
@@ -77,6 +81,14 @@ struct VideoOutbound {
     metadata: VideoFrameMetadata,
     payload: Bytes,
     ordering_epoch: u64,
+}
+
+#[derive(Default)]
+struct QuicApplicationMetrics {
+    video_reassembly_drops: AtomicU64,
+    video_keyframe_requests: AtomicU64,
+    reliable_keyframes_sent: AtomicU64,
+    reliable_keyframes_received: AtomicU64,
 }
 
 impl VideoOutbound {
@@ -223,6 +235,8 @@ pub struct QuicApplicationStream {
     video_ordering: Arc<VideoOrderingGate>,
     raw_mode: AtomicBool,
     agreement: SessionAgreement,
+    application_protocol: QuicApplicationProtocol,
+    metrics: Arc<QuicApplicationMetrics>,
     local_addr: SocketAddr,
     _endpoint_lease: Option<Endpoint>,
     tasks: Vec<JoinHandle<()>>,
@@ -237,10 +251,17 @@ impl QuicApplicationStream {
         let connection = authentication.connection();
         let session_id = authentication.session_id();
         let peer_binding = QuicPeerBinding::capture(&authentication)?;
-        let agreement = negotiate_application_session(&mut authentication, role).await?;
+        let application_protocol = negotiated_application_protocol(&connection)?;
+        let agreement =
+            negotiate_application_session(&mut authentication, role, application_protocol).await?;
         let channels = tokio::time::timeout(
             CHANNEL_SETUP_TIMEOUT,
-            establish_application_channels(&connection, session_id, role),
+            establish_application_channels(
+                &connection,
+                session_id,
+                role,
+                agreement.reliable_keyframes,
+            ),
         )
         .await
         .map_err(|_| QuicTransportError::Timeout("application channel setup"))??;
@@ -248,6 +269,7 @@ impl QuicApplicationStream {
         let (inbound_tx, inbound) = mpsc::channel(APPLICATION_INBOUND_CAPACITY);
         let mut tasks = Vec::with_capacity(16);
         let video_ordering = VideoOrderingGate::new();
+        let metrics = Arc::new(QuicApplicationMetrics::default());
         let (control, task_pair) = spawn_reliable_channel(
             channels.control,
             ReliableChannelKind::Control,
@@ -255,6 +277,7 @@ impl QuicApplicationStream {
             inbound_tx.clone(),
             connection.clone(),
             video_ordering.clone(),
+            metrics.clone(),
             None,
         );
         tasks.extend(task_pair);
@@ -265,6 +288,7 @@ impl QuicApplicationStream {
             inbound_tx.clone(),
             connection.clone(),
             video_ordering.clone(),
+            metrics.clone(),
             None,
         );
         tasks.extend(task_pair);
@@ -275,6 +299,7 @@ impl QuicApplicationStream {
             inbound_tx.clone(),
             connection.clone(),
             video_ordering.clone(),
+            metrics.clone(),
             None,
         );
         tasks.extend(task_pair);
@@ -285,6 +310,7 @@ impl QuicApplicationStream {
             inbound_tx.clone(),
             connection.clone(),
             video_ordering.clone(),
+            metrics.clone(),
             Some(agreement.max_file_bitrate_kbps),
         );
         tasks.extend(task_pair);
@@ -295,9 +321,26 @@ impl QuicApplicationStream {
             inbound_tx.clone(),
             connection.clone(),
             video_ordering.clone(),
+            metrics.clone(),
             None,
         );
         tasks.extend(task_pair);
+
+        let reliable_video_sender = if let Some(channel) = channels.video {
+            let (sender, receiver) = channel.into_split();
+            tasks.push(tokio::spawn(run_reliable_reader(
+                receiver,
+                ReliableChannelKind::Video,
+                inbound_tx.clone(),
+                connection.clone(),
+                None,
+                video_ordering.clone(),
+                metrics.clone(),
+            )));
+            Some(sender)
+        } else {
+            None
+        };
 
         let (audio, audio_rx) = mpsc::channel(AUDIO_OUTBOUND_CAPACITY);
         let latest_video = LatestSlot::new();
@@ -310,6 +353,8 @@ impl QuicApplicationStream {
             video_ordering.clone(),
             inbound_tx.clone(),
             connection.clone(),
+            reliable_video_sender,
+            metrics.clone(),
         )));
         tasks.push(tokio::spawn(run_mouse_writer(
             QuicDatagramSender::new(connection.clone(), session_id)
@@ -325,24 +370,33 @@ impl QuicApplicationStream {
             inbound_tx.clone(),
             connection.clone(),
         )));
+        let video_reassembly_config = VideoReassemblyConfig {
+            // Version 2 keyframes arrive on their reliable stream and therefore
+            // never pass through the DATAGRAM reassembler's startup gate.
+            require_initial_keyframe: !agreement.reliable_keyframes,
+            ..VideoReassemblyConfig::default()
+        };
         tasks.push(tokio::spawn(run_datagram_reader(
             QuicDatagramReceiver::new(
                 connection.clone(),
                 session_id,
-                VideoReassemblyConfig::default(),
+                video_reassembly_config,
                 AudioJitterConfig::default(),
             )?
             .with_max_datagram_size(negotiated_datagram_size),
             inbound_tx,
             control.clone(),
             connection.clone(),
+            metrics.clone(),
         )));
 
         log::info!(
-            "QUIC application channels ready: role={role:?}, local={local_addr}, peer={}, mtu={}, datagram_payload={:?}",
+            "QUIC application channels ready: role={role:?}, protocol={application_protocol:?}, reliable_keyframes={}, local={local_addr}, peer={}, mtu={}, datagram_payload_live={:?}, datagram_payload_negotiated={}",
+            agreement.reliable_keyframes,
             connection.remote_address(),
             connection.stats().path.current_mtu,
-            connection.max_datagram_size()
+            connection.max_datagram_size(),
+            agreement.max_datagram_payload,
         );
         Ok(Self {
             connection,
@@ -362,6 +416,8 @@ impl QuicApplicationStream {
             video_ordering,
             raw_mode: AtomicBool::new(false),
             agreement,
+            application_protocol,
+            metrics,
             local_addr,
             _endpoint_lease: None,
             tasks,
@@ -500,7 +556,20 @@ impl QuicApplicationStream {
     }
 
     pub fn stats(&self) -> QuicConnectionStats {
-        QuicConnectionStats::capture(&self.connection)
+        let mut stats = QuicConnectionStats::capture(&self.connection);
+        stats.application_protocol = self.application_protocol as u16;
+        stats.negotiated_datagram_size = Some(usize::from(self.agreement.max_datagram_payload));
+        stats.reliable_keyframes = self.agreement.reliable_keyframes;
+        stats.video_reassembly_drops = self.metrics.video_reassembly_drops.load(Ordering::Relaxed);
+        stats.video_keyframe_requests =
+            self.metrics.video_keyframe_requests.load(Ordering::Relaxed);
+        stats.reliable_keyframes_sent =
+            self.metrics.reliable_keyframes_sent.load(Ordering::Relaxed);
+        stats.reliable_keyframes_received = self
+            .metrics
+            .reliable_keyframes_received
+            .load(Ordering::Relaxed);
+        stats
     }
 
     pub fn peer_binding(&self) -> &QuicPeerBinding {
@@ -529,8 +598,10 @@ impl Drop for QuicApplicationStream {
 async fn negotiate_application_session(
     authentication: &mut AuthenticatedControlChannel,
     role: ApplicationQuicRole,
+    application_protocol: QuicApplicationProtocol,
 ) -> Result<SessionAgreement, QuicTransportError> {
-    let local_offer = application_session_offer(&authentication.connection())?;
+    let local_offer =
+        application_session_offer(&authentication.connection(), application_protocol)?;
     let agreement = match role {
         ApplicationQuicRole::Client => {
             let encoded = encode_session_offer(&local_offer).map_err(session_negotiation_error)?;
@@ -571,40 +642,56 @@ async fn negotiate_application_session(
         }
     };
     log::info!(
-        "QUIC session negotiated: protocol={}, video={:?}, audio={:?}, color={:?}, mtu_payload={}, max_fps={}, file_kbps={}",
+        "QUIC session negotiated: protocol={}, video={:?}, audio={:?}, color={:?}, mtu_payload={}, reliable_keyframes={}, max_fps={}, file_kbps={}",
         agreement.protocol_version,
         agreement.video_codec,
         agreement.audio_codec,
         agreement.color_format,
         agreement.max_datagram_payload,
+        agreement.reliable_keyframes,
         agreement.max_fps,
         agreement.max_file_bitrate_kbps
     );
     Ok(agreement)
 }
 
-fn application_session_offer(connection: &Connection) -> Result<SessionOffer, QuicTransportError> {
+fn application_session_offer(
+    connection: &Connection,
+    application_protocol: QuicApplicationProtocol,
+) -> Result<SessionOffer, QuicTransportError> {
     let config = NetworkTransportConfig::load()
         .map_err(|error| QuicTransportError::Configuration(error.to_string()))?;
-    let max_datagram_payload = connection
+    let current_datagram_payload = connection
         .max_datagram_size()
         .ok_or_else(|| {
             QuicTransportError::Datagram("peer did not negotiate QUIC DATAGRAM".to_owned())
         })?
-        .clamp(256, 65_000) as u16;
+        .clamp(256, 65_000);
+    let max_datagram_payload = if application_protocol.supports_reliable_keyframes() {
+        current_datagram_payload
+            .max(V2_MAX_APPLICATION_DATAGRAM_SIZE)
+            .min(65_000)
+    } else {
+        current_datagram_payload
+    } as u16;
     let file_kbps = if config.file_bandwidth_limit_mbps == 0 {
         1_000_000
     } else {
         config.file_bandwidth_limit_mbps.saturating_mul(1_000)
     };
     Ok(SessionOffer {
-        minimum_protocol_version: PROTOCOL_VERSION,
-        maximum_protocol_version: PROTOCOL_VERSION,
+        minimum_protocol_version: application_protocol as u16,
+        maximum_protocol_version: application_protocol as u16,
         capabilities: CAP_CLIPBOARD_SEND
             | CAP_CLIPBOARD_RECEIVE
             | CAP_FILE_TRANSFER
             | CAP_INPUT_SEND
-            | CAP_INPUT_RECEIVE,
+            | CAP_INPUT_RECEIVE
+            | if application_protocol.supports_reliable_keyframes() {
+                CAP_RELIABLE_KEYFRAMES
+            } else {
+                0
+            },
         latency_mode: LatencyMode::LowLatency,
         video_codecs: vec![
             VideoCodec::Av1,
@@ -635,25 +722,22 @@ struct ApplicationChannels {
     clipboard: ReliableChannel,
     file: ReliableChannel,
     diagnostics: ReliableChannel,
+    video: Option<ReliableChannel>,
 }
 
 async fn establish_application_channels(
     connection: &Connection,
     session_id: [u8; 16],
     role: ApplicationQuicRole,
+    reliable_keyframes: bool,
 ) -> Result<ApplicationChannels, QuicTransportError> {
     let mut control = None;
     let mut input = None;
     let mut clipboard = None;
     let mut file = None;
     let mut diagnostics = None;
-    for expected in [
-        ReliableChannelKind::Control,
-        ReliableChannelKind::Input,
-        ReliableChannelKind::Clipboard,
-        ReliableChannelKind::FileTransfer,
-        ReliableChannelKind::Diagnostics,
-    ] {
+    let mut video = None;
+    for expected in application_channel_kinds(reliable_keyframes) {
         let channel = match role {
             ApplicationQuicRole::Client => {
                 ReliableChannel::open(connection, expected, session_id).await?
@@ -666,6 +750,7 @@ async fn establish_application_channels(
             ReliableChannelKind::Clipboard => &mut clipboard,
             ReliableChannelKind::FileTransfer => &mut file,
             ReliableChannelKind::Diagnostics => &mut diagnostics,
+            ReliableChannelKind::Video => &mut video,
         };
         if slot.replace(channel).is_some() {
             return Err(QuicTransportError::ProtocolState(
@@ -679,7 +764,26 @@ async fn establish_application_channels(
         clipboard: require_channel(clipboard, "clipboard")?,
         file: require_channel(file, "file")?,
         diagnostics: require_channel(diagnostics, "diagnostics")?,
+        video: if reliable_keyframes {
+            Some(require_channel(video, "reliable video")?)
+        } else {
+            None
+        },
     })
+}
+
+fn application_channel_kinds(reliable_keyframes: bool) -> Vec<ReliableChannelKind> {
+    let mut channels = vec![
+        ReliableChannelKind::Control,
+        ReliableChannelKind::Input,
+        ReliableChannelKind::Clipboard,
+        ReliableChannelKind::FileTransfer,
+        ReliableChannelKind::Diagnostics,
+    ];
+    if reliable_keyframes {
+        channels.push(ReliableChannelKind::Video);
+    }
+    channels
 }
 
 fn require_channel(
@@ -698,6 +802,7 @@ fn spawn_reliable_channel(
     inbound: mpsc::Sender<Result<BytesMut, Error>>,
     connection: Connection,
     video_ordering: Arc<VideoOrderingGate>,
+    metrics: Arc<QuicApplicationMetrics>,
     bandwidth_limit_kbps: Option<u32>,
 ) -> (mpsc::Sender<ReliableOutbound>, [JoinHandle<()>; 2]) {
     let (sender, receiver) = channel.into_split();
@@ -719,6 +824,7 @@ fn spawn_reliable_channel(
         connection,
         internal_control,
         video_ordering,
+        metrics,
     ));
     (outbound, [writer, reader])
 }
@@ -759,6 +865,7 @@ async fn run_reliable_reader(
     connection: Connection,
     internal_control: Option<mpsc::Sender<ReliableOutbound>>,
     video_ordering: Arc<VideoOrderingGate>,
+    metrics: Arc<QuicApplicationMetrics>,
 ) {
     loop {
         let message = match receiver.receive().await {
@@ -835,6 +942,11 @@ async fn run_reliable_reader(
                 _ => {}
             }
         }
+        if expected_kind == ReliableChannelKind::Video {
+            metrics
+                .reliable_keyframes_received
+                .fetch_add(1, Ordering::Relaxed);
+        }
         if inbound
             .send(Ok(BytesMut::from(message.payload.as_slice())))
             .await
@@ -851,7 +963,10 @@ async fn run_video_writer(
     video_ordering: Arc<VideoOrderingGate>,
     inbound: mpsc::Sender<Result<BytesMut, Error>>,
     connection: Connection,
+    mut reliable_sender: Option<ReliableChannelSender>,
+    metrics: Arc<QuicApplicationMetrics>,
 ) {
+    let started = Instant::now();
     loop {
         let mut item = video.take().await;
         while !video_ordering.is_open(item.ordering_epoch) {
@@ -862,6 +977,27 @@ async fn run_video_writer(
                         item = newer;
                     }
                 },
+            }
+        }
+        if item.is_keyframe() {
+            if let Some(reliable_sender) = reliable_sender.as_mut() {
+                let timestamp = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+                if let Err(error) = reliable_sender
+                    .send(MessageType::ReliableVideoFrame, 0, timestamp, &item.payload)
+                    .await
+                {
+                    report_terminal_error(&inbound, &connection, error.to_string()).await;
+                    return;
+                }
+                metrics
+                    .reliable_keyframes_sent
+                    .fetch_add(1, Ordering::Relaxed);
+                log::debug!(
+                    "QUIC reliable keyframe sent: frame_id={}, bytes={}",
+                    item.metadata.frame_id,
+                    item.payload.len()
+                );
+                continue;
             }
         }
         if let Err(error) = sender
@@ -929,6 +1065,7 @@ async fn run_datagram_reader(
     inbound: mpsc::Sender<Result<BytesMut, Error>>,
     control: mpsc::Sender<ReliableOutbound>,
     connection: Connection,
+    metrics: Arc<QuicApplicationMetrics>,
 ) {
     let mut received_audio_format = None;
     loop {
@@ -941,7 +1078,18 @@ async fn run_datagram_reader(
         };
         match event {
             DatagramReceiveEvent::Video(outcome) => {
+                let video_stats = receiver.video_stats();
+                metrics.video_reassembly_drops.store(
+                    video_stats
+                        .expired_frames
+                        .saturating_add(video_stats.evicted_frames)
+                        .saturating_add(video_stats.pre_keyframe_frames),
+                    Ordering::Relaxed,
+                );
                 if outcome.request_keyframe {
+                    metrics
+                        .video_keyframe_requests
+                        .fetch_add(1, Ordering::Relaxed);
                     let _ = control.try_send(ReliableOutbound {
                         message_type: MessageType::ApplicationControl,
                         payload: Bytes::from(refresh_video_message()),
@@ -1080,6 +1228,10 @@ fn validate_reliable_application_message(
         }
         ReliableChannelKind::Diagnostics => {
             message_type == MessageType::Diagnostics && class == ApplicationClass::Diagnostics
+        }
+        ReliableChannelKind::Video => {
+            message_type == MessageType::ReliableVideoFrame
+                && matches!(class, ApplicationClass::Video(metadata) if metadata.flags & FLAG_KEYFRAME != 0)
         }
     };
     if valid {
@@ -1413,6 +1565,23 @@ mod tests {
     }
 
     #[test]
+    fn v1_keeps_five_channels_and_v2_adds_only_reliable_video() {
+        assert_eq!(
+            application_channel_kinds(false),
+            vec![
+                ReliableChannelKind::Control,
+                ReliableChannelKind::Input,
+                ReliableChannelKind::Clipboard,
+                ReliableChannelKind::FileTransfer,
+                ReliableChannelKind::Diagnostics,
+            ]
+        );
+        let v2 = application_channel_kinds(true);
+        assert_eq!(v2.len(), 6);
+        assert_eq!(v2.last(), Some(&ReliableChannelKind::Video));
+    }
+
+    #[test]
     fn audio_format_pack_is_bounded() {
         let format = AudioFormat {
             sample_rate: 48_000,
@@ -1607,6 +1776,44 @@ mod tests {
         })
         .await
         .unwrap();
+
+        assert_eq!(client_stream.stats().application_protocol, 2);
+        assert!(client_stream.stats().reliable_keyframes);
+        assert!(client_stream.stats().reliable_keyframes_sent >= 1);
+        assert!(server_stream.stats().reliable_keyframes_received >= 1);
+
+        let mut delta = Message::new();
+        let mut delta_frame = VideoFrame {
+            frame_id: 2,
+            capture_time_ms: 4,
+            ..Default::default()
+        };
+        delta_frame.set_h264s(EncodedVideoFrames {
+            frames: vec![EncodedVideoFrame {
+                data: Bytes::from(vec![9; 2_000]),
+                key: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        delta.set_video_frame(delta_frame);
+        client_stream
+            .enqueue(Bytes::from(delta.write_to_bytes().unwrap()))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let bytes = server_stream.next().await.unwrap().unwrap();
+                let message = Message::parse_from_bytes(&bytes).unwrap();
+                if matches!(
+                    message.union,
+                    Some(message::Union::VideoFrame(frame)) if frame.frame_id == 2
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("DATAGRAM delta must follow a reliable startup keyframe");
 
         client_stream.set_raw();
         client_stream

@@ -16,6 +16,7 @@ const MAX_CLIPBOARD_STREAM_MESSAGE: usize = HEADER_LEN + 16 * 1024 * 1024;
 const MAX_FILE_STREAM_MESSAGE: usize = HEADER_LEN + 1024 * 1024;
 const MAX_INPUT_STREAM_MESSAGE: usize = HEADER_LEN + 4 * 1024;
 const MAX_DIAGNOSTICS_STREAM_MESSAGE: usize = HEADER_LEN + 64 * 1024;
+const MAX_VIDEO_STREAM_MESSAGE: usize = HEADER_LEN + 32 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReliableChannelKind {
@@ -24,6 +25,7 @@ pub enum ReliableChannelKind {
     Clipboard,
     FileTransfer,
     Diagnostics,
+    Video,
 }
 
 impl ReliableChannelKind {
@@ -34,6 +36,7 @@ impl ReliableChannelKind {
             Self::Clipboard => ChannelId::Clipboard,
             Self::FileTransfer => ChannelId::FileTransfer,
             Self::Diagnostics => ChannelId::Diagnostics,
+            Self::Video => ChannelId::ReliableVideo,
         }
     }
 
@@ -44,6 +47,7 @@ impl ReliableChannelKind {
             Self::Clipboard => 200,
             Self::FileTransfer => 100,
             Self::Diagnostics => 0,
+            Self::Video => 700,
         }
     }
 
@@ -54,6 +58,7 @@ impl ReliableChannelKind {
             Self::Clipboard => MAX_CLIPBOARD_STREAM_MESSAGE,
             Self::FileTransfer => MAX_FILE_STREAM_MESSAGE,
             Self::Diagnostics => MAX_DIAGNOSTICS_STREAM_MESSAGE,
+            Self::Video => MAX_VIDEO_STREAM_MESSAGE,
         }
     }
 }
@@ -68,6 +73,7 @@ impl TryFrom<ChannelId> for ReliableChannelKind {
             ChannelId::Clipboard => Ok(Self::Clipboard),
             ChannelId::FileTransfer => Ok(Self::FileTransfer),
             ChannelId::Diagnostics => Ok(Self::Diagnostics),
+            ChannelId::ReliableVideo => Ok(Self::Video),
             _ => Err(QuicTransportError::ProtocolState(format!(
                 "channel {channel:?} is not a reliable application stream"
             ))),
@@ -436,6 +442,7 @@ mod tests {
             ReliableChannelKind::Clipboard,
             ReliableChannelKind::FileTransfer,
             ReliableChannelKind::Diagnostics,
+            ReliableChannelKind::Video,
         ] {
             assert_eq!(
                 decode_stream_preface(&encode_stream_preface(kind)).unwrap(),

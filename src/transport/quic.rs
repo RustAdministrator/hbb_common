@@ -17,8 +17,8 @@ use quinn::{
         server::danger::{ClientCertVerified, ClientCertVerifier},
         DigitallySignedStruct, DistinguishedName, Error as TlsError, SignatureScheme,
     },
-    ClientConfig, Connection, ConnectionError, Endpoint, RecvStream, SendStream, ServerConfig,
-    TransportConfig, VarInt,
+    ClientConfig, Connection, ConnectionError, Endpoint, MtuDiscoveryConfig, RecvStream,
+    SendStream, ServerConfig, TransportConfig, VarInt,
 };
 use std::{
     convert::{TryFrom, TryInto},
@@ -27,9 +27,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const ALPN: &[u8] = b"rustadmin-quic-v1";
+pub const ALPN_V1: &[u8] = b"rustadmin-quic-v1";
+pub const ALPN_V2: &[u8] = b"rustadmin-quic-v2";
+pub const ALPN: &[u8] = ALPN_V1;
 pub const DEFAULT_QUIC_PORT: u16 = 48100;
 pub const DEFAULT_INITIAL_MTU: u16 = 1200;
+pub const DEFAULT_MAX_MTU: u16 = 1360;
 pub const DEFAULT_DATAGRAM_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 pub const PEER_SERVER_NAME: &str = "rustadmin-peer";
 pub const MAX_PEER_CERTIFICATE_BYTES: usize = 16 * 1024;
@@ -45,6 +48,19 @@ const SERVER_HELLO_LEN: usize =
 const ROLE_CLIENT: u8 = 1;
 const ROLE_SERVER: u8 = 2;
 const AUTH_CLOSE_CODE: u32 = 0x100;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u16)]
+pub enum QuicApplicationProtocol {
+    V1 = 1,
+    V2 = 2,
+}
+
+impl QuicApplicationProtocol {
+    pub fn supports_reliable_keyframes(self) -> bool {
+        self == Self::V2
+    }
+}
 
 fn provisional_signature_schemes() -> Vec<SignatureScheme> {
     vec![
@@ -165,8 +181,10 @@ pub struct QuicTransportOptions {
     pub idle_timeout: Duration,
     pub keepalive_interval: Duration,
     pub initial_mtu: u16,
+    pub max_mtu: u16,
     pub datagram_receive_buffer_size: usize,
     pub datagram_send_buffer_size: usize,
+    pub enable_application_protocol_v2: bool,
 }
 
 impl Default for QuicTransportOptions {
@@ -177,8 +195,10 @@ impl Default for QuicTransportOptions {
             idle_timeout: Duration::from_secs(15),
             keepalive_interval: Duration::from_secs(5),
             initial_mtu: DEFAULT_INITIAL_MTU,
+            max_mtu: DEFAULT_MAX_MTU,
             datagram_receive_buffer_size: DEFAULT_DATAGRAM_BUFFER_BYTES,
             datagram_send_buffer_size: DEFAULT_DATAGRAM_BUFFER_BYTES,
+            enable_application_protocol_v2: true,
         }
     }
 }
@@ -262,6 +282,13 @@ pub struct QuicConnectionStats {
     pub current_mtu: u16,
     pub max_datagram_size: Option<usize>,
     pub black_holes_detected: u64,
+    pub application_protocol: u16,
+    pub negotiated_datagram_size: Option<usize>,
+    pub reliable_keyframes: bool,
+    pub video_reassembly_drops: u64,
+    pub video_keyframe_requests: u64,
+    pub reliable_keyframes_sent: u64,
+    pub reliable_keyframes_received: u64,
 }
 
 impl QuicConnectionStats {
@@ -276,6 +303,13 @@ impl QuicConnectionStats {
             current_mtu: stats.path.current_mtu,
             max_datagram_size: connection.max_datagram_size(),
             black_holes_detected: stats.path.black_holes_detected,
+            application_protocol: 0,
+            negotiated_datagram_size: None,
+            reliable_keyframes: false,
+            video_reassembly_drops: 0,
+            video_keyframe_requests: 0,
+            reliable_keyframes_sent: 0,
+            reliable_keyframes_received: 0,
         }
     }
 }
@@ -357,12 +391,13 @@ impl QuicServerEndpoint {
         let endpoint = Endpoint::server(server_config, bind_address)
             .map_err(|error| QuicTransportError::UdpBind(error.to_string()))?;
         log::info!(
-            "QUIC UDP listener active: address={}, initial_mtu={}, datagram_receive_buffer={}, datagram_send_buffer={}",
+            "QUIC UDP listener active: address={}, initial_mtu={}, max_mtu={}, datagram_receive_buffer={}, datagram_send_buffer={}",
             endpoint
                 .local_addr()
                 .map(|address| address.to_string())
                 .unwrap_or_else(|_| bind_address.to_string()),
             options.initial_mtu,
+            options.max_mtu,
             options.datagram_receive_buffer_size,
             options.datagram_send_buffer_size
         );
@@ -383,12 +418,13 @@ impl QuicServerEndpoint {
         let endpoint = Endpoint::server(server_config, bind_address)
             .map_err(|error| QuicTransportError::UdpBind(error.to_string()))?;
         log::info!(
-            "QUIC UDP listener active: address={}, initial_mtu={}, datagram_receive_buffer={}, datagram_send_buffer={}, first_contact=bounded",
+            "QUIC UDP listener active: address={}, initial_mtu={}, max_mtu={}, datagram_receive_buffer={}, datagram_send_buffer={}, first_contact=bounded",
             endpoint
                 .local_addr()
                 .map(|address| address.to_string())
                 .unwrap_or_else(|_| bind_address.to_string()),
             options.initial_mtu,
+            options.max_mtu,
             options.datagram_receive_buffer_size,
             options.datagram_send_buffer_size
         );
@@ -823,6 +859,39 @@ fn ensure_udp_enabled() -> Result<(), QuicTransportError> {
     }
 }
 
+fn supported_alpn_protocols(options: &QuicTransportOptions) -> Vec<Vec<u8>> {
+    if options.enable_application_protocol_v2 {
+        vec![ALPN_V2.to_vec(), ALPN_V1.to_vec()]
+    } else {
+        vec![ALPN_V1.to_vec()]
+    }
+}
+
+pub fn negotiated_application_protocol(
+    connection: &Connection,
+) -> Result<QuicApplicationProtocol, QuicTransportError> {
+    let handshake = connection
+        .handshake_data()
+        .ok_or_else(|| {
+            QuicTransportError::Handshake("TLS handshake metadata is unavailable".to_owned())
+        })?
+        .downcast::<quinn::crypto::rustls::HandshakeData>()
+        .map_err(|_| {
+            QuicTransportError::Handshake("unexpected TLS handshake metadata".to_owned())
+        })?;
+    match handshake.protocol.as_deref() {
+        Some(ALPN_V2) => Ok(QuicApplicationProtocol::V2),
+        Some(ALPN_V1) => Ok(QuicApplicationProtocol::V1),
+        Some(protocol) => Err(QuicTransportError::Handshake(format!(
+            "unsupported negotiated ALPN {}",
+            String::from_utf8_lossy(protocol)
+        ))),
+        None => Err(QuicTransportError::Handshake(
+            "TLS peer did not negotiate an ALPN".to_owned(),
+        )),
+    }
+}
+
 fn build_server_config(
     credentials: TlsCredentials,
     trusted_client_certificates: Vec<CertificateDer<'static>>,
@@ -847,7 +916,7 @@ fn build_server_config(
         .with_client_cert_verifier(client_verifier)
         .with_single_cert(credentials.certificate_chain, credentials.private_key)
         .map_err(|error| QuicTransportError::Configuration(error.to_string()))?;
-    crypto.alpn_protocols = vec![ALPN.to_vec()];
+    crypto.alpn_protocols = supported_alpn_protocols(options);
     let crypto = QuicServerConfig::try_from(crypto)
         .map_err(|error| QuicTransportError::Configuration(error.to_string()))?;
     let mut config = ServerConfig::with_crypto(Arc::new(crypto));
@@ -866,7 +935,7 @@ fn build_provisional_server_config(
         .with_client_cert_verifier(Arc::new(ProvisionalClientCertificateVerifier::default()))
         .with_single_cert(credentials.certificate_chain, credentials.private_key)
         .map_err(|error| QuicTransportError::Configuration(error.to_string()))?;
-    crypto.alpn_protocols = vec![ALPN.to_vec()];
+    crypto.alpn_protocols = supported_alpn_protocols(options);
     let crypto = QuicServerConfig::try_from(crypto)
         .map_err(|error| QuicTransportError::Configuration(error.to_string()))?;
     let mut config = ServerConfig::with_crypto(Arc::new(crypto));
@@ -890,7 +959,7 @@ fn build_client_config(
         .with_root_certificates(roots)
         .with_client_auth_cert(credentials.certificate_chain, credentials.private_key)
         .map_err(|error| QuicTransportError::Configuration(error.to_string()))?;
-    crypto.alpn_protocols = vec![ALPN.to_vec()];
+    crypto.alpn_protocols = supported_alpn_protocols(options);
     let crypto = QuicClientConfig::try_from(crypto)
         .map_err(|error| QuicTransportError::Configuration(error.to_string()))?;
     let mut config = ClientConfig::new(Arc::new(crypto));
@@ -910,7 +979,7 @@ fn build_provisional_client_config(
         .with_custom_certificate_verifier(Arc::new(ProvisionalServerCertificateVerifier))
         .with_client_auth_cert(credentials.certificate_chain, credentials.private_key)
         .map_err(|error| QuicTransportError::Configuration(error.to_string()))?;
-    crypto.alpn_protocols = vec![ALPN.to_vec()];
+    crypto.alpn_protocols = supported_alpn_protocols(options);
     let crypto = QuicClientConfig::try_from(crypto)
         .map_err(|error| QuicTransportError::Configuration(error.to_string()))?;
     let mut config = ClientConfig::new(Arc::new(crypto));
@@ -927,6 +996,12 @@ fn build_transport_config(
             options.initial_mtu, DEFAULT_INITIAL_MTU
         )));
     }
+    if options.max_mtu < options.initial_mtu {
+        return Err(QuicTransportError::Configuration(format!(
+            "QUIC maximum MTU {} is below initial MTU {}",
+            options.max_mtu, options.initial_mtu
+        )));
+    }
     let idle_timeout =
         options
             .idle_timeout
@@ -934,6 +1009,8 @@ fn build_transport_config(
             .map_err(|error: quinn::VarIntBoundsExceeded| {
                 QuicTransportError::Configuration(error.to_string())
             })?;
+    let mut mtu_discovery = MtuDiscoveryConfig::default();
+    mtu_discovery.upper_bound(options.max_mtu);
     let mut transport = TransportConfig::default();
     transport
         .max_idle_timeout(Some(idle_timeout))
@@ -944,6 +1021,7 @@ fn build_transport_config(
         .max_concurrent_uni_streams(32_u32.into())
         .initial_mtu(options.initial_mtu)
         .min_mtu(DEFAULT_INITIAL_MTU)
+        .mtu_discovery_config(Some(mtu_discovery))
         .datagram_receive_buffer_size(Some(options.datagram_receive_buffer_size))
         .datagram_send_buffer_size(options.datagram_send_buffer_size);
     Ok(Arc::new(transport))
@@ -1453,6 +1531,77 @@ mod tests {
         DeviceIdentity::from_bytes(&secret_key.0, &public_key.0).unwrap()
     }
 
+    async fn negotiate_test_alpn(
+        server_v2: bool,
+        client_v2: bool,
+    ) -> Option<(QuicApplicationProtocol, QuicApplicationProtocol)> {
+        let server_certificate = certificate();
+        let client_certificate = certificate();
+        let server_options = QuicTransportOptions {
+            connect_timeout: Duration::from_secs(2),
+            enable_application_protocol_v2: server_v2,
+            ..Default::default()
+        };
+        let client_options = QuicTransportOptions {
+            connect_timeout: Duration::from_secs(2),
+            enable_application_protocol_v2: client_v2,
+            ..Default::default()
+        };
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let server = match QuicServerEndpoint::bind(
+            bind,
+            server_certificate.credentials(),
+            client_certificate.certificate.clone(),
+            &server_options,
+        ) {
+            Ok(server) => server,
+            Err(QuicTransportError::UdpBind(error))
+                if error.contains("Operation not permitted") =>
+            {
+                return None
+            }
+            Err(error) => panic!("server endpoint failed: {}", error),
+        };
+        let client = QuicClientEndpoint::bind(
+            bind,
+            client_certificate.credentials(),
+            server_certificate.certificate.clone(),
+            &client_options,
+        )
+        .unwrap();
+        let server_address = server.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let connection = server.accept().await.unwrap();
+            let protocol = negotiated_application_protocol(&connection).unwrap();
+            connection.close(0u32.into(), b"ALPN test complete");
+            protocol
+        });
+        let connection = client.connect(server_address).await.unwrap();
+        let client_protocol = negotiated_application_protocol(&connection).unwrap();
+        let server_protocol = server_task.await.unwrap();
+        client.close();
+        Some((client_protocol, server_protocol))
+    }
+
+    #[tokio::test]
+    async fn alpn_v2_is_preferred_and_v1_peers_remain_compatible() {
+        let Some(v2) = negotiate_test_alpn(true, true).await else {
+            return;
+        };
+        assert_eq!(
+            v2,
+            (QuicApplicationProtocol::V2, QuicApplicationProtocol::V2)
+        );
+        assert_eq!(
+            negotiate_test_alpn(false, true).await,
+            Some((QuicApplicationProtocol::V1, QuicApplicationProtocol::V1))
+        );
+        assert_eq!(
+            negotiate_test_alpn(true, false).await,
+            Some((QuicApplicationProtocol::V1, QuicApplicationProtocol::V1))
+        );
+    }
+
     fn session_offer() -> SessionOffer {
         SessionOffer {
             minimum_protocol_version: 1,
@@ -1676,7 +1825,7 @@ mod tests {
                 VideoFrameMetadata {
                     frame_id: 1,
                     codec: VideoCodec::H264,
-                    flags: 0,
+                    flags: crate::transport::video_datagram::FLAG_KEYFRAME,
                     presentation_timestamp_us: 100,
                 },
                 &vec![8; 5000],
@@ -1783,6 +1932,13 @@ mod tests {
     fn transport_rejects_mtu_below_quic_minimum() {
         let options = QuicTransportOptions {
             initial_mtu: DEFAULT_INITIAL_MTU - 1,
+            ..Default::default()
+        };
+        assert!(build_transport_config(&options).is_err());
+
+        let options = QuicTransportOptions {
+            initial_mtu: DEFAULT_MAX_MTU,
+            max_mtu: DEFAULT_INITIAL_MTU,
             ..Default::default()
         };
         assert!(build_transport_config(&options).is_err());

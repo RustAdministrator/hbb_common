@@ -11,7 +11,7 @@ use super::{
     quic::QuicTransportError,
     video_datagram::{
         fragment_video_frame, VideoDatagramError, VideoFrameMetadata, VideoReassembler,
-        VideoReassemblyConfig, VideoReassemblyOutcome,
+        VideoReassemblyConfig, VideoReassemblyOutcome, VideoReassemblyStats,
     },
 };
 use bytes::Bytes;
@@ -271,6 +271,10 @@ impl QuicDatagramReceiver {
 
     pub fn pop_audio(&mut self, now: Instant) -> Option<AudioPlayoutItem> {
         self.audio.pop_ready(now)
+    }
+
+    pub fn video_stats(&self) -> &VideoReassemblyStats {
+        self.video.stats()
     }
 
     pub fn reset(&mut self) {

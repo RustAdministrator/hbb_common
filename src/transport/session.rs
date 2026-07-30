@@ -20,12 +20,14 @@ pub const CAP_CLIPBOARD_RECEIVE: u16 = 1 << 2;
 pub const CAP_FILE_TRANSFER: u16 = 1 << 3;
 pub const CAP_INPUT_SEND: u16 = 1 << 4;
 pub const CAP_INPUT_RECEIVE: u16 = 1 << 5;
+pub const CAP_RELIABLE_KEYFRAMES: u16 = 1 << 6;
 pub const KNOWN_CAPABILITIES: u16 = CAP_HDR
     | CAP_CLIPBOARD_SEND
     | CAP_CLIPBOARD_RECEIVE
     | CAP_FILE_TRANSFER
     | CAP_INPUT_SEND
-    | CAP_INPUT_RECEIVE;
+    | CAP_INPUT_RECEIVE
+    | CAP_RELIABLE_KEYFRAMES;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -117,6 +119,7 @@ pub struct SessionAgreement {
     pub file_transfer_enabled: bool,
     pub local_may_send_input: bool,
     pub remote_may_send_input: bool,
+    pub reliable_keyframes: bool,
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -306,6 +309,7 @@ pub fn negotiate_session(
             && remote.capabilities & CAP_INPUT_RECEIVE != 0,
         remote_may_send_input: remote.capabilities & CAP_INPUT_SEND != 0
             && local.capabilities & CAP_INPUT_RECEIVE != 0,
+        reliable_keyframes: local.capabilities & remote.capabilities & CAP_RELIABLE_KEYFRAMES != 0,
     })
 }
 
@@ -368,6 +372,7 @@ pub fn decode_session_agreement(
         file_transfer_enabled: flags & CAP_FILE_TRANSFER != 0,
         local_may_send_input: flags & CAP_INPUT_SEND != 0,
         remote_may_send_input: flags & CAP_INPUT_RECEIVE != 0,
+        reliable_keyframes: flags & CAP_RELIABLE_KEYFRAMES != 0,
     };
     validate_agreement_fields(&agreement)?;
     Ok(agreement)
@@ -398,6 +403,7 @@ pub fn validate_agreement_for_offer(
         || (agreement.file_transfer_enabled && local_offer.capabilities & CAP_FILE_TRANSFER == 0)
         || (agreement.local_may_send_input && local_offer.capabilities & CAP_INPUT_SEND == 0)
         || (agreement.remote_may_send_input && local_offer.capabilities & CAP_INPUT_RECEIVE == 0)
+        || (agreement.reliable_keyframes && local_offer.capabilities & CAP_RELIABLE_KEYFRAMES == 0)
     {
         return Err(SessionNegotiationError::InvalidAgreement);
     }
@@ -482,6 +488,7 @@ fn agreement_flags(agreement: &SessionAgreement) -> u16 {
         (agreement.file_transfer_enabled, CAP_FILE_TRANSFER),
         (agreement.local_may_send_input, CAP_INPUT_SEND),
         (agreement.remote_may_send_input, CAP_INPUT_RECEIVE),
+        (agreement.reliable_keyframes, CAP_RELIABLE_KEYFRAMES),
     ] {
         if enabled {
             flags |= flag;
@@ -561,7 +568,8 @@ mod tests {
                 | CAP_CLIPBOARD_RECEIVE
                 | CAP_FILE_TRANSFER
                 | CAP_INPUT_SEND
-                | CAP_INPUT_RECEIVE,
+                | CAP_INPUT_RECEIVE
+                | CAP_RELIABLE_KEYFRAMES,
             latency_mode: LatencyMode::LowLatency,
             video_codecs: vec![VideoCodec::H265, VideoCodec::H264],
             audio_codecs: vec![AudioCodec::Opus],

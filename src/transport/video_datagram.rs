@@ -62,6 +62,8 @@ pub struct VideoReassemblyConfig {
     pub max_pending_frames: usize,
     pub max_memory_bytes: usize,
     pub fragment_deadline: Duration,
+    pub keyframe_fragment_deadline: Duration,
+    pub require_initial_keyframe: bool,
     pub keyframe_request_after_drops: u32,
     pub keyframe_request_interval: Duration,
 }
@@ -72,7 +74,9 @@ impl Default for VideoReassemblyConfig {
             max_frame_bytes: MAX_VIDEO_FRAME_BYTES,
             max_pending_frames: 8,
             max_memory_bytes: 64 * 1024 * 1024,
-            fragment_deadline: Duration::from_millis(80),
+            fragment_deadline: Duration::from_millis(120),
+            keyframe_fragment_deadline: Duration::from_millis(500),
+            require_initial_keyframe: true,
             keyframe_request_after_drops: 3,
             keyframe_request_interval: Duration::from_millis(500),
         }
@@ -87,6 +91,8 @@ pub struct VideoReassemblyStats {
     pub duplicate_fragments: u64,
     pub obsolete_fragments: u64,
     pub malformed_fragments: u64,
+    pub pre_keyframe_frames: u64,
+    pub expired_keyframes: u64,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -210,6 +216,7 @@ pub struct VideoReassembler {
     pending: BTreeMap<u64, PendingFrame>,
     pending_bytes: usize,
     last_completed_frame_id: u64,
+    has_completed_keyframe: bool,
     consecutive_dropped_frames: u32,
     last_keyframe_request: Option<Instant>,
     stats: VideoReassemblyStats,
@@ -223,11 +230,13 @@ impl VideoReassembler {
         if config.max_pending_frames == 0 || config.max_memory_bytes < config.max_frame_bytes {
             return Err(VideoDatagramError::MemoryLimit);
         }
+        let has_completed_keyframe = !config.require_initial_keyframe;
         Ok(Self {
             config,
             pending: BTreeMap::new(),
             pending_bytes: 0,
             last_completed_frame_id: 0,
+            has_completed_keyframe,
             consecutive_dropped_frames: 0,
             last_keyframe_request: None,
             stats: VideoReassemblyStats::default(),
@@ -322,6 +331,20 @@ impl VideoReassembler {
             return Err(VideoDatagramError::InvalidFrameSize(received_bytes));
         }
 
+        let is_keyframe = fragment_header.metadata.flags & FLAG_KEYFRAME != 0;
+        if !self.has_completed_keyframe && !is_keyframe {
+            let dropped = self
+                .pending
+                .remove(&fragment_header.metadata.frame_id)
+                .expect("complete pending frame exists");
+            self.pending_bytes = self.pending_bytes.saturating_sub(dropped.received_bytes);
+            self.stats.pre_keyframe_frames = self.stats.pre_keyframe_frames.saturating_add(1);
+            self.record_drops(1);
+            outcome.dropped_frames = outcome.dropped_frames.saturating_add(1);
+            outcome.request_keyframe = self.should_request_keyframe(now);
+            return Ok(outcome);
+        }
+
         let complete = self
             .pending
             .remove(&fragment_header.metadata.frame_id)
@@ -332,6 +355,9 @@ impl VideoReassembler {
             payload.extend_from_slice(fragment.as_deref().expect("all fragments are present"));
         }
         self.last_completed_frame_id = complete.header.metadata.frame_id;
+        if is_keyframe {
+            self.has_completed_keyframe = true;
+        }
         self.drop_obsolete_pending();
         self.consecutive_dropped_frames = 0;
         self.stats.completed_frames = self.stats.completed_frames.saturating_add(1);
@@ -347,8 +373,12 @@ impl VideoReassembler {
             .pending
             .iter()
             .filter_map(|(frame_id, frame)| {
-                if now.saturating_duration_since(frame.created_at) >= self.config.fragment_deadline
-                {
+                let deadline = if frame.header.metadata.flags & FLAG_KEYFRAME != 0 {
+                    self.config.keyframe_fragment_deadline
+                } else {
+                    self.config.fragment_deadline
+                };
+                if now.saturating_duration_since(frame.created_at) >= deadline {
                     Some(*frame_id)
                 } else {
                     None
@@ -357,6 +387,13 @@ impl VideoReassembler {
             .collect();
         let dropped_frames = u32::try_from(expired.len()).unwrap_or(u32::MAX);
         for frame_id in expired {
+            if self
+                .pending
+                .get(&frame_id)
+                .is_some_and(|frame| frame.header.metadata.flags & FLAG_KEYFRAME != 0)
+            {
+                self.stats.expired_keyframes = self.stats.expired_keyframes.saturating_add(1);
+            }
             self.drop_frame(frame_id, false);
             self.stats.expired_frames = self.stats.expired_frames.saturating_add(1);
         }
@@ -372,6 +409,7 @@ impl VideoReassembler {
         self.pending.clear();
         self.pending_bytes = 0;
         self.last_completed_frame_id = 0;
+        self.has_completed_keyframe = !self.config.require_initial_keyframe;
         self.consecutive_dropped_frames = 0;
         self.last_keyframe_request = None;
     }
@@ -413,7 +451,14 @@ impl VideoReassembler {
     }
 
     fn evict_oldest(&mut self) -> bool {
-        let frame_id = match self.pending.keys().next().copied() {
+        let frame_id = match self
+            .pending
+            .iter()
+            .find_map(|(frame_id, frame)| {
+                (frame.header.metadata.flags & FLAG_KEYFRAME == 0).then_some(*frame_id)
+            })
+            .or_else(|| self.pending.keys().next().copied())
+        {
             Some(frame_id) => frame_id,
             None => return false,
         };
@@ -549,9 +594,20 @@ mod tests {
         VideoFrameMetadata {
             frame_id,
             codec: VideoCodec::H264,
-            flags: 0,
+            flags: FLAG_KEYFRAME,
             presentation_timestamp_us: 99,
         }
+    }
+
+    fn datagrams_with_flags(
+        frame_id: u64,
+        flags: u8,
+        bytes: &[u8],
+        max_size: usize,
+    ) -> Vec<Vec<u8>> {
+        let mut metadata = metadata(frame_id);
+        metadata.flags = flags;
+        fragment_video_frame([7; 16], 1, 42, metadata, bytes, max_size).unwrap()
     }
 
     fn datagrams(frame_id: u64, bytes: &[u8], max_size: usize) -> Vec<Vec<u8>> {
@@ -589,6 +645,7 @@ mod tests {
         let now = Instant::now();
         let mut reassembler = VideoReassembler::new(VideoReassemblyConfig {
             fragment_deadline: Duration::from_millis(10),
+            keyframe_fragment_deadline: Duration::from_millis(10),
             keyframe_request_after_drops: 1,
             ..VideoReassemblyConfig::default()
         })
@@ -608,6 +665,74 @@ mod tests {
                 .or(complete);
         }
         assert_eq!(complete.unwrap().metadata.frame_id, 2);
+    }
+
+    #[test]
+    fn startup_delta_does_not_obsolete_partial_keyframe() {
+        let now = Instant::now();
+        let mut reassembler = VideoReassembler::new(VideoReassemblyConfig {
+            keyframe_request_after_drops: 1,
+            ..VideoReassemblyConfig::default()
+        })
+        .unwrap();
+        let keyframe = datagrams_with_flags(1, FLAG_KEYFRAME, &[1; 4_000], 700);
+        reassembler.push(&keyframe[0], now).unwrap();
+
+        let mut delta_outcome = VideoReassemblyOutcome::default();
+        for packet in datagrams_with_flags(2, 0, &[2; 1_000], 700) {
+            delta_outcome = reassembler.push(&packet, now).unwrap();
+        }
+        assert!(delta_outcome.frame.is_none());
+        assert!(delta_outcome.request_keyframe);
+        assert_eq!(reassembler.stats().pre_keyframe_frames, 1);
+
+        let mut completed = None;
+        for packet in keyframe.into_iter().skip(1) {
+            completed = reassembler.push(&packet, now).unwrap().frame.or(completed);
+        }
+        assert_eq!(completed.unwrap().metadata.frame_id, 1);
+    }
+
+    #[test]
+    fn external_reliable_keyframe_mode_accepts_datagram_delta() {
+        let now = Instant::now();
+        let mut reassembler = VideoReassembler::new(VideoReassemblyConfig {
+            require_initial_keyframe: false,
+            ..VideoReassemblyConfig::default()
+        })
+        .unwrap();
+        let mut completed = None;
+        for packet in datagrams_with_flags(2, 0, &[2; 1_000], 700) {
+            completed = reassembler.push(&packet, now).unwrap().frame.or(completed);
+        }
+        assert_eq!(completed.unwrap().metadata.frame_id, 2);
+        assert_eq!(reassembler.stats().pre_keyframe_frames, 0);
+    }
+
+    #[test]
+    fn keyframe_uses_longer_fragment_deadline() {
+        let now = Instant::now();
+        let mut reassembler = VideoReassembler::new(VideoReassemblyConfig {
+            fragment_deadline: Duration::from_millis(10),
+            keyframe_fragment_deadline: Duration::from_millis(100),
+            ..VideoReassemblyConfig::default()
+        })
+        .unwrap();
+        let keyframe = datagrams(1, &[1; 3_000], 700);
+        reassembler.push(&keyframe[0], now).unwrap();
+        assert_eq!(
+            reassembler
+                .expire(now + Duration::from_millis(11))
+                .dropped_frames,
+            0
+        );
+        assert_eq!(
+            reassembler
+                .expire(now + Duration::from_millis(101))
+                .dropped_frames,
+            1
+        );
+        assert_eq!(reassembler.stats().expired_keyframes, 1);
     }
 
     #[test]
