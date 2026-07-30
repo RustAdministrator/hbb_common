@@ -12,7 +12,10 @@ use crate::{
 use anyhow::bail;
 use async_recursion::async_recursion;
 use bytes::{Bytes, BytesMut};
-use futures::{SinkExt, StreamExt};
+use futures::{
+    stream::{SplitSink, SplitStream},
+    SinkExt, StreamExt,
+};
 use std::{
     io::{Error, ErrorKind},
     net::SocketAddr,
@@ -35,7 +38,35 @@ pub struct WsFramedStream {
     send_timeout: u64,
 }
 
+type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+pub struct WsReadHalf {
+    stream: SplitStream<WsStream>,
+    decrypt: Option<Encrypt>,
+}
+
+pub struct WsWriteHalf {
+    stream: SplitSink<WsStream, WsMessage>,
+    encrypt: Option<Encrypt>,
+    send_timeout: u64,
+}
+
 impl WsFramedStream {
+    pub fn into_split(self) -> (WsReadHalf, WsWriteHalf) {
+        let (write, read) = self.stream.split();
+        (
+            WsReadHalf {
+                stream: read,
+                decrypt: self.encrypt.clone(),
+            },
+            WsWriteHalf {
+                stream: write,
+                encrypt: self.encrypt,
+                send_timeout: self.send_timeout,
+            },
+        )
+    }
+
     pub fn has_tls_transport(&self) -> bool {
         matches!(
             self.stream.get_ref(),
@@ -318,6 +349,65 @@ impl WsFramedStream {
             Ok(res) => res,
             Err(_) => None,
         }
+    }
+}
+
+impl WsReadHalf {
+    pub async fn next(&mut self) -> Option<Result<BytesMut, Error>> {
+        while let Some(msg) = self.stream.next().await {
+            let msg = match msg {
+                Ok(msg) => msg,
+                Err(err) => {
+                    log::error!("{}", err);
+                    return Some(Err(Error::new(
+                        ErrorKind::Other,
+                        format!("WebSocket protocol error: {err}"),
+                    )));
+                }
+            };
+            match msg {
+                WsMessage::Binary(data) => {
+                    let mut bytes = BytesMut::from(&data[..]);
+                    if let Some(key) = self.decrypt.as_mut() {
+                        if let Err(err) = key.dec(&mut bytes) {
+                            return Some(Err(err));
+                        }
+                    }
+                    return Some(Ok(bytes));
+                }
+                WsMessage::Text(text) => return Some(Ok(BytesMut::from(text.as_bytes()))),
+                WsMessage::Close(_) => return None,
+                _ => continue,
+            }
+        }
+        None
+    }
+}
+
+impl WsWriteHalf {
+    pub async fn send(&mut self, msg: &impl Message) -> ResultType<()> {
+        self.send_raw(msg.write_to_bytes()?).await
+    }
+
+    pub async fn send_raw(&mut self, mut msg: Vec<u8>) -> ResultType<()> {
+        if let Some(key) = self.encrypt.as_mut() {
+            msg = key.enc(&msg);
+        }
+        self.send_bytes(Bytes::from(msg)).await
+    }
+
+    pub async fn send_bytes(&mut self, bytes: Bytes) -> ResultType<()> {
+        let message = WsMessage::Binary(bytes);
+        if self.send_timeout > 0 {
+            timeout(
+                Duration::from_millis(self.send_timeout),
+                self.stream.send(message),
+            )
+            .await??;
+        } else {
+            self.stream.send(message).await?;
+        }
+        Ok(())
     }
 }
 

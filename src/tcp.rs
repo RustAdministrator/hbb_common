@@ -16,11 +16,11 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf},
     net::{lookup_host, TcpListener, TcpSocket, TcpStream, ToSocketAddrs},
 };
 use tokio_socks::IntoTargetAddr;
-use tokio_util::codec::Framed;
+use tokio_util::codec::{Framed, FramedRead};
 
 pub trait TcpStreamTrait: AsyncRead + AsyncWrite + Unpin {}
 pub struct DynTcpStream(pub Box<dyn TcpStreamTrait + Send + Sync>);
@@ -42,6 +42,19 @@ pub struct FramedStream(
     pub Option<Encrypt>,
     pub u64,
 );
+
+pub struct FramedReadHalf {
+    stream: FramedRead<ReadHalf<DynTcpStream>, BytesCodec>,
+    decrypt: Option<Encrypt>,
+}
+
+pub struct FramedWriteHalf {
+    stream: WriteHalf<DynTcpStream>,
+    encrypt: Option<Encrypt>,
+    raw: bool,
+    send_timeout: u64,
+    pending: BytesMut,
+}
 
 impl Deref for FramedStream {
     type Target = Framed<DynTcpStream, BytesCodec>;
@@ -93,6 +106,28 @@ pub(crate) fn new_socket(
 }
 
 impl FramedStream {
+    pub fn into_split(self) -> (FramedReadHalf, FramedWriteHalf) {
+        let Self(stream, _addr, encrypt, send_timeout) = self;
+        let parts = stream.into_parts();
+        let raw = parts.codec.is_raw();
+        let (read_io, write_io) = tokio::io::split(parts.io);
+        let mut read = FramedRead::new(read_io, parts.codec);
+        read.read_buffer_mut().extend_from_slice(&parts.read_buf);
+        (
+            FramedReadHalf {
+                stream: read,
+                decrypt: encrypt.clone(),
+            },
+            FramedWriteHalf {
+                stream: write_io,
+                encrypt,
+                raw,
+                send_timeout,
+                pending: parts.write_buf,
+            },
+        )
+    }
+
     pub async fn new<T: ToSocketAddrs + std::fmt::Display>(
         remote_addr: T,
         local_addr: Option<SocketAddr>,
@@ -262,6 +297,67 @@ impl FramedStream {
         let mut nonce = Nonce([0u8; secretbox::NONCEBYTES]);
         nonce.0[..std::mem::size_of_val(&seqnum)].copy_from_slice(&seqnum.to_le_bytes());
         nonce
+    }
+}
+
+impl FramedReadHalf {
+    pub async fn next(&mut self) -> Option<Result<BytesMut, Error>> {
+        let mut result = self.stream.next().await;
+        if let Some(Ok(bytes)) = result.as_mut() {
+            if let Some(key) = self.decrypt.as_mut() {
+                if let Err(err) = key.dec(bytes) {
+                    return Some(Err(err));
+                }
+            }
+        }
+        result
+    }
+}
+
+impl FramedWriteHalf {
+    pub async fn send(&mut self, msg: &impl Message) -> ResultType<()> {
+        self.send_raw(msg.write_to_bytes()?).await
+    }
+
+    pub async fn send_raw(&mut self, mut msg: Vec<u8>) -> ResultType<()> {
+        if let Some(key) = self.encrypt.as_mut() {
+            msg = key.enc(&msg);
+        }
+        self.send_bytes(Bytes::from(msg)).await
+    }
+
+    pub async fn send_bytes(&mut self, bytes: Bytes) -> ResultType<()> {
+        let timeout = self.send_timeout;
+        if timeout > 0 {
+            super::timeout(timeout, self.send_bytes_inner(bytes)).await??;
+        } else {
+            self.send_bytes_inner(bytes).await?;
+        }
+        Ok(())
+    }
+
+    async fn send_bytes_inner(&mut self, bytes: Bytes) -> io::Result<()> {
+        if !self.pending.is_empty() {
+            let pending = self.pending.split().freeze();
+            self.write_wire_bytes(&pending, !self.raw).await?;
+        }
+
+        let bounded = bytes.len() > TCP_FRAMED_WRITE_CHUNK_LIMIT && !self.raw;
+        let mut framed = BytesMut::with_capacity(bytes.len() + 4);
+        BytesCodec::encode_frame(self.raw, bytes, &mut framed)?;
+        self.write_wire_bytes(&framed, bounded).await?;
+        self.stream.flush().await
+    }
+
+    async fn write_wire_bytes(&mut self, bytes: &[u8], bounded: bool) -> io::Result<()> {
+        if bounded {
+            for chunk in bytes.chunks(TCP_FRAMED_WRITE_CHUNK_LIMIT) {
+                self.stream.write_all(chunk).await?;
+            }
+        } else {
+            self.stream.write_all(bytes).await?;
+        }
+        Ok(())
     }
 }
 
@@ -440,7 +536,11 @@ fn set_tcp_maxseg(_stream: &TcpStream, _mss: u32) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use bytes::Buf;
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     struct RecordingWrites {
         writes: Arc<Mutex<Vec<usize>>>,
@@ -493,6 +593,134 @@ mod tests {
             .iter()
             .all(|len| *len <= TCP_FRAMED_WRITE_CHUNK_LIMIT));
         assert!(writes.iter().sum::<usize>() >= expected_payload_len);
+    }
+
+    #[tokio::test]
+    async fn split_writer_keeps_path_safe_chunks() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let stream = RecordingWrites {
+            writes: writes.clone(),
+        };
+        let framed = FramedStream::from(stream, "127.0.0.1:0".parse().unwrap());
+        let (_reader, mut writer) = framed.into_split();
+
+        writer
+            .send_bytes(Bytes::from(vec![9; 64 * 1024 + 17]))
+            .await
+            .unwrap();
+
+        let writes = writes.lock().unwrap();
+        assert!(writes.len() > 1);
+        assert!(writes
+            .iter()
+            .all(|len| *len <= TCP_FRAMED_WRITE_CHUNK_LIMIT));
+    }
+
+    struct ReadableBlockedWrite {
+        inbound: Bytes,
+    }
+
+    impl AsyncRead for ReadableBlockedWrite {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.inbound.is_empty() {
+                return Poll::Pending;
+            }
+            let count = self.inbound.len().min(buf.remaining());
+            buf.put_slice(&self.inbound[..count]);
+            self.inbound.advance(count);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for ReadableBlockedWrite {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn split_reader_progresses_while_writer_is_blocked() {
+        let payload = Bytes::from_static(b"inbound-video-frame");
+        let mut encoded = BytesMut::new();
+        BytesCodec::encode_frame(false, payload.clone(), &mut encoded).unwrap();
+        let framed = FramedStream::from(
+            ReadableBlockedWrite {
+                inbound: encoded.freeze(),
+            },
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        let (mut reader, mut writer) = framed.into_split();
+        let write_task = tokio::spawn(async move {
+            writer
+                .send_bytes(Bytes::from_static(b"blocked-feedback"))
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        let received = tokio::time::timeout(Duration::from_millis(100), reader.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(&received[..], &payload[..]);
+        assert!(!write_task.is_finished());
+        write_task.abort();
+    }
+
+    #[tokio::test]
+    async fn split_preserves_independent_encryption_counters() {
+        let (left, right) = tokio::io::duplex(4096);
+        let addr = "127.0.0.1:0".parse().unwrap();
+        let key = Key([7; secretbox::KEYBYTES]);
+        let mut local = FramedStream::from(left, addr);
+        let mut remote = FramedStream::from(right, addr);
+        local.set_key(key.clone());
+        remote.set_key(key);
+
+        local.send_raw(b"before-split-left".to_vec()).await.unwrap();
+        assert_eq!(
+            &remote.next().await.unwrap().unwrap()[..],
+            b"before-split-left"
+        );
+        remote
+            .send_raw(b"before-split-right".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            &local.next().await.unwrap().unwrap()[..],
+            b"before-split-right"
+        );
+
+        let (mut reader, mut writer) = local.into_split();
+        writer.send_raw(b"after-split-left".to_vec()).await.unwrap();
+        assert_eq!(
+            &remote.next().await.unwrap().unwrap()[..],
+            b"after-split-left"
+        );
+        remote
+            .send_raw(b"after-split-right".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            &reader.next().await.unwrap().unwrap()[..],
+            b"after-split-right"
+        );
     }
 
     #[test]
