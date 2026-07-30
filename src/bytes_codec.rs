@@ -40,6 +40,33 @@ impl BytesCodec {
         self.max_packet_length = n;
     }
 
+    pub fn is_raw(&self) -> bool {
+        self.raw
+    }
+
+    pub fn encode_frame(raw: bool, data: Bytes, buf: &mut BytesMut) -> io::Result<()> {
+        if raw {
+            buf.reserve(data.len());
+            buf.put(data);
+            return Ok(());
+        }
+        if data.len() <= 0x3F {
+            buf.put_u8((data.len() << 2) as u8);
+        } else if data.len() <= 0x3FFF {
+            buf.put_u16_le((data.len() << 2) as u16 | 0x1);
+        } else if data.len() <= 0x3FFFFF {
+            let h = (data.len() << 2) as u32 | 0x2;
+            buf.put_u16_le((h & 0xFFFF) as u16);
+            buf.put_u8((h >> 16) as u8);
+        } else if data.len() <= 0x3FFFFFFF {
+            buf.put_u32_le((data.len() << 2) as u32 | 0x3);
+        } else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Overflow"));
+        }
+        buf.extend(data);
+        Ok(())
+    }
+
     fn decode_head(&mut self, src: &mut BytesMut) -> io::Result<Option<usize>> {
         if src.is_empty() {
             return Ok(None);
@@ -112,26 +139,7 @@ impl Encoder<Bytes> for BytesCodec {
     type Error = io::Error;
 
     fn encode(&mut self, data: Bytes, buf: &mut BytesMut) -> Result<(), io::Error> {
-        if self.raw {
-            buf.reserve(data.len());
-            buf.put(data);
-            return Ok(());
-        }
-        if data.len() <= 0x3F {
-            buf.put_u8((data.len() << 2) as u8);
-        } else if data.len() <= 0x3FFF {
-            buf.put_u16_le((data.len() << 2) as u16 | 0x1);
-        } else if data.len() <= 0x3FFFFF {
-            let h = (data.len() << 2) as u32 | 0x2;
-            buf.put_u16_le((h & 0xFFFF) as u16);
-            buf.put_u8((h >> 16) as u8);
-        } else if data.len() <= 0x3FFFFFFF {
-            buf.put_u32_le((data.len() << 2) as u32 | 0x3);
-        } else {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Overflow"));
-        }
-        buf.extend(data);
-        Ok(())
+        Self::encode_frame(self.raw, data, buf)
     }
 }
 
