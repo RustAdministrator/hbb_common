@@ -52,6 +52,10 @@ pub enum MessageType {
     SessionClose = 7,
     SessionOffer = 8,
     SessionAccept = 9,
+    ApplicationControl = 10,
+    ApplicationRaw = 11,
+    VideoOrdering = 12,
+    VideoOrderingAck = 13,
     ReliableInput = 16,
     Clipboard = 32,
     FileMetadata = 48,
@@ -77,6 +81,10 @@ impl TryFrom<u16> for MessageType {
             7 => Ok(Self::SessionClose),
             8 => Ok(Self::SessionOffer),
             9 => Ok(Self::SessionAccept),
+            10 => Ok(Self::ApplicationControl),
+            11 => Ok(Self::ApplicationRaw),
+            12 => Ok(Self::VideoOrdering),
+            13 => Ok(Self::VideoOrderingAck),
             16 => Ok(Self::ReliableInput),
             32 => Ok(Self::Clipboard),
             48 => Ok(Self::FileMetadata),
@@ -102,7 +110,11 @@ impl MessageType {
             | Self::KeyframeRequest
             | Self::SessionClose
             | Self::SessionOffer
-            | Self::SessionAccept => ChannelId::Control,
+            | Self::SessionAccept
+            | Self::ApplicationControl
+            | Self::ApplicationRaw
+            | Self::VideoOrdering
+            | Self::VideoOrderingAck => ChannelId::Control,
             Self::ReliableInput => ChannelId::ReliableInput,
             Self::Clipboard => ChannelId::Clipboard,
             Self::FileMetadata | Self::FileChunk | Self::FileCancel => ChannelId::FileTransfer,
@@ -119,6 +131,9 @@ impl MessageType {
             Self::Ping | Self::Pong => 64,
             Self::Error | Self::SessionClose => 16 * 1024,
             Self::SessionOffer | Self::SessionAccept => 4 * 1024,
+            Self::ApplicationControl | Self::ApplicationRaw => 32 * 1024 * 1024,
+            Self::VideoOrdering => 1024 * 1024,
+            Self::VideoOrderingAck => 8,
             Self::KeyframeRequest => 64,
             Self::ReliableInput => 4 * 1024,
             Self::Clipboard => 16 * 1024 * 1024,

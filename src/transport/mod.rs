@@ -15,6 +15,12 @@ pub mod video_datagram;
 pub mod datagram;
 
 #[cfg(feature = "quic-transport")]
+pub mod application;
+
+#[cfg(feature = "quic-transport")]
+pub mod identity;
+
+#[cfg(feature = "quic-transport")]
 pub mod quic;
 
 #[cfg(feature = "quic-transport")]

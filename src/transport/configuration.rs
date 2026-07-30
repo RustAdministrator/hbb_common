@@ -67,8 +67,8 @@ impl NetworkTransportConfig {
         let value = |key: &str| values.get(key).map(String::as_str).unwrap_or("");
         let udp_disabled = value(keys::OPTION_DISABLE_UDP) == "Y";
         let configured_mode = match value(keys::OPTION_REMOTE_TRANSPORT) {
-            "" | "tcp" => RemoteTransportMode::Tcp,
-            "quic-preferred" => RemoteTransportMode::QuicPreferred,
+            "" | "quic-preferred" => RemoteTransportMode::QuicPreferred,
+            "tcp" => RemoteTransportMode::Tcp,
             "quic-only" => RemoteTransportMode::QuicOnly,
             invalid => return Err(NetworkConfigError::InvalidMode(invalid.to_owned())),
         };
@@ -123,13 +123,19 @@ impl NetworkTransportConfig {
                 file_bandwidth_limit_mbps.to_string(),
             ));
         }
+        let enable_ipv6 = value(keys::OPTION_QUIC_ENABLE_IPV6) != "N";
+        if !enable_ipv6 && listen_address.is_ipv6() {
+            return Err(NetworkConfigError::InvalidListenAddress(
+                listen_address.to_string(),
+            ));
+        }
         Ok(Self {
             mode,
             listen_address,
             listen_port,
             connect_timeout: Duration::from_millis(connect_timeout_ms),
             keepalive_interval: Duration::from_millis(keepalive_interval_ms),
-            enable_ipv6: value(keys::OPTION_QUIC_ENABLE_IPV6) != "N",
+            enable_ipv6,
             file_bandwidth_limit_mbps,
             trusted_peer_store,
         })
@@ -152,10 +158,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_preserve_tcp_compatibility() {
+    fn defaults_enable_quic_with_automatic_tcp_fallback() {
         let config =
             NetworkTransportConfig::from_values(&HashMap::new(), PathBuf::from("trusted")).unwrap();
-        assert_eq!(config.mode, RemoteTransportMode::Tcp);
+        assert_eq!(config.mode, RemoteTransportMode::QuicPreferred);
         assert_eq!(config.listen_port, DEFAULT_QUIC_PORT);
         assert_eq!(config.connect_timeout, Duration::from_secs(5));
     }
@@ -192,5 +198,17 @@ mod tests {
         assert_eq!(config.mode, RemoteTransportMode::QuicPreferred);
         assert_eq!(config.listen_address, IpAddr::from([10, 20, 30, 2]));
         assert_eq!(config.listen_port, 48101);
+    }
+
+    #[test]
+    fn ipv6_disabled_rejects_ipv6_listener() {
+        let values = HashMap::from([
+            (keys::OPTION_QUIC_LISTEN_ADDRESS.to_owned(), "::".to_owned()),
+            (keys::OPTION_QUIC_ENABLE_IPV6.to_owned(), "N".to_owned()),
+        ]);
+        assert!(matches!(
+            NetworkTransportConfig::from_values(&values, PathBuf::from("trusted")),
+            Err(NetworkConfigError::InvalidListenAddress(_))
+        ));
     }
 }

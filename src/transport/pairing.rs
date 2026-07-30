@@ -136,6 +136,24 @@ impl FileTrustedPeerStore {
         let digest = Sha256::digest(peer_id.as_bytes());
         Ok(self.directory.join(format!("{}.json", hex_lower(&digest))))
     }
+
+    pub fn load_all(&self) -> Result<Vec<TrustedPeerRecord>, PairingError> {
+        let mut records = Vec::new();
+        for entry in fs::read_dir(&self.directory).map_err(PairingError::Io)? {
+            let entry = entry.map_err(PairingError::Io)?;
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            if records.len() >= 4_096 {
+                return Err(PairingError::InvalidRecord);
+            }
+            let encoded = fs::read(&path).map_err(PairingError::Io)?;
+            records.push(decode_record(&encoded)?);
+        }
+        records.sort_by(|left, right| left.peer_id.cmp(&right.peer_id));
+        Ok(records)
+    }
 }
 
 impl TrustedPeerStore for FileTrustedPeerStore {
@@ -146,12 +164,7 @@ impl TrustedPeerStore for FileTrustedPeerStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(PairingError::Io(error)),
         };
-        if encoded.len() > 64 * 1024 {
-            return Err(PairingError::InvalidRecord);
-        }
-        let persisted: PersistedTrustedPeer =
-            serde_json::from_slice(&encoded).map_err(|_| PairingError::InvalidRecord)?;
-        let record = persisted.into_record()?;
+        let record = decode_record(&encoded)?;
         if record.peer_id != peer_id {
             return Err(PairingError::InvalidRecord);
         }
@@ -185,6 +198,17 @@ impl TrustedPeerStore for FileTrustedPeerStore {
         }
         Ok(())
     }
+}
+
+fn decode_record(encoded: &[u8]) -> Result<TrustedPeerRecord, PairingError> {
+    if encoded.len() > 64 * 1024 {
+        return Err(PairingError::InvalidRecord);
+    }
+    let persisted: PersistedTrustedPeer =
+        serde_json::from_slice(encoded).map_err(|_| PairingError::InvalidRecord)?;
+    let record = persisted.into_record()?;
+    record.validate()?;
+    Ok(record)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -366,5 +390,28 @@ mod tests {
             record.validate(),
             Err(PairingError::InvalidCertificate)
         ));
+    }
+
+    #[test]
+    fn file_store_lists_only_valid_bounded_records() {
+        let directory = std::env::temp_dir().join(format!(
+            "rustadmin-quic-trust-{}-{}",
+            std::process::id(),
+            crate::rand::random::<u64>()
+        ));
+        let mut store = FileTrustedPeerStore::new(&directory).unwrap();
+        let candidate = candidate();
+        store
+            .insert(
+                candidate
+                    .clone()
+                    .confirm(&candidate.fingerprint(), 1)
+                    .unwrap(),
+            )
+            .unwrap();
+        let records = store.load_all().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].peer_id, "peer-1");
+        fs::remove_dir_all(directory).unwrap();
     }
 }

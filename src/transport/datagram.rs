@@ -4,8 +4,8 @@ use super::{
         AudioJitterConfig, AudioPacketMetadata, AudioPlayoutItem,
     },
     input::{
-        encode_mouse_movement, InputProtocolError, MouseMovement, MouseMovementMode,
-        MouseMovementReceiver,
+        encode_application_mouse_movement, encode_mouse_movement, InputProtocolError,
+        MouseMovement, MouseMovementMode, MouseMovementReceiver, MOUSE_MOVEMENT_PAYLOAD_LEN,
     },
     protocol::{decode_header, MessageType, SessionId, HEADER_LEN},
     quic::QuicTransportError,
@@ -25,6 +25,7 @@ pub struct QuicDatagramSender {
     next_audio_sequence: u64,
     next_mouse_sequence: u64,
     started: Instant,
+    negotiated_max_datagram_size: usize,
 }
 
 impl QuicDatagramSender {
@@ -36,7 +37,13 @@ impl QuicDatagramSender {
             next_audio_sequence: 1,
             next_mouse_sequence: 1,
             started: Instant::now(),
+            negotiated_max_datagram_size: usize::MAX,
         }
+    }
+
+    pub fn with_max_datagram_size(mut self, max_datagram_size: usize) -> Self {
+        self.negotiated_max_datagram_size = max_datagram_size;
+        self
     }
 
     pub fn send_video_frame(
@@ -130,10 +137,46 @@ impl QuicDatagramSender {
         Ok(sequence)
     }
 
+    pub fn send_application_mouse_movement(
+        &mut self,
+        mode: MouseMovementMode,
+        x: i32,
+        y: i32,
+        display_id: u32,
+        button_state_mask: u16,
+        application_payload: &[u8],
+    ) -> Result<u64, QuicTransportError> {
+        let sequence = self.next_mouse_sequence;
+        let datagram = encode_application_mouse_movement(
+            self.session_id,
+            MouseMovement {
+                sequence_number: sequence,
+                monotonic_timestamp_us: elapsed_us(self.started),
+                mode,
+                x,
+                y,
+                display_id,
+                button_state_mask,
+            },
+            application_payload,
+            self.max_datagram_size()?,
+        )?;
+        self.connection
+            .send_datagram(Bytes::from(datagram))
+            .map_err(|error| QuicTransportError::Datagram(error.to_string()))?;
+        self.next_mouse_sequence = sequence.checked_add(1).ok_or_else(|| {
+            QuicTransportError::ProtocolState("mouse sequence exhausted".to_owned())
+        })?;
+        Ok(sequence)
+    }
+
     pub fn max_datagram_size(&self) -> Result<usize, QuicTransportError> {
-        self.connection.max_datagram_size().ok_or_else(|| {
-            QuicTransportError::Datagram("peer does not support QUIC DATAGRAM".to_owned())
-        })
+        self.connection
+            .max_datagram_size()
+            .map(|current| current.min(self.negotiated_max_datagram_size))
+            .ok_or_else(|| {
+                QuicTransportError::Datagram("peer does not support QUIC DATAGRAM".to_owned())
+            })
     }
 }
 
@@ -143,6 +186,7 @@ pub struct QuicDatagramReceiver {
     video: VideoReassembler,
     audio: AudioJitterBuffer,
     mouse: MouseMovementReceiver,
+    negotiated_max_datagram_size: usize,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -150,6 +194,7 @@ pub enum DatagramReceiveEvent {
     Video(VideoReassemblyOutcome),
     AudioAccepted,
     Mouse(Option<MouseMovement>),
+    ApplicationMouse(Option<(MouseMovement, Vec<u8>)>),
 }
 
 impl QuicDatagramReceiver {
@@ -165,7 +210,13 @@ impl QuicDatagramReceiver {
             video: VideoReassembler::new(video_config)?,
             audio: AudioJitterBuffer::new(audio_config)?,
             mouse: MouseMovementReceiver::new(session_id),
+            negotiated_max_datagram_size: usize::MAX,
         })
+    }
+
+    pub fn with_max_datagram_size(mut self, max_datagram_size: usize) -> Self {
+        self.negotiated_max_datagram_size = max_datagram_size;
+        self
     }
 
     pub async fn receive(
@@ -177,6 +228,13 @@ impl QuicDatagramReceiver {
             .read_datagram()
             .await
             .map_err(|error| QuicTransportError::Datagram(error.to_string()))?;
+        if datagram.len() > self.negotiated_max_datagram_size {
+            return Err(QuicTransportError::ProtocolState(format!(
+                "QUIC datagram length {} exceeds negotiated limit {}",
+                datagram.len(),
+                self.negotiated_max_datagram_size
+            )));
+        }
         if datagram.len() < HEADER_LEN {
             return Err(QuicTransportError::ProtocolState(
                 "received truncated QUIC datagram".to_owned(),
@@ -197,7 +255,13 @@ impl QuicDatagramReceiver {
                 Ok(DatagramReceiveEvent::AudioAccepted)
             }
             MessageType::MouseMovement => {
-                Ok(DatagramReceiveEvent::Mouse(self.mouse.apply(&datagram)?))
+                if header.payload_length as usize == MOUSE_MOVEMENT_PAYLOAD_LEN {
+                    Ok(DatagramReceiveEvent::Mouse(self.mouse.apply(&datagram)?))
+                } else {
+                    Ok(DatagramReceiveEvent::ApplicationMouse(
+                        self.mouse.apply_application(&datagram)?,
+                    ))
+                }
             }
             message_type => Err(QuicTransportError::ProtocolState(format!(
                 "message {message_type:?} is invalid on QUIC DATAGRAM"

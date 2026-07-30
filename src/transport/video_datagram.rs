@@ -23,6 +23,7 @@ pub enum VideoCodec {
     Vp8 = 3,
     Vp9 = 4,
     Av1 = 5,
+    Raw = 6,
 }
 
 impl TryFrom<u8> for VideoCodec {
@@ -35,6 +36,7 @@ impl TryFrom<u8> for VideoCodec {
             3 => Ok(Self::Vp8),
             4 => Ok(Self::Vp9),
             5 => Ok(Self::Av1),
+            6 => Ok(Self::Raw),
             _ => Err(VideoDatagramError::UnknownCodec(value)),
         }
     }

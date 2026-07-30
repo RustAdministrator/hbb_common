@@ -14,8 +14,8 @@ use quinn::{
         self,
         pki_types::{CertificateDer, PrivateKeyDer},
     },
-    ClientConfig, Connection, Endpoint, RecvStream, SendStream, ServerConfig, TransportConfig,
-    VarInt,
+    ClientConfig, Connection, ConnectionError, Endpoint, RecvStream, SendStream, ServerConfig,
+    TransportConfig, VarInt,
 };
 use std::{
     convert::{TryFrom, TryInto},
@@ -166,7 +166,7 @@ impl QuicConnectionStats {
 
 pub struct QuicServerEndpoint {
     endpoint: Endpoint,
-    expected_client_certificate: CertificatePin,
+    expected_client_certificates: Vec<CertificatePin>,
     connect_timeout: Duration,
 }
 
@@ -178,9 +178,31 @@ impl QuicServerEndpoint {
         options: &QuicTransportOptions,
     ) -> Result<Self, QuicTransportError> {
         ensure_udp_enabled()?;
-        let expected_client_certificate =
-            CertificatePin::from_certificate(&trusted_client_certificate);
-        let server_config = build_server_config(credentials, trusted_client_certificate, options)?;
+        Self::bind_trusted_certificates(
+            bind_address,
+            credentials,
+            vec![trusted_client_certificate],
+            options,
+        )
+    }
+
+    pub fn bind_trusted_certificates(
+        bind_address: SocketAddr,
+        credentials: TlsCredentials,
+        trusted_client_certificates: Vec<CertificateDer<'static>>,
+        options: &QuicTransportOptions,
+    ) -> Result<Self, QuicTransportError> {
+        ensure_udp_enabled()?;
+        if trusted_client_certificates.is_empty() {
+            return Err(QuicTransportError::Configuration(
+                "at least one trusted QUIC client certificate is required".to_owned(),
+            ));
+        }
+        let expected_client_certificates = trusted_client_certificates
+            .iter()
+            .map(CertificatePin::from_certificate)
+            .collect();
+        let server_config = build_server_config(credentials, trusted_client_certificates, options)?;
         let endpoint = Endpoint::server(server_config, bind_address)
             .map_err(|error| QuicTransportError::UdpBind(error.to_string()))?;
         log::info!(
@@ -195,7 +217,7 @@ impl QuicServerEndpoint {
         );
         Ok(Self {
             endpoint,
-            expected_client_certificate,
+            expected_client_certificates,
             connect_timeout: options.connect_timeout,
         })
     }
@@ -215,7 +237,10 @@ impl QuicServerEndpoint {
             .await
             .map_err(|_| QuicTransportError::Timeout("handshake"))?
             .map_err(|error| QuicTransportError::Handshake(error.to_string()))?;
-        verify_peer_certificate(&connection, self.expected_client_certificate)?;
+        let actual = peer_certificate_pin(&connection)?;
+        if !self.expected_client_certificates.contains(&actual) {
+            return Err(QuicTransportError::CertificatePinMismatch);
+        }
         log_connection("accepted", &connection);
         Ok(connection)
     }
@@ -269,7 +294,12 @@ impl QuicClientEndpoint {
         let connection = tokio::time::timeout(self.connect_timeout, connecting)
             .await
             .map_err(|_| QuicTransportError::Timeout("connect"))?
-            .map_err(|error| QuicTransportError::Handshake(error.to_string()))?;
+            .map_err(|error| match error {
+                ConnectionError::TimedOut | ConnectionError::Reset => {
+                    QuicTransportError::Unreachable(error.to_string())
+                }
+                _ => QuicTransportError::Handshake(error.to_string()),
+            })?;
         verify_peer_certificate(&connection, self.expected_server_certificate)?;
         log_connection("connected", &connection);
         Ok(connection)
@@ -277,6 +307,10 @@ impl QuicClientEndpoint {
 
     pub fn close(&self) {
         self.endpoint.close(VarInt::from_u32(0), b"endpoint closed");
+    }
+
+    pub fn lease(&self) -> Endpoint {
+        self.endpoint.clone()
     }
 }
 
@@ -333,6 +367,31 @@ impl AuthenticatedControlChannel {
                 identity,
                 expected_client_identity_key,
                 session_id,
+            ),
+        )
+        .await
+        .map_err(|_| QuicTransportError::Timeout("application authentication"))?;
+        if result.is_err() {
+            connection.close(
+                VarInt::from_u32(AUTH_CLOSE_CODE),
+                b"application authentication failed",
+            );
+        }
+        result
+    }
+
+    pub async fn authenticate_server_discover_session(
+        connection: Connection,
+        identity: &DeviceIdentity,
+        expected_client_identity_key: [u8; IDENTITY_PUBLIC_KEY_LEN],
+        timeout: Duration,
+    ) -> Result<Self, QuicTransportError> {
+        let result = tokio::time::timeout(
+            timeout,
+            authenticate_server_discover_session_inner(
+                connection.clone(),
+                identity,
+                expected_client_identity_key,
             ),
         )
         .await
@@ -488,6 +547,8 @@ pub enum QuicTransportError {
     EndpointClosed,
     #[error("QUIC {0} timed out")]
     Timeout(&'static str),
+    #[error("QUIC peer is unreachable: {0}")]
+    Unreachable(String),
     #[error("QUIC TLS handshake failed: {0}")]
     Handshake(String),
     #[error("QUIC peer certificate pin mismatch")]
@@ -516,14 +577,16 @@ fn ensure_udp_enabled() -> Result<(), QuicTransportError> {
 
 fn build_server_config(
     credentials: TlsCredentials,
-    trusted_client_certificate: CertificateDer<'static>,
+    trusted_client_certificates: Vec<CertificateDer<'static>>,
     options: &QuicTransportOptions,
 ) -> Result<ServerConfig, QuicTransportError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut roots = rustls::RootCertStore::empty();
-    roots
-        .add(trusted_client_certificate)
-        .map_err(|error| QuicTransportError::Configuration(error.to_string()))?;
+    for certificate in trusted_client_certificates {
+        roots
+            .add(certificate)
+            .map_err(|error| QuicTransportError::Configuration(error.to_string()))?;
+    }
     let client_verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
         Arc::new(roots),
         provider.clone(),
@@ -616,6 +679,19 @@ fn verify_peer_certificate(
         return Err(QuicTransportError::CertificatePinMismatch);
     }
     Ok(())
+}
+
+pub fn peer_certificate_pin(connection: &Connection) -> Result<CertificatePin, QuicTransportError> {
+    let identity = connection
+        .peer_identity()
+        .ok_or(QuicTransportError::MissingPeerCertificate)?;
+    let certificates = identity
+        .downcast::<Vec<CertificateDer<'static>>>()
+        .map_err(|_| QuicTransportError::MissingPeerCertificate)?;
+    let certificate = certificates
+        .first()
+        .ok_or(QuicTransportError::MissingPeerCertificate)?;
+    Ok(CertificatePin::from_certificate(certificate))
 }
 
 fn log_connection(action: &str, connection: &Connection) {
@@ -746,6 +822,66 @@ async fn authenticate_server_inner(
     )?;
     write_message(&mut send, &header, &server_payload).await?;
 
+    Ok(AuthenticatedControlChannel {
+        connection,
+        send,
+        receive,
+        session_id,
+        next_outgoing_sequence: 2,
+        last_incoming_sequence: 1,
+        started,
+        peer_identity_key: client_key,
+    })
+}
+
+async fn authenticate_server_discover_session_inner(
+    connection: Connection,
+    identity: &DeviceIdentity,
+    expected_client_identity_key: [u8; IDENTITY_PUBLIC_KEY_LEN],
+) -> Result<AuthenticatedControlChannel, QuicTransportError> {
+    let started = Instant::now();
+    let (mut send, mut receive) = connection
+        .accept_bi()
+        .await
+        .map_err(|error| QuicTransportError::Stream(error.to_string()))?;
+    send.set_priority(i32::MAX)
+        .map_err(|error| QuicTransportError::Stream(error.to_string()))?;
+    let request = read_message(&mut receive).await?;
+    if request.header.message_type != MessageType::ClientHello
+        || request.header.sequence_number != 1
+        || request.header.flags & FLAG_ACK_REQUIRED == 0
+    {
+        return Err(QuicTransportError::Authentication(
+            "invalid client hello header".to_owned(),
+        ));
+    }
+    let session_id = request.header.session_id;
+    let exporter = export_keying_material(&connection, &session_id)?;
+    let (client_key, client_nonce) = parse_client_hello(&request.payload, &session_id, &exporter)?;
+    if client_key != expected_client_identity_key {
+        return Err(QuicTransportError::Authentication(
+            "client device identity key is not trusted".to_owned(),
+        ));
+    }
+    let mut server_nonce = [0u8; NONCE_LEN];
+    OsRng.fill_bytes(&mut server_nonce);
+    let server_payload = encode_server_hello(
+        identity,
+        &session_id,
+        &exporter,
+        &client_key,
+        &client_nonce,
+        &server_nonce,
+    );
+    let header = MessageHeader::new(
+        MessageType::ServerHello,
+        FLAG_RESPONSE,
+        session_id,
+        1,
+        server_payload.len(),
+        elapsed_us(started),
+    )?;
+    write_message(&mut send, &header, &server_payload).await?;
     Ok(AuthenticatedControlChannel {
         connection,
         send,
@@ -1155,6 +1291,7 @@ mod tests {
                         }
                         DatagramReceiveEvent::AudioAccepted => audio_received = true,
                         DatagramReceiveEvent::Mouse(movement) => mouse_movement = movement,
+                        DatagramReceiveEvent::ApplicationMouse(_) => {}
                     }
                 }
             })

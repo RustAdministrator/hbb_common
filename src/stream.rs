@@ -1,3 +1,5 @@
+#[cfg(feature = "quic-transport")]
+use crate::transport::application::QuicApplicationStream;
 #[cfg(feature = "webrtc")]
 use crate::webrtc;
 use crate::{config, tcp, websocket, ResultType};
@@ -566,9 +568,28 @@ pub enum Stream {
     WebSocket(websocket::WsFramedStream),
     Tcp(tcp::FramedStream),
     Duplex(DuplexStream),
+    #[cfg(feature = "quic-transport")]
+    Quic(QuicApplicationStream),
 }
 
 impl Stream {
+    #[inline]
+    pub fn is_quic(&self) -> bool {
+        #[cfg(feature = "quic-transport")]
+        if matches!(self, Self::Quic(_)) {
+            return true;
+        }
+        false
+    }
+
+    #[cfg(feature = "quic-transport")]
+    pub fn quic_stats(&self) -> Option<crate::transport::quic::QuicConnectionStats> {
+        match self {
+            Self::Quic(stream) => Some(stream.stats()),
+            _ => None,
+        }
+    }
+
     #[inline]
     pub fn has_secure_transport(&self) -> bool {
         match self {
@@ -577,6 +598,8 @@ impl Stream {
             Stream::WebSocket(s) => s.has_tls_transport(),
             Stream::Tcp(_) => false,
             Stream::Duplex(s) => s.secure_transport,
+            #[cfg(feature = "quic-transport")]
+            Stream::Quic(_) => true,
         }
     }
 
@@ -588,6 +611,8 @@ impl Stream {
             Stream::WebSocket(s) => s.set_send_timeout(ms),
             Stream::Tcp(s) => s.set_send_timeout(ms),
             Stream::Duplex(s) => s.send_timeout_ms.store(ms, Ordering::Relaxed),
+            #[cfg(feature = "quic-transport")]
+            Stream::Quic(_) => {}
         }
     }
 
@@ -599,6 +624,8 @@ impl Stream {
             Stream::WebSocket(s) => s.set_raw(),
             Stream::Tcp(s) => s.set_raw(),
             Stream::Duplex(_) => log::warn!("set_raw ignored after stream split"),
+            #[cfg(feature = "quic-transport")]
+            Stream::Quic(stream) => stream.set_raw(),
         }
     }
 
@@ -610,6 +637,8 @@ impl Stream {
             Stream::WebSocket(s) => s.send_bytes(bytes).await,
             Stream::Tcp(s) => s.send_bytes(bytes).await,
             Stream::Duplex(s) => s.enqueue(bytes, "Bytes", false),
+            #[cfg(feature = "quic-transport")]
+            Stream::Quic(s) => s.enqueue(bytes),
         }
     }
 
@@ -621,6 +650,8 @@ impl Stream {
             Stream::WebSocket(s) => s.send_raw(bytes).await,
             Stream::Tcp(s) => s.send_raw(bytes).await,
             Stream::Duplex(s) => s.enqueue(Bytes::from(bytes), "Raw", true),
+            #[cfg(feature = "quic-transport")]
+            Stream::Quic(s) => s.enqueue(Bytes::from(bytes)),
         }
     }
 
@@ -632,6 +663,8 @@ impl Stream {
             Stream::WebSocket(s) => s.set_key(key),
             Stream::Tcp(s) => s.set_key(key),
             Stream::Duplex(_) => log::warn!("set_key ignored after stream split"),
+            #[cfg(feature = "quic-transport")]
+            Stream::Quic(_) => log::debug!("application secretbox key is redundant over QUIC TLS"),
         }
     }
 
@@ -643,6 +676,8 @@ impl Stream {
             Stream::WebSocket(s) => s.is_secured(),
             Stream::Tcp(s) => s.is_secured(),
             Stream::Duplex(s) => s.secured,
+            #[cfg(feature = "quic-transport")]
+            Stream::Quic(_) => true,
         }
     }
 
@@ -657,6 +692,13 @@ impl Stream {
             Stream::WebSocket(s) => s.next_timeout(timeout).await,
             Stream::Tcp(s) => s.next_timeout(timeout).await,
             Stream::Duplex(s) => {
+                match tokio::time::timeout(Duration::from_millis(timeout), s.next()).await {
+                    Ok(result) => result,
+                    Err(_) => None,
+                }
+            }
+            #[cfg(feature = "quic-transport")]
+            Stream::Quic(s) => {
                 match tokio::time::timeout(Duration::from_millis(timeout), s.next()).await {
                     Ok(result) => result,
                     Err(_) => None,
@@ -690,6 +732,8 @@ impl Stream {
             Self::Duplex(stream) => {
                 stream.enqueue(Bytes::from(msg.write_to_bytes()?), "Message", true)
             }
+            #[cfg(feature = "quic-transport")]
+            Self::Quic(stream) => stream.enqueue(Bytes::from(msg.write_to_bytes()?)),
         }
     }
 
@@ -700,6 +744,8 @@ impl Stream {
     ) -> ResultType<()> {
         match self {
             Self::Duplex(stream) => stream.enqueue(Bytes::from(msg.write_to_bytes()?), kind, true),
+            #[cfg(feature = "quic-transport")]
+            Self::Quic(stream) => stream.enqueue(Bytes::from(msg.write_to_bytes()?)),
             _ => self.send(msg).await,
         }
     }
@@ -713,6 +759,8 @@ impl Stream {
             Self::Duplex(stream) => {
                 stream.enqueue_barrier(Bytes::from(msg.write_to_bytes()?), kind)
             }
+            #[cfg(feature = "quic-transport")]
+            Self::Quic(stream) => stream.enqueue(Bytes::from(msg.write_to_bytes()?)),
             _ => self.send(msg).await,
         }
     }
@@ -728,6 +776,8 @@ impl Stream {
                     .enqueue_and_wait(Bytes::from(msg.write_to_bytes()?), kind)
                     .await
             }
+            #[cfg(feature = "quic-transport")]
+            Self::Quic(stream) => stream.enqueue(Bytes::from(msg.write_to_bytes()?)),
             _ => self.send(msg).await,
         }
     }
@@ -742,6 +792,8 @@ impl Stream {
             Self::Duplex(stream) => {
                 stream.enqueue_latest(key, Bytes::from(msg.write_to_bytes()?), kind)
             }
+            #[cfg(feature = "quic-transport")]
+            Self::Quic(stream) => stream.enqueue(Bytes::from(msg.write_to_bytes()?)),
             _ => self.send(msg).await,
         }
     }
@@ -755,6 +807,8 @@ impl Stream {
             Self::WebSocket(ws) => ws.next().await,
             Self::Tcp(tcp) => tcp.next().await,
             Self::Duplex(stream) => stream.next().await,
+            #[cfg(feature = "quic-transport")]
+            Self::Quic(stream) => stream.next().await,
         }
     }
 
@@ -766,6 +820,8 @@ impl Stream {
             Self::WebSocket(ws) => ws.local_addr(),
             Self::Tcp(tcp) => tcp.local_addr(),
             Self::Duplex(stream) => stream.local_addr,
+            #[cfg(feature = "quic-transport")]
+            Self::Quic(stream) => stream.local_addr(),
         }
     }
 
@@ -799,6 +855,8 @@ impl Stream {
                 (StreamReader::Tcp(reader), StreamWriter::Tcp(writer))
             }
             Self::Duplex(stream) => return Self::Duplex(stream),
+            #[cfg(feature = "quic-transport")]
+            Self::Quic(stream) => return Self::Quic(stream),
         };
         let outbox = OutboundQueue::new(outbox_capacity);
         let writer_outbox = outbox.clone();
@@ -835,6 +893,11 @@ impl Stream {
             Self::Duplex(stream) => Some(stream.progress_snapshot()),
             _ => None,
         }
+    }
+
+    #[cfg(feature = "quic-transport")]
+    pub fn from_quic(stream: QuicApplicationStream) -> Self {
+        Self::Quic(stream)
     }
 
     #[inline]

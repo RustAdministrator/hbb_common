@@ -8,6 +8,8 @@ use std::{
 };
 
 pub const MOUSE_MOVEMENT_PAYLOAD_LEN: usize = 20;
+pub const APPLICATION_MOUSE_HEADER_LEN: usize = 24;
+pub const MAX_APPLICATION_MOUSE_BYTES: usize = 4 * 1024;
 pub const RELIABLE_INPUT_PAYLOAD_LEN: usize = 24;
 pub const MAX_DISPLAY_ID: u32 = 255;
 pub const KNOWN_BUTTON_MASK: u16 = 0x001f;
@@ -154,6 +156,42 @@ pub fn encode_mouse_movement(
     Ok(encode_message(&header, &payload)?)
 }
 
+pub fn encode_application_mouse_movement(
+    session_id: SessionId,
+    movement: MouseMovement,
+    application_payload: &[u8],
+    max_datagram_size: usize,
+) -> Result<Vec<u8>, InputProtocolError> {
+    validate_mouse_movement(movement)?;
+    if application_payload.is_empty() || application_payload.len() > MAX_APPLICATION_MOUSE_BYTES {
+        return Err(InputProtocolError::InvalidMousePayloadSize);
+    }
+    let payload_len = u32::try_from(application_payload.len())
+        .map_err(|_| InputProtocolError::InvalidMousePayloadSize)?;
+    if HEADER_LEN + APPLICATION_MOUSE_HEADER_LEN + application_payload.len() > max_datagram_size {
+        return Err(InputProtocolError::InvalidMousePayloadSize);
+    }
+    let mut payload = Vec::with_capacity(APPLICATION_MOUSE_HEADER_LEN + application_payload.len());
+    payload.push(movement.mode as u8);
+    payload.push(0);
+    payload.extend_from_slice(&movement.button_state_mask.to_be_bytes());
+    payload.extend_from_slice(&movement.display_id.to_be_bytes());
+    payload.extend_from_slice(&movement.x.to_be_bytes());
+    payload.extend_from_slice(&movement.y.to_be_bytes());
+    payload.extend_from_slice(&payload_len.to_be_bytes());
+    payload.extend_from_slice(&0u32.to_be_bytes());
+    payload.extend_from_slice(application_payload);
+    let header = MessageHeader::new(
+        MessageType::MouseMovement,
+        0,
+        session_id,
+        movement.sequence_number,
+        payload.len(),
+        movement.monotonic_timestamp_us,
+    )?;
+    Ok(encode_message(&header, &payload)?)
+}
+
 pub fn decode_mouse_movement(datagram: &[u8]) -> Result<MouseMovement, InputProtocolError> {
     let message = decode_message(datagram)?;
     if message.header.message_type != MessageType::MouseMovement {
@@ -180,6 +218,39 @@ pub fn decode_mouse_movement(datagram: &[u8]) -> Result<MouseMovement, InputProt
     };
     validate_mouse_movement(movement)?;
     Ok(movement)
+}
+
+pub fn decode_application_mouse_movement(
+    datagram: &[u8],
+) -> Result<(MouseMovement, Vec<u8>), InputProtocolError> {
+    let message = decode_message(datagram)?;
+    if message.header.message_type != MessageType::MouseMovement
+        || message.payload.len() < APPLICATION_MOUSE_HEADER_LEN
+    {
+        return Err(InputProtocolError::InvalidMousePayloadSize);
+    }
+    if message.payload[1] != 0 || read_u32(message.payload, 20) != 0 {
+        return Err(InputProtocolError::ReservedField);
+    }
+    let application_len = read_u32(message.payload, 16) as usize;
+    let application_payload = &message.payload[APPLICATION_MOUSE_HEADER_LEN..];
+    if application_len == 0
+        || application_len > MAX_APPLICATION_MOUSE_BYTES
+        || application_len != application_payload.len()
+    {
+        return Err(InputProtocolError::InvalidMousePayloadSize);
+    }
+    let movement = MouseMovement {
+        sequence_number: message.header.sequence_number,
+        monotonic_timestamp_us: message.header.monotonic_timestamp_us,
+        mode: MouseMovementMode::try_from(message.payload[0])?,
+        button_state_mask: read_u16(message.payload, 2),
+        display_id: read_u32(message.payload, 4),
+        x: read_i32(message.payload, 8),
+        y: read_i32(message.payload, 12),
+    };
+    validate_mouse_movement(movement)?;
+    Ok((movement, application_payload.to_vec()))
 }
 
 pub fn encode_reliable_input(event: ReliableInputEvent) -> Vec<u8> {
@@ -306,6 +377,22 @@ impl MouseMovementReceiver {
         }
         self.last_sequence = movement.sequence_number;
         Ok(Some(movement))
+    }
+
+    pub fn apply_application(
+        &mut self,
+        datagram: &[u8],
+    ) -> Result<Option<(MouseMovement, Vec<u8>)>, InputProtocolError> {
+        let message = decode_message(datagram)?;
+        if message.header.session_id != self.session_id {
+            return Err(InputProtocolError::SessionMismatch);
+        }
+        let (movement, payload) = decode_application_mouse_movement(datagram)?;
+        if movement.sequence_number <= self.last_sequence {
+            return Ok(None);
+        }
+        self.last_sequence = movement.sequence_number;
+        Ok(Some((movement, payload)))
     }
 
     pub fn reset(&mut self) {
@@ -474,6 +561,32 @@ mod tests {
         let mut receiver = MouseMovementReceiver::new(session);
         assert_eq!(receiver.apply(&newer).unwrap(), Some(movement(2, 200)));
         assert_eq!(receiver.apply(&older).unwrap(), None);
+    }
+
+    #[test]
+    fn application_mouse_payload_round_trips_and_preserves_ordering() {
+        let session = [6; 16];
+        let movement = MouseMovement {
+            sequence_number: 3,
+            monotonic_timestamp_us: 55,
+            mode: MouseMovementMode::Relative,
+            x: -4,
+            y: 9,
+            display_id: 2,
+            button_state_mask: 3,
+        };
+        let encoded =
+            encode_application_mouse_movement(session, movement, b"protobuf-mouse", 1200).unwrap();
+        assert_eq!(
+            decode_application_mouse_movement(&encoded).unwrap(),
+            (movement, b"protobuf-mouse".to_vec())
+        );
+        let mut receiver = MouseMovementReceiver::new(session);
+        assert_eq!(
+            receiver.apply_application(&encoded).unwrap(),
+            Some((movement, b"protobuf-mouse".to_vec()))
+        );
+        assert_eq!(receiver.apply_application(&encoded).unwrap(), None);
     }
 
     #[test]
