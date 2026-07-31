@@ -404,6 +404,8 @@ impl Proxy {
                     addr,
                     None,
                     0,
+                    None,
+                    crate::tcp::tcp_write_pacing_enabled(),
                 ))
             }
             ProxyScheme::Https { .. } => {
@@ -445,6 +447,8 @@ impl Proxy {
                     addr,
                     None,
                     0,
+                    None,
+                    crate::tcp::tcp_write_pacing_enabled(),
                 ))
             }
             ProxyScheme::Socks5 { .. } => {
@@ -472,6 +476,8 @@ impl Proxy {
                     addr,
                     None,
                     0,
+                    None,
+                    crate::tcp::tcp_write_pacing_enabled(),
                 ))
             }
         };

@@ -757,9 +757,15 @@ message TestDelay {
 message PublicKey {
   bytes asymmetric_value = 1;
   bytes symmetric_value = 2;
+  // Optional signed QUIC identity. Older peers ignore this field.
+  bytes quic_identity = 3;
 }
 
-message SignedId { bytes id = 1; }
+message SignedId {
+  bytes id = 1;
+  // Optional signed QUIC identity. The legacy id field remains unchanged.
+  bytes quic_identity = 2;
+}
 
 message AudioFormat {
   uint32 sample_rate = 1;
