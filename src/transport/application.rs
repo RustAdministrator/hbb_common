@@ -1069,7 +1069,7 @@ async fn run_datagram_reader(
 ) {
     let mut received_audio_format = None;
     loop {
-        let event = match receiver.receive(Instant::now()).await {
+        let event = match receiver.receive().await {
             Ok(event) => event,
             Err(error) => {
                 report_terminal_error(&inbound, &connection, error.to_string()).await;

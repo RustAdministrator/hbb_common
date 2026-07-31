@@ -219,15 +219,13 @@ impl QuicDatagramReceiver {
         self
     }
 
-    pub async fn receive(
-        &mut self,
-        now: Instant,
-    ) -> Result<DatagramReceiveEvent, QuicTransportError> {
+    pub async fn receive(&mut self) -> Result<DatagramReceiveEvent, QuicTransportError> {
         let datagram = self
             .connection
             .read_datagram()
             .await
             .map_err(|error| QuicTransportError::Datagram(error.to_string()))?;
+        let now = Instant::now();
         if datagram.len() > self.negotiated_max_datagram_size {
             return Err(QuicTransportError::ProtocolState(format!(
                 "QUIC datagram length {} exceeds negotiated limit {}",

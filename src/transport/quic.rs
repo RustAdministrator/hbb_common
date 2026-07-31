@@ -1663,6 +1663,9 @@ mod tests {
         let session_id = [9; 16];
         let authentication_timeout = options.authentication_timeout;
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let (datagram_ready_tx, datagram_ready_rx) = tokio::sync::oneshot::channel();
+        let idle_gap =
+            VideoReassemblyConfig::default().fragment_deadline + Duration::from_millis(50);
 
         let server_task = tokio::spawn(async move {
             let connection = server.accept().await.unwrap();
@@ -1720,13 +1723,13 @@ mod tests {
                 AudioJitterConfig::default(),
             )
             .unwrap();
-            let received_at = Instant::now();
+            let _ = datagram_ready_tx.send(());
             let mut video_frame = None;
             let mut audio_received = false;
             let mut mouse_movement = None;
             tokio::time::timeout(Duration::from_secs(2), async {
                 while video_frame.is_none() || !audio_received || mouse_movement.is_none() {
-                    match datagrams.receive(received_at).await.unwrap() {
+                    match datagrams.receive().await.unwrap() {
                         DatagramReceiveEvent::Video(outcome) => {
                             video_frame = outcome.frame;
                         }
@@ -1739,11 +1742,12 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(video_frame.unwrap().payload, vec![8; 5000]);
+            assert_eq!(datagrams.video_stats().expired_frames, 0);
             let mouse_movement: MouseMovement = mouse_movement.unwrap();
             assert_eq!(mouse_movement.mode, MouseMovementMode::Absolute);
             assert_eq!((mouse_movement.x, mouse_movement.y), (640, 480));
             assert_eq!(
-                datagrams.pop_audio(received_at + Duration::from_millis(31)),
+                datagrams.pop_audio(Instant::now() + Duration::from_millis(31)),
                 Some(AudioPlayoutItem::Packet(
                     crate::transport::audio_datagram::AudioPacket {
                         metadata: crate::transport::audio_datagram::AudioPacketMetadata {
@@ -1819,6 +1823,9 @@ mod tests {
             .await
             .unwrap();
 
+        let _ = datagram_ready_rx.await;
+        // An idle display must not age the first fragment by time spent waiting for it.
+        tokio::time::sleep(idle_gap).await;
         let mut datagrams = QuicDatagramSender::new(channel.connection(), session_id);
         let video_fragments = datagrams
             .send_video_frame(
