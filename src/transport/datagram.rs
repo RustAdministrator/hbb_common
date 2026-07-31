@@ -275,6 +275,10 @@ impl QuicDatagramReceiver {
         self.video.stats()
     }
 
+    pub fn expire_video(&mut self, now: Instant) -> VideoReassemblyOutcome {
+        self.video.expire(now)
+    }
+
     pub fn reset(&mut self) {
         self.video.reset();
         self.audio.reset();

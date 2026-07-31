@@ -289,6 +289,10 @@ pub struct QuicConnectionStats {
     pub video_keyframe_requests: u64,
     pub reliable_keyframes_sent: u64,
     pub reliable_keyframes_received: u64,
+    pub video_source_frame_gaps: u64,
+    pub video_recovery_suppressed_frames: u64,
+    pub video_sender_replacements: u64,
+    pub video_sender_reference_resets: u64,
 }
 
 impl QuicConnectionStats {
@@ -310,6 +314,10 @@ impl QuicConnectionStats {
             video_keyframe_requests: 0,
             reliable_keyframes_sent: 0,
             reliable_keyframes_received: 0,
+            video_source_frame_gaps: 0,
+            video_recovery_suppressed_frames: 0,
+            video_sender_replacements: 0,
+            video_sender_reference_resets: 0,
         }
     }
 }

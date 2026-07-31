@@ -77,7 +77,7 @@ impl Default for VideoReassemblyConfig {
             fragment_deadline: Duration::from_millis(120),
             keyframe_fragment_deadline: Duration::from_millis(500),
             require_initial_keyframe: true,
-            keyframe_request_after_drops: 3,
+            keyframe_request_after_drops: 1,
             keyframe_request_interval: Duration::from_millis(500),
         }
     }
@@ -88,6 +88,7 @@ pub struct VideoReassemblyStats {
     pub completed_frames: u64,
     pub expired_frames: u64,
     pub evicted_frames: u64,
+    pub obsolete_frames: u64,
     pub duplicate_fragments: u64,
     pub obsolete_fragments: u64,
     pub malformed_fragments: u64,
@@ -321,7 +322,7 @@ impl VideoReassembler {
             return Err(VideoDatagramError::InvalidFrameSize(received_bytes));
         }
         if pending.received_fragments != fragment_header.fragment_count {
-            outcome.request_keyframe = self.should_request_keyframe(now);
+            outcome.request_keyframe |= self.should_request_keyframe(now);
             return Ok(outcome);
         }
         if pending.received_bytes != fragment_header.frame_size {
@@ -341,7 +342,7 @@ impl VideoReassembler {
             self.stats.pre_keyframe_frames = self.stats.pre_keyframe_frames.saturating_add(1);
             self.record_drops(1);
             outcome.dropped_frames = outcome.dropped_frames.saturating_add(1);
-            outcome.request_keyframe = self.should_request_keyframe(now);
+            outcome.request_keyframe |= self.should_request_keyframe(now);
             return Ok(outcome);
         }
 
@@ -358,8 +359,15 @@ impl VideoReassembler {
         if is_keyframe {
             self.has_completed_keyframe = true;
         }
-        self.drop_obsolete_pending();
-        self.consecutive_dropped_frames = 0;
+        let obsolete_frames = self.drop_obsolete_pending();
+        if obsolete_frames > 0 {
+            self.record_drops(obsolete_frames);
+            outcome.dropped_frames = outcome.dropped_frames.saturating_add(obsolete_frames);
+            outcome.request_keyframe |= self.should_request_keyframe(now);
+        }
+        if is_keyframe || outcome.dropped_frames == 0 {
+            self.consecutive_dropped_frames = 0;
+        }
         self.stats.completed_frames = self.stats.completed_frames.saturating_add(1);
         outcome.frame = Some(CompleteVideoFrame {
             metadata: complete.header.metadata,
@@ -477,16 +485,19 @@ impl VideoReassembler {
         }
     }
 
-    fn drop_obsolete_pending(&mut self) {
+    fn drop_obsolete_pending(&mut self) -> u32 {
         let obsolete: Vec<u64> = self
             .pending
             .range(..=self.last_completed_frame_id)
             .map(|(frame_id, _)| *frame_id)
             .collect();
-        for frame_id in obsolete {
-            self.drop_frame(frame_id, false);
+        for frame_id in &obsolete {
+            self.drop_frame(*frame_id, false);
             self.stats.obsolete_fragments = self.stats.obsolete_fragments.saturating_add(1);
         }
+        let count = u32::try_from(obsolete.len()).unwrap_or(u32::MAX);
+        self.stats.obsolete_frames = self.stats.obsolete_frames.saturating_add(u64::from(count));
+        count
     }
 
     fn record_drops(&mut self, count: u32) {
@@ -668,6 +679,27 @@ mod tests {
     }
 
     #[test]
+    fn expiry_keyframe_request_is_not_overwritten_by_the_next_fragment() {
+        let now = Instant::now();
+        let mut reassembler = VideoReassembler::new(VideoReassemblyConfig {
+            fragment_deadline: Duration::from_millis(10),
+            keyframe_fragment_deadline: Duration::from_millis(10),
+            keyframe_request_after_drops: 1,
+            ..VideoReassemblyConfig::default()
+        })
+        .unwrap();
+        let old = datagrams(1, &[1; 3_000], 700);
+        reassembler.push(&old[0], now).unwrap();
+
+        let newer = datagrams(2, &[2; 3_000], 700);
+        let outcome = reassembler
+            .push(&newer[0], now + Duration::from_millis(11))
+            .unwrap();
+        assert_eq!(outcome.dropped_frames, 1);
+        assert!(outcome.request_keyframe);
+    }
+
+    #[test]
     fn startup_delta_does_not_obsolete_partial_keyframe() {
         let now = Instant::now();
         let mut reassembler = VideoReassembler::new(VideoReassemblyConfig {
@@ -746,6 +778,7 @@ mod tests {
         }
         assert_eq!(reassembler.pending_memory_bytes(), 0);
         assert_eq!(reassembler.push(&old[1], now).unwrap().frame, None);
+        assert_eq!(reassembler.stats().obsolete_frames, 1);
         assert_eq!(reassembler.stats().obsolete_fragments, 2);
     }
 
