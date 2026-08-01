@@ -16,10 +16,137 @@ use super::{
 };
 use bytes::Bytes;
 use quinn::Connection;
-use std::time::Instant;
+use std::{
+    convert::TryFrom,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant},
+};
+
+pub const DEFAULT_INTERACTIVE_DATAGRAM_RESERVE_BYTES: usize = 64 * 1024;
+pub const MIN_VIDEO_DATAGRAM_QUEUE_BYTES: usize = 192 * 1024;
+pub const MAX_VIDEO_DATAGRAM_QUEUE_BYTES: usize = 512 * 1024;
+const VIDEO_DATAGRAM_QUEUE_TARGET_LATENCY: Duration = Duration::from_millis(120);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DatagramSendStats {
+    pub video_frames_sent: u64,
+    pub video_frames_rejected: u64,
+    pub video_datagrams_sent: u64,
+    pub video_frame_bytes: u64,
+    pub video_frame_bytes_peak: u64,
+    pub video_frame_fragments: u64,
+    pub video_frame_fragments_peak: u64,
+    pub send_buffer_space: u64,
+    pub send_buffer_space_min: u64,
+    pub send_buffer_queued: u64,
+    pub video_queue_budget: u64,
+    pub audio_packets_dropped: u64,
+    pub mouse_updates_dropped: u64,
+}
+
+#[derive(Default)]
+struct DatagramSendCounters {
+    video_frames_sent: AtomicU64,
+    video_frames_rejected: AtomicU64,
+    video_datagrams_sent: AtomicU64,
+    video_frame_bytes: AtomicU64,
+    video_frame_bytes_peak: AtomicU64,
+    video_frame_fragments: AtomicU64,
+    video_frame_fragments_peak: AtomicU64,
+    send_buffer_space: AtomicU64,
+    send_buffer_space_min: AtomicU64,
+    send_buffer_capacity: AtomicU64,
+    send_buffer_queued: AtomicU64,
+    video_queue_budget: AtomicU64,
+    audio_packets_dropped: AtomicU64,
+    mouse_updates_dropped: AtomicU64,
+}
+
+pub struct QuicDatagramSendCoordinator {
+    gate: Mutex<()>,
+    interactive_reserve_bytes: usize,
+    counters: DatagramSendCounters,
+}
+
+impl QuicDatagramSendCoordinator {
+    pub fn new(interactive_reserve_bytes: usize, send_buffer_capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            gate: Mutex::new(()),
+            interactive_reserve_bytes,
+            counters: DatagramSendCounters {
+                send_buffer_space_min: AtomicU64::new(u64::MAX),
+                send_buffer_capacity: AtomicU64::new(
+                    u64::try_from(send_buffer_capacity).unwrap_or(u64::MAX),
+                ),
+                ..DatagramSendCounters::default()
+            },
+        })
+    }
+
+    pub fn stats(&self) -> DatagramSendStats {
+        let send_buffer_space_min = self.counters.send_buffer_space_min.load(Ordering::Relaxed);
+        DatagramSendStats {
+            video_frames_sent: self.counters.video_frames_sent.load(Ordering::Relaxed),
+            video_frames_rejected: self.counters.video_frames_rejected.load(Ordering::Relaxed),
+            video_datagrams_sent: self.counters.video_datagrams_sent.load(Ordering::Relaxed),
+            video_frame_bytes: self.counters.video_frame_bytes.load(Ordering::Relaxed),
+            video_frame_bytes_peak: self.counters.video_frame_bytes_peak.load(Ordering::Relaxed),
+            video_frame_fragments: self.counters.video_frame_fragments.load(Ordering::Relaxed),
+            video_frame_fragments_peak: self
+                .counters
+                .video_frame_fragments_peak
+                .load(Ordering::Relaxed),
+            send_buffer_space: self.counters.send_buffer_space.load(Ordering::Relaxed),
+            send_buffer_space_min: if send_buffer_space_min == u64::MAX {
+                0
+            } else {
+                send_buffer_space_min
+            },
+            send_buffer_queued: self.counters.send_buffer_queued.load(Ordering::Relaxed),
+            video_queue_budget: self.counters.video_queue_budget.load(Ordering::Relaxed),
+            audio_packets_dropped: self.counters.audio_packets_dropped.load(Ordering::Relaxed),
+            mouse_updates_dropped: self.counters.mouse_updates_dropped.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_space(&self, available: usize) -> usize {
+        let available = u64::try_from(available).unwrap_or(u64::MAX);
+        self.counters
+            .send_buffer_space
+            .store(available, Ordering::Relaxed);
+        self.counters
+            .send_buffer_space_min
+            .fetch_min(available, Ordering::Relaxed);
+        let previous_capacity = self
+            .counters
+            .send_buffer_capacity
+            .fetch_max(available, Ordering::Relaxed);
+        let capacity = previous_capacity.max(available);
+        let queued = capacity.saturating_sub(available);
+        self.counters
+            .send_buffer_queued
+            .store(queued, Ordering::Relaxed);
+        usize::try_from(queued).unwrap_or(usize::MAX)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VideoDatagramSendOutcome {
+    Sent {
+        fragment_count: usize,
+    },
+    RejectedNoSpace {
+        datagram_bytes: usize,
+        available_bytes: usize,
+    },
+}
 
 pub struct QuicDatagramSender {
     connection: Connection,
+    coordinator: Arc<QuicDatagramSendCoordinator>,
     session_id: SessionId,
     next_video_sequence: u64,
     next_audio_sequence: u64,
@@ -30,8 +157,13 @@ pub struct QuicDatagramSender {
 
 impl QuicDatagramSender {
     pub fn new(connection: Connection, session_id: SessionId) -> Self {
+        let send_buffer_capacity = connection.datagram_send_buffer_space();
         Self {
             connection,
+            coordinator: QuicDatagramSendCoordinator::new(
+                DEFAULT_INTERACTIVE_DATAGRAM_RESERVE_BYTES,
+                send_buffer_capacity,
+            ),
             session_id,
             next_video_sequence: 1,
             next_audio_sequence: 1,
@@ -46,11 +178,16 @@ impl QuicDatagramSender {
         self
     }
 
+    pub fn with_coordinator(mut self, coordinator: Arc<QuicDatagramSendCoordinator>) -> Self {
+        self.coordinator = coordinator;
+        self
+    }
+
     pub fn send_video_frame(
         &mut self,
         metadata: VideoFrameMetadata,
         encoded_frame: &[u8],
-    ) -> Result<usize, QuicTransportError> {
+    ) -> Result<VideoDatagramSendOutcome, QuicTransportError> {
         let max_datagram_size = self.max_datagram_size()?;
         let fragments = fragment_video_frame(
             self.session_id,
@@ -60,19 +197,76 @@ impl QuicDatagramSender {
             encoded_frame,
             max_datagram_size,
         )?;
-        self.next_video_sequence = self
+        let fragment_count = fragments.len();
+        let datagram_bytes = fragments.iter().fold(0usize, |total, fragment| {
+            total.saturating_add(fragment.len())
+        });
+        let frame_bytes = u64::try_from(encoded_frame.len()).unwrap_or(u64::MAX);
+        let fragment_count_u64 = u64::try_from(fragment_count).unwrap_or(u64::MAX);
+        self.coordinator
+            .counters
+            .video_frame_bytes
+            .store(frame_bytes, Ordering::Relaxed);
+        self.coordinator
+            .counters
+            .video_frame_bytes_peak
+            .fetch_max(frame_bytes, Ordering::Relaxed);
+        self.coordinator
+            .counters
+            .video_frame_fragments
+            .store(fragment_count_u64, Ordering::Relaxed);
+        self.coordinator
+            .counters
+            .video_frame_fragments_peak
+            .fetch_max(fragment_count_u64, Ordering::Relaxed);
+
+        let _gate = self.coordinator.gate.lock().unwrap();
+        let available_bytes = self.connection.datagram_send_buffer_space();
+        let queued_bytes = self.coordinator.record_space(available_bytes);
+        let path = self.connection.stats().path;
+        let video_queue_budget = video_datagram_queue_budget(path.cwnd, path.rtt);
+        self.coordinator.counters.video_queue_budget.store(
+            u64::try_from(video_queue_budget).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        if !video_frame_fits_send_budget(
+            datagram_bytes,
+            available_bytes,
+            self.coordinator.interactive_reserve_bytes,
+            queued_bytes,
+            video_queue_budget,
+        ) {
+            self.coordinator
+                .counters
+                .video_frames_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(VideoDatagramSendOutcome::RejectedNoSpace {
+                datagram_bytes,
+                available_bytes,
+            });
+        }
+
+        let next_video_sequence = self
             .next_video_sequence
-            .checked_add(fragments.len() as u64)
+            .checked_add(fragment_count_u64)
             .ok_or_else(|| {
                 QuicTransportError::ProtocolState("video sequence exhausted".to_owned())
             })?;
-        let fragment_count = fragments.len();
         for fragment in fragments {
             self.connection
                 .send_datagram(Bytes::from(fragment))
                 .map_err(|error| QuicTransportError::Datagram(error.to_string()))?;
         }
-        Ok(fragment_count)
+        self.next_video_sequence = next_video_sequence;
+        self.coordinator
+            .counters
+            .video_frames_sent
+            .fetch_add(1, Ordering::Relaxed);
+        self.coordinator
+            .counters
+            .video_datagrams_sent
+            .fetch_add(fragment_count_u64, Ordering::Relaxed);
+        Ok(VideoDatagramSendOutcome::Sent { fragment_count })
     }
 
     pub fn send_audio_packet(
@@ -82,7 +276,7 @@ impl QuicDatagramSender {
         channels: u8,
         sample_rate_hz: u32,
         encoded_audio: &[u8],
-    ) -> Result<u64, QuicTransportError> {
+    ) -> Result<Option<u64>, QuicTransportError> {
         let sequence = self.next_audio_sequence;
         let datagram = encode_audio_datagram(
             self.session_id,
@@ -97,13 +291,24 @@ impl QuicDatagramSender {
             encoded_audio,
             self.max_datagram_size()?,
         )?;
+        let next_sequence = sequence.checked_add(1).ok_or_else(|| {
+            QuicTransportError::ProtocolState("audio sequence exhausted".to_owned())
+        })?;
+        let _gate = self.coordinator.gate.lock().unwrap();
+        let available_bytes = self.connection.datagram_send_buffer_space();
+        self.coordinator.record_space(available_bytes);
+        self.next_audio_sequence = next_sequence;
+        if datagram.len() > available_bytes {
+            self.coordinator
+                .counters
+                .audio_packets_dropped
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        }
         self.connection
             .send_datagram(Bytes::from(datagram))
             .map_err(|error| QuicTransportError::Datagram(error.to_string()))?;
-        self.next_audio_sequence = sequence.checked_add(1).ok_or_else(|| {
-            QuicTransportError::ProtocolState("audio sequence exhausted".to_owned())
-        })?;
-        Ok(sequence)
+        Ok(Some(sequence))
     }
 
     pub fn send_mouse_movement(
@@ -113,7 +318,7 @@ impl QuicDatagramSender {
         y: i32,
         display_id: u32,
         button_state_mask: u16,
-    ) -> Result<u64, QuicTransportError> {
+    ) -> Result<Option<u64>, QuicTransportError> {
         let sequence = self.next_mouse_sequence;
         let datagram = encode_mouse_movement(
             self.session_id,
@@ -128,13 +333,24 @@ impl QuicDatagramSender {
             },
             self.max_datagram_size()?,
         )?;
+        let next_sequence = sequence.checked_add(1).ok_or_else(|| {
+            QuicTransportError::ProtocolState("mouse sequence exhausted".to_owned())
+        })?;
+        let _gate = self.coordinator.gate.lock().unwrap();
+        let available_bytes = self.connection.datagram_send_buffer_space();
+        self.coordinator.record_space(available_bytes);
+        self.next_mouse_sequence = next_sequence;
+        if datagram.len() > available_bytes {
+            self.coordinator
+                .counters
+                .mouse_updates_dropped
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        }
         self.connection
             .send_datagram(Bytes::from(datagram))
             .map_err(|error| QuicTransportError::Datagram(error.to_string()))?;
-        self.next_mouse_sequence = sequence.checked_add(1).ok_or_else(|| {
-            QuicTransportError::ProtocolState("mouse sequence exhausted".to_owned())
-        })?;
-        Ok(sequence)
+        Ok(Some(sequence))
     }
 
     pub fn send_application_mouse_movement(
@@ -145,7 +361,7 @@ impl QuicDatagramSender {
         display_id: u32,
         button_state_mask: u16,
         application_payload: &[u8],
-    ) -> Result<u64, QuicTransportError> {
+    ) -> Result<Option<u64>, QuicTransportError> {
         let sequence = self.next_mouse_sequence;
         let datagram = encode_application_mouse_movement(
             self.session_id,
@@ -161,13 +377,24 @@ impl QuicDatagramSender {
             application_payload,
             self.max_datagram_size()?,
         )?;
+        let next_sequence = sequence.checked_add(1).ok_or_else(|| {
+            QuicTransportError::ProtocolState("mouse sequence exhausted".to_owned())
+        })?;
+        let _gate = self.coordinator.gate.lock().unwrap();
+        let available_bytes = self.connection.datagram_send_buffer_space();
+        self.coordinator.record_space(available_bytes);
+        self.next_mouse_sequence = next_sequence;
+        if datagram.len() > available_bytes {
+            self.coordinator
+                .counters
+                .mouse_updates_dropped
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        }
         self.connection
             .send_datagram(Bytes::from(datagram))
             .map_err(|error| QuicTransportError::Datagram(error.to_string()))?;
-        self.next_mouse_sequence = sequence.checked_add(1).ok_or_else(|| {
-            QuicTransportError::ProtocolState("mouse sequence exhausted".to_owned())
-        })?;
-        Ok(sequence)
+        Ok(Some(sequence))
     }
 
     pub fn max_datagram_size(&self) -> Result<usize, QuicTransportError> {
@@ -306,4 +533,91 @@ impl From<InputProtocolError> for QuicTransportError {
 
 fn elapsed_us(started: Instant) -> u64 {
     started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn video_frame_fits_send_budget(
+    datagram_bytes: usize,
+    available_bytes: usize,
+    interactive_reserve_bytes: usize,
+    queued_bytes: usize,
+    video_queue_budget: usize,
+) -> bool {
+    let preserves_interactive_reserve = datagram_bytes
+        .checked_add(interactive_reserve_bytes)
+        .map(|required| required <= available_bytes)
+        .unwrap_or(false);
+    let stays_within_video_queue = queued_bytes
+        .checked_add(datagram_bytes)
+        .map(|queued| queued <= video_queue_budget)
+        .unwrap_or(false);
+    preserves_interactive_reserve && stays_within_video_queue
+}
+
+fn video_datagram_queue_budget(congestion_window_bytes: u64, rtt: Duration) -> usize {
+    let rtt_us = rtt.as_micros().max(5_000);
+    let target_us = VIDEO_DATAGRAM_QUEUE_TARGET_LATENCY.as_micros();
+    let latency_budget = u128::from(congestion_window_bytes)
+        .saturating_mul(target_us)
+        .checked_div(rtt_us)
+        .unwrap_or(0);
+    usize::try_from(latency_budget).unwrap_or(usize::MAX).clamp(
+        MIN_VIDEO_DATAGRAM_QUEUE_BYTES,
+        MAX_VIDEO_DATAGRAM_QUEUE_BYTES,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        video_datagram_queue_budget, video_frame_fits_send_budget, MAX_VIDEO_DATAGRAM_QUEUE_BYTES,
+        MIN_VIDEO_DATAGRAM_QUEUE_BYTES,
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn video_admission_preserves_the_complete_interactive_reserve() {
+        assert!(video_frame_fits_send_budget(
+            128_000, 192_000, 64_000, 0, 192_000,
+        ));
+        assert!(!video_frame_fits_send_budget(
+            128_001, 192_000, 64_000, 0, 192_000,
+        ));
+    }
+
+    #[test]
+    fn video_admission_bounds_existing_queue_age() {
+        assert!(video_frame_fits_send_budget(
+            64_000, 512_000, 64_000, 128_000, 192_000,
+        ));
+        assert!(!video_frame_fits_send_budget(
+            64_001, 512_000, 64_000, 128_000, 192_000,
+        ));
+    }
+
+    #[test]
+    fn video_admission_rejects_overflowed_size_calculations() {
+        assert!(!video_frame_fits_send_budget(
+            usize::MAX,
+            usize::MAX,
+            1,
+            0,
+            usize::MAX,
+        ));
+    }
+
+    #[test]
+    fn video_queue_budget_scales_with_path_and_is_bounded() {
+        assert_eq!(
+            video_datagram_queue_budget(16 * 1024, Duration::from_millis(200)),
+            MIN_VIDEO_DATAGRAM_QUEUE_BYTES,
+        );
+        assert_eq!(
+            video_datagram_queue_budget(4 * 1024 * 1024, Duration::from_millis(5)),
+            MAX_VIDEO_DATAGRAM_QUEUE_BYTES,
+        );
+        assert_eq!(
+            video_datagram_queue_budget(128 * 1024, Duration::from_millis(80)),
+            192 * 1024,
+        );
+    }
 }

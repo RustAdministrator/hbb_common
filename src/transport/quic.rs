@@ -29,6 +29,7 @@ use std::{
 
 pub const ALPN_V1: &[u8] = b"rustadmin-quic-v1";
 pub const ALPN_V2: &[u8] = b"rustadmin-quic-v2";
+pub const ALPN_V3: &[u8] = b"rustadmin-quic-v3";
 pub const ALPN: &[u8] = ALPN_V1;
 pub const DEFAULT_QUIC_PORT: u16 = 48100;
 pub const DEFAULT_INITIAL_MTU: u16 = 1200;
@@ -54,11 +55,16 @@ const AUTH_CLOSE_CODE: u32 = 0x100;
 pub enum QuicApplicationProtocol {
     V1 = 1,
     V2 = 2,
+    V3 = 3,
 }
 
 impl QuicApplicationProtocol {
     pub fn supports_reliable_keyframes(self) -> bool {
-        self == Self::V2
+        matches!(self, Self::V2 | Self::V3)
+    }
+
+    pub fn supports_scoped_video_reference_refresh(self) -> bool {
+        matches!(self, Self::V3)
     }
 }
 
@@ -286,6 +292,17 @@ pub struct QuicConnectionStats {
     pub negotiated_datagram_size: Option<usize>,
     pub reliable_keyframes: bool,
     pub video_reassembly_drops: u64,
+    pub video_reassembly_expired: u64,
+    pub video_reassembly_evicted: u64,
+    pub video_reassembly_obsolete: u64,
+    pub video_reassembly_pre_keyframe: u64,
+    pub video_reassembly_expired_keyframes: u64,
+    pub video_reassembly_missing_fragments: u64,
+    pub video_reassembly_last_us: u64,
+    pub video_reassembly_max_us: u64,
+    pub video_reassembly_max_gap_us: u64,
+    pub video_reassembly_last_frame_bytes: u64,
+    pub video_reassembly_last_frame_fragments: u64,
     pub video_keyframe_requests: u64,
     pub reliable_keyframes_sent: u64,
     pub reliable_keyframes_received: u64,
@@ -293,6 +310,19 @@ pub struct QuicConnectionStats {
     pub video_recovery_suppressed_frames: u64,
     pub video_sender_replacements: u64,
     pub video_sender_reference_resets: u64,
+    pub video_datagram_frames_sent: u64,
+    pub video_datagram_frames_rejected: u64,
+    pub video_datagrams_sent: u64,
+    pub video_datagram_frame_bytes: u64,
+    pub video_datagram_frame_bytes_peak: u64,
+    pub video_datagram_frame_fragments: u64,
+    pub video_datagram_frame_fragments_peak: u64,
+    pub datagram_send_buffer_space: u64,
+    pub datagram_send_buffer_space_min: u64,
+    pub datagram_send_buffer_queued: u64,
+    pub video_datagram_queue_budget: u64,
+    pub audio_datagram_drops: u64,
+    pub mouse_datagram_drops: u64,
 }
 
 impl QuicConnectionStats {
@@ -311,6 +341,17 @@ impl QuicConnectionStats {
             negotiated_datagram_size: None,
             reliable_keyframes: false,
             video_reassembly_drops: 0,
+            video_reassembly_expired: 0,
+            video_reassembly_evicted: 0,
+            video_reassembly_obsolete: 0,
+            video_reassembly_pre_keyframe: 0,
+            video_reassembly_expired_keyframes: 0,
+            video_reassembly_missing_fragments: 0,
+            video_reassembly_last_us: 0,
+            video_reassembly_max_us: 0,
+            video_reassembly_max_gap_us: 0,
+            video_reassembly_last_frame_bytes: 0,
+            video_reassembly_last_frame_fragments: 0,
             video_keyframe_requests: 0,
             reliable_keyframes_sent: 0,
             reliable_keyframes_received: 0,
@@ -318,6 +359,19 @@ impl QuicConnectionStats {
             video_recovery_suppressed_frames: 0,
             video_sender_replacements: 0,
             video_sender_reference_resets: 0,
+            video_datagram_frames_sent: 0,
+            video_datagram_frames_rejected: 0,
+            video_datagrams_sent: 0,
+            video_datagram_frame_bytes: 0,
+            video_datagram_frame_bytes_peak: 0,
+            video_datagram_frame_fragments: 0,
+            video_datagram_frame_fragments_peak: 0,
+            datagram_send_buffer_space: 0,
+            datagram_send_buffer_space_min: 0,
+            datagram_send_buffer_queued: 0,
+            video_datagram_queue_budget: 0,
+            audio_datagram_drops: 0,
+            mouse_datagram_drops: 0,
         }
     }
 }
@@ -869,7 +923,7 @@ fn ensure_udp_enabled() -> Result<(), QuicTransportError> {
 
 fn supported_alpn_protocols(options: &QuicTransportOptions) -> Vec<Vec<u8>> {
     if options.enable_application_protocol_v2 {
-        vec![ALPN_V2.to_vec(), ALPN_V1.to_vec()]
+        vec![ALPN_V3.to_vec(), ALPN_V2.to_vec(), ALPN_V1.to_vec()]
     } else {
         vec![ALPN_V1.to_vec()]
     }
@@ -888,6 +942,7 @@ pub fn negotiated_application_protocol(
             QuicTransportError::Handshake("unexpected TLS handshake metadata".to_owned())
         })?;
     match handshake.protocol.as_deref() {
+        Some(ALPN_V3) => Ok(QuicApplicationProtocol::V3),
         Some(ALPN_V2) => Ok(QuicApplicationProtocol::V2),
         Some(ALPN_V1) => Ok(QuicApplicationProtocol::V1),
         Some(protocol) => Err(QuicTransportError::Handshake(format!(
@@ -1490,7 +1545,10 @@ mod tests {
     use super::*;
     use crate::transport::{
         audio_datagram::{AudioCodec, AudioJitterConfig, AudioPlayoutItem},
-        datagram::{DatagramReceiveEvent, QuicDatagramReceiver, QuicDatagramSender},
+        datagram::{
+            DatagramReceiveEvent, QuicDatagramReceiver, QuicDatagramSender,
+            VideoDatagramSendOutcome,
+        },
         input::{MouseMovement, MouseMovementMode},
         reliable::{ReliableChannel, ReliableChannelKind},
         session::{
@@ -1592,13 +1650,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn alpn_v2_is_preferred_and_v1_peers_remain_compatible() {
-        let Some(v2) = negotiate_test_alpn(true, true).await else {
+    async fn alpn_v3_is_preferred_and_older_peers_remain_compatible() {
+        let Some(v3) = negotiate_test_alpn(true, true).await else {
             return;
         };
         assert_eq!(
-            v2,
-            (QuicApplicationProtocol::V2, QuicApplicationProtocol::V2)
+            v3,
+            (QuicApplicationProtocol::V3, QuicApplicationProtocol::V3)
         );
         assert_eq!(
             negotiate_test_alpn(false, true).await,
@@ -1846,7 +1904,10 @@ mod tests {
                 &vec![8; 5000],
             )
             .unwrap();
-        assert!(video_fragments > 1);
+        assert!(matches!(
+            video_fragments,
+            VideoDatagramSendOutcome::Sent { fragment_count } if fragment_count > 1
+        ));
         datagrams
             .send_audio_packet(123, AudioCodec::Opus, 2, 48_000, &vec![9; 120])
             .unwrap();
