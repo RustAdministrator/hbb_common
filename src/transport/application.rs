@@ -1,7 +1,10 @@
 use super::{
     audio_datagram::{AudioCodec, AudioJitterConfig, AudioPlayoutItem},
     configuration::NetworkTransportConfig,
-    datagram::{DatagramReceiveEvent, QuicDatagramReceiver, QuicDatagramSender},
+    datagram::{
+        DatagramReceiveEvent, QuicDatagramReceiver, QuicDatagramSendCoordinator,
+        QuicDatagramSender, VideoDatagramSendOutcome, DEFAULT_INTERACTIVE_DATAGRAM_RESERVE_BYTES,
+    },
     input::MouseMovementMode,
     protocol::MessageType,
     quic::{
@@ -20,7 +23,9 @@ use super::{
     },
     video_datagram::{VideoCodec, VideoFrameMetadata, VideoReassemblyConfig, FLAG_KEYFRAME},
 };
-use crate::message_proto::{message, misc, video_frame, AudioFormat, Message, Misc, VideoFrame};
+use crate::message_proto::{
+    message, misc, video_frame, AudioFormat, Message, Misc, VideoFrame, VideoReferenceRefresh,
+};
 use bytes::{Bytes, BytesMut};
 use protobuf::Message as ProtobufMessage;
 use quinn::{Connection, Endpoint};
@@ -50,7 +55,9 @@ const AUDIO_OUTBOUND_CAPACITY: usize = 64;
 const CHANNEL_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 const V2_MAX_APPLICATION_DATAGRAM_SIZE: usize = 1300;
 const VIDEO_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(25);
-const VIDEO_KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(500);
+const VIDEO_KEYFRAME_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
+const VIDEO_KEYFRAME_RETRY_MAX_ATTEMPTS: u8 = 3;
+const VIDEO_KEYFRAME_RECOVERY_CYCLE_COOLDOWN: Duration = Duration::from_secs(10);
 const MAX_VIDEO_STREAM_STATES: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -83,13 +90,30 @@ struct ReliableOutbound {
 
 struct VideoOutbound {
     metadata: VideoFrameMetadata,
+    source_info: Option<VideoSourceInfo>,
     payload: Bytes,
     ordering_epoch: u64,
+}
+
+enum LocalVideoRefresh {
+    Legacy,
+    Reference(VideoReferenceRefresh),
 }
 
 #[derive(Default)]
 struct QuicApplicationMetrics {
     video_reassembly_drops: AtomicU64,
+    video_reassembly_expired: AtomicU64,
+    video_reassembly_evicted: AtomicU64,
+    video_reassembly_obsolete: AtomicU64,
+    video_reassembly_pre_keyframe: AtomicU64,
+    video_reassembly_expired_keyframes: AtomicU64,
+    video_reassembly_missing_fragments: AtomicU64,
+    video_reassembly_last_us: AtomicU64,
+    video_reassembly_max_us: AtomicU64,
+    video_reassembly_max_gap_us: AtomicU64,
+    video_reassembly_last_frame_bytes: AtomicU64,
+    video_reassembly_last_frame_fragments: AtomicU64,
     video_keyframe_requests: AtomicU64,
     reliable_keyframes_sent: AtomicU64,
     reliable_keyframes_received: AtomicU64,
@@ -102,7 +126,8 @@ struct QuicApplicationMetrics {
 
 struct VideoSendRecovery {
     state: Mutex<VideoSendRecoveryState>,
-    refresh: mpsc::Sender<()>,
+    refresh: mpsc::Sender<LocalVideoRefresh>,
+    scoped_reference_refresh: bool,
     metrics: Arc<QuicApplicationMetrics>,
 }
 
@@ -113,15 +138,25 @@ struct VideoSendRecoveryState {
 }
 
 impl VideoSendRecovery {
-    fn new(refresh: mpsc::Sender<()>, metrics: Arc<QuicApplicationMetrics>) -> Arc<Self> {
+    fn new(
+        refresh: mpsc::Sender<LocalVideoRefresh>,
+        scoped_reference_refresh: bool,
+        metrics: Arc<QuicApplicationMetrics>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(VideoSendRecoveryState::default()),
             refresh,
+            scoped_reference_refresh,
             metrics,
         })
     }
 
-    fn enter(&self, dropped_frame_id: u64, reason: &'static str) {
+    fn enter(
+        &self,
+        source_info: Option<VideoSourceInfo>,
+        dropped_frame_id: u64,
+        reason: &'static str,
+    ) {
         let first_loss = {
             let mut state = self.state.lock().unwrap();
             state.minimum_keyframe_id = state.minimum_keyframe_id.max(dropped_frame_id);
@@ -133,7 +168,20 @@ impl VideoSendRecovery {
             self.metrics
                 .video_sender_reference_resets
                 .fetch_add(1, Ordering::Relaxed);
-            let _ = self.refresh.try_send(());
+            if self.scoped_reference_refresh {
+                if let Some(refresh) = source_info
+                    .and_then(|info| video_reference_refresh(info, 1))
+                    .map(LocalVideoRefresh::Reference)
+                {
+                    let _ = self.refresh.try_send(refresh);
+                } else {
+                    log::debug!(
+                        "QUIC video sender lost an encoded reference before source metadata was available; scoped refresh suppressed"
+                    );
+                }
+            } else {
+                let _ = self.refresh.try_send(LocalVideoRefresh::Legacy);
+            }
             log::warn!(
                 "QUIC video sender lost an encoded reference at frame {dropped_frame_id}: {reason}; requesting a fresh keyframe"
             );
@@ -193,10 +241,24 @@ enum VideoReceiveDecision {
     SuppressAfterGap,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PendingVideoRecovery {
+    source: Option<VideoSourceInfo>,
+    requested_at: Instant,
+    retries: u8,
+}
+
+#[derive(Debug)]
+enum VideoKeyframeRequest {
+    Legacy,
+    Scoped(VideoReferenceRefresh),
+}
+
 #[derive(Default)]
 struct VideoReceiveRecovery {
     streams: BTreeMap<VideoStreamKey, VideoReceiveState>,
-    last_keyframe_request: Option<Instant>,
+    last_observed: Option<VideoSourceInfo>,
+    pending_request: Option<PendingVideoRecovery>,
 }
 
 impl VideoReceiveRecovery {
@@ -207,8 +269,16 @@ impl VideoReceiveRecovery {
         if !self.streams.contains_key(&info.key) && self.streams.len() >= MAX_VIDEO_STREAM_STATES {
             self.streams.pop_first();
         }
+        self.last_observed = Some(info);
         let state = self.streams.entry(info.key).or_default();
         if info.keyframe {
+            if self.pending_request.is_some_and(|pending| {
+                pending
+                    .source
+                    .is_some_and(|source| source.key == info.key && info.frame_id > source.frame_id)
+            }) {
+                self.pending_request = None;
+            }
             state.last_frame_id = info.frame_id;
             state.awaiting_keyframe = false;
             return VideoReceiveDecision::Accept;
@@ -234,18 +304,77 @@ impl VideoReceiveRecovery {
         }
     }
 
+    fn latest_source(&self) -> Option<VideoSourceInfo> {
+        if let Some(info) = self.last_observed {
+            return Some(info);
+        }
+        self.streams.iter().rev().find_map(|(key, state)| {
+            (state.last_frame_id > 0).then_some(VideoSourceInfo {
+                key: *key,
+                frame_id: state.last_frame_id,
+                keyframe: false,
+            })
+        })
+    }
+
     fn has_unrecovered_streams(&self) -> bool {
         self.streams.values().any(|state| state.awaiting_keyframe)
     }
 
-    fn can_request_keyframe(&self, now: Instant) -> bool {
-        self.last_keyframe_request
-            .map(|last| now.saturating_duration_since(last) >= VIDEO_KEYFRAME_REQUEST_INTERVAL)
-            .unwrap_or(true)
-    }
+    fn next_keyframe_request(
+        &mut self,
+        now: Instant,
+        scoped_reference_refresh: bool,
+        dropped_frames: u64,
+    ) -> Option<VideoKeyframeRequest> {
+        let source = self.latest_source();
+        if scoped_reference_refresh && source.is_none() {
+            return None;
+        }
 
-    fn record_keyframe_request(&mut self, now: Instant) {
-        self.last_keyframe_request = Some(now);
+        let is_new_stream = self.pending_request.is_some_and(|pending| {
+            pending
+                .source
+                .zip(source)
+                .is_some_and(|(pending, source)| pending.key != source.key)
+        });
+        let due = match self.pending_request {
+            None => true,
+            Some(_) if is_new_stream => true,
+            Some(pending) if pending.retries < VIDEO_KEYFRAME_RETRY_MAX_ATTEMPTS => {
+                let multiplier = 1u32 << u32::from(pending.retries);
+                now.saturating_duration_since(pending.requested_at)
+                    >= VIDEO_KEYFRAME_RETRY_INITIAL_DELAY.saturating_mul(multiplier)
+            }
+            Some(pending) => {
+                now.saturating_duration_since(pending.requested_at)
+                    >= VIDEO_KEYFRAME_RECOVERY_CYCLE_COOLDOWN
+            }
+        };
+        if !due {
+            return None;
+        }
+
+        let retries = match self.pending_request {
+            Some(pending)
+                if !is_new_stream && pending.retries < VIDEO_KEYFRAME_RETRY_MAX_ATTEMPTS =>
+            {
+                pending.retries.saturating_add(1)
+            }
+            _ => 0,
+        };
+        self.pending_request = Some(PendingVideoRecovery {
+            source,
+            requested_at: now,
+            retries,
+        });
+        match (scoped_reference_refresh, source) {
+            (true, Some(source)) => {
+                video_reference_refresh(source, dropped_frames).map(VideoKeyframeRequest::Scoped)
+            }
+            (false, _) => Some(VideoKeyframeRequest::Legacy),
+            (true, None) => None,
+        }
     }
 }
 
@@ -399,6 +528,7 @@ pub struct QuicApplicationStream {
     latest_video: Arc<LatestSlot<VideoOutbound>>,
     video_send_recovery: Arc<VideoSendRecovery>,
     latest_mouse: Arc<LatestSlot<MouseOutbound>>,
+    datagram_send: Arc<QuicDatagramSendCoordinator>,
     audio_format: Arc<AtomicU64>,
     next_transport_frame_id: AtomicU64,
     video_ordering: Arc<VideoOrderingGate>,
@@ -440,7 +570,11 @@ impl QuicApplicationStream {
         let video_ordering = VideoOrderingGate::new();
         let metrics = Arc::new(QuicApplicationMetrics::default());
         let (video_refresh_tx, video_refresh_rx) = mpsc::channel(1);
-        let video_send_recovery = VideoSendRecovery::new(video_refresh_tx, metrics.clone());
+        let video_send_recovery = VideoSendRecovery::new(
+            video_refresh_tx,
+            application_protocol.supports_scoped_video_reference_refresh(),
+            metrics.clone(),
+        );
         tasks.push(tokio::spawn(run_local_video_refresh(
             video_refresh_rx,
             inbound_tx.clone(),
@@ -520,10 +654,15 @@ impl QuicApplicationStream {
         let (audio, audio_rx) = mpsc::channel(AUDIO_OUTBOUND_CAPACITY);
         let latest_video = LatestSlot::new();
         let latest_mouse = LatestSlot::new();
+        let datagram_send = QuicDatagramSendCoordinator::new(
+            DEFAULT_INTERACTIVE_DATAGRAM_RESERVE_BYTES,
+            connection.datagram_send_buffer_space(),
+        );
         let negotiated_datagram_size = usize::from(agreement.max_datagram_payload);
         tasks.push(tokio::spawn(run_video_writer(
             QuicDatagramSender::new(connection.clone(), session_id)
-                .with_max_datagram_size(negotiated_datagram_size),
+                .with_max_datagram_size(negotiated_datagram_size)
+                .with_coordinator(datagram_send.clone()),
             latest_video.clone(),
             video_ordering.clone(),
             inbound_tx.clone(),
@@ -533,14 +672,16 @@ impl QuicApplicationStream {
         )));
         tasks.push(tokio::spawn(run_mouse_writer(
             QuicDatagramSender::new(connection.clone(), session_id)
-                .with_max_datagram_size(negotiated_datagram_size),
+                .with_max_datagram_size(negotiated_datagram_size)
+                .with_coordinator(datagram_send.clone()),
             latest_mouse.clone(),
             inbound_tx.clone(),
             connection.clone(),
         )));
         tasks.push(tokio::spawn(run_audio_writer(
             QuicDatagramSender::new(connection.clone(), session_id)
-                .with_max_datagram_size(negotiated_datagram_size),
+                .with_max_datagram_size(negotiated_datagram_size)
+                .with_coordinator(datagram_send.clone()),
             audio_rx,
             inbound_tx.clone(),
             connection.clone(),
@@ -562,6 +703,7 @@ impl QuicApplicationStream {
             inbound_tx,
             control.clone(),
             connection.clone(),
+            application_protocol.supports_scoped_video_reference_refresh(),
             metrics.clone(),
         )));
 
@@ -587,6 +729,7 @@ impl QuicApplicationStream {
             latest_video,
             video_send_recovery,
             latest_mouse,
+            datagram_send,
             audio_format: Arc::new(AtomicU64::new(0)),
             next_transport_frame_id: AtomicU64::new(1),
             video_ordering,
@@ -649,9 +792,11 @@ impl QuicApplicationStream {
                 if !keyframe && self.video_send_recovery.suppress_delta(frame_id) {
                     return Ok(());
                 }
+                let source_info = video_source_info(&payload).ok();
                 let queued = self.latest_video.replace_when_with(
                     VideoOutbound {
                         metadata,
+                        source_info,
                         payload,
                         ordering_epoch: self.video_ordering.current_epoch(),
                     },
@@ -662,6 +807,7 @@ impl QuicApplicationStream {
                             .fetch_add(1, Ordering::Relaxed);
                         if !incoming.is_keyframe() {
                             self.video_send_recovery.enter(
+                                incoming.source_info,
                                 incoming.metadata.frame_id,
                                 "a newer encoded delta replaced a pending frame",
                             );
@@ -673,6 +819,7 @@ impl QuicApplicationStream {
                         .video_sender_replacements
                         .fetch_add(1, Ordering::Relaxed);
                     self.video_send_recovery.enter(
+                        source_info,
                         frame_id,
                         "an encoded frame could not enter the latest-frame slot",
                     );
@@ -762,6 +909,48 @@ impl QuicApplicationStream {
         stats.negotiated_datagram_size = Some(usize::from(self.agreement.max_datagram_payload));
         stats.reliable_keyframes = self.agreement.reliable_keyframes;
         stats.video_reassembly_drops = self.metrics.video_reassembly_drops.load(Ordering::Relaxed);
+        stats.video_reassembly_expired = self
+            .metrics
+            .video_reassembly_expired
+            .load(Ordering::Relaxed);
+        stats.video_reassembly_evicted = self
+            .metrics
+            .video_reassembly_evicted
+            .load(Ordering::Relaxed);
+        stats.video_reassembly_obsolete = self
+            .metrics
+            .video_reassembly_obsolete
+            .load(Ordering::Relaxed);
+        stats.video_reassembly_pre_keyframe = self
+            .metrics
+            .video_reassembly_pre_keyframe
+            .load(Ordering::Relaxed);
+        stats.video_reassembly_expired_keyframes = self
+            .metrics
+            .video_reassembly_expired_keyframes
+            .load(Ordering::Relaxed);
+        stats.video_reassembly_missing_fragments = self
+            .metrics
+            .video_reassembly_missing_fragments
+            .load(Ordering::Relaxed);
+        stats.video_reassembly_last_us = self
+            .metrics
+            .video_reassembly_last_us
+            .load(Ordering::Relaxed);
+        stats.video_reassembly_max_us =
+            self.metrics.video_reassembly_max_us.load(Ordering::Relaxed);
+        stats.video_reassembly_max_gap_us = self
+            .metrics
+            .video_reassembly_max_gap_us
+            .load(Ordering::Relaxed);
+        stats.video_reassembly_last_frame_bytes = self
+            .metrics
+            .video_reassembly_last_frame_bytes
+            .load(Ordering::Relaxed);
+        stats.video_reassembly_last_frame_fragments = self
+            .metrics
+            .video_reassembly_last_frame_fragments
+            .load(Ordering::Relaxed);
         stats.video_keyframe_requests =
             self.metrics.video_keyframe_requests.load(Ordering::Relaxed);
         stats.reliable_keyframes_sent =
@@ -784,6 +973,20 @@ impl QuicApplicationStream {
             .metrics
             .video_sender_reference_resets
             .load(Ordering::Relaxed);
+        let datagram_send = self.datagram_send.stats();
+        stats.video_datagram_frames_sent = datagram_send.video_frames_sent;
+        stats.video_datagram_frames_rejected = datagram_send.video_frames_rejected;
+        stats.video_datagrams_sent = datagram_send.video_datagrams_sent;
+        stats.video_datagram_frame_bytes = datagram_send.video_frame_bytes;
+        stats.video_datagram_frame_bytes_peak = datagram_send.video_frame_bytes_peak;
+        stats.video_datagram_frame_fragments = datagram_send.video_frame_fragments;
+        stats.video_datagram_frame_fragments_peak = datagram_send.video_frame_fragments_peak;
+        stats.datagram_send_buffer_space = datagram_send.send_buffer_space;
+        stats.datagram_send_buffer_space_min = datagram_send.send_buffer_space_min;
+        stats.datagram_send_buffer_queued = datagram_send.send_buffer_queued;
+        stats.video_datagram_queue_budget = datagram_send.video_queue_budget;
+        stats.audio_datagram_drops = datagram_send.audio_packets_dropped;
+        stats.mouse_datagram_drops = datagram_send.mouse_updates_dropped;
         stats
     }
 
@@ -1185,11 +1388,14 @@ async fn run_reliable_reader(
 }
 
 async fn run_local_video_refresh(
-    mut refresh: mpsc::Receiver<()>,
+    mut refresh: mpsc::Receiver<LocalVideoRefresh>,
     inbound: mpsc::Sender<Result<BytesMut, Error>>,
 ) {
-    while refresh.recv().await.is_some() {
-        let message = refresh_video_message();
+    while let Some(refresh) = refresh.recv().await {
+        let message = match refresh {
+            LocalVideoRefresh::Legacy => refresh_video_message(),
+            LocalVideoRefresh::Reference(refresh) => video_reference_refresh_message(refresh),
+        };
         if inbound
             .send(Ok(BytesMut::from(message.as_slice())))
             .await
@@ -1223,6 +1429,7 @@ async fn run_video_writer(
                             .fetch_add(1, Ordering::Relaxed);
                         if !newer.is_keyframe() {
                             recovery.enter(
+                                newer.source_info,
                                 newer.metadata.frame_id,
                                 "a newer encoded delta replaced a frame waiting for display ordering",
                             );
@@ -1234,6 +1441,7 @@ async fn run_video_writer(
                             .video_sender_replacements
                             .fetch_add(1, Ordering::Relaxed);
                         recovery.enter(
+                            newer.source_info,
                             newer.metadata.frame_id,
                             "an encoded frame was discarded while waiting for display ordering",
                         );
@@ -1267,12 +1475,30 @@ async fn run_video_writer(
                 continue;
             }
         }
-        if let Err(error) = sender
-            .send_video_frame(item.metadata, &item.payload)
-            .map(|_| ())
-        {
-            report_terminal_error(&inbound, &connection, error.to_string()).await;
-            return;
+        match sender.send_video_frame(item.metadata, &item.payload) {
+            Ok(VideoDatagramSendOutcome::Sent { .. }) => {}
+            Ok(VideoDatagramSendOutcome::RejectedNoSpace {
+                datagram_bytes,
+                available_bytes,
+            }) => {
+                log::warn!(
+                    "QUIC video frame rejected before DATAGRAM enqueue: frame_id={}, bytes={}, datagram_bytes={}, available_bytes={}",
+                    item.metadata.frame_id,
+                    item.payload.len(),
+                    datagram_bytes,
+                    available_bytes,
+                );
+                recovery.enter(
+                    item.source_info,
+                    item.metadata.frame_id,
+                    "the complete encoded frame did not fit the QUIC DATAGRAM send budget",
+                );
+                continue;
+            }
+            Err(error) => {
+                report_terminal_error(&inbound, &connection, error.to_string()).await;
+                return;
+            }
         }
         if item.is_keyframe() {
             recovery.keyframe_sent(item.metadata.frame_id);
@@ -1335,6 +1561,7 @@ async fn run_datagram_reader(
     inbound: mpsc::Sender<Result<BytesMut, Error>>,
     control: mpsc::Sender<ReliableOutbound>,
     connection: Connection,
+    scoped_reference_refresh: bool,
     metrics: Arc<QuicApplicationMetrics>,
 ) {
     let mut received_audio_format = None;
@@ -1360,6 +1587,7 @@ async fn run_datagram_reader(
                         receiver.video_stats(),
                         &inbound,
                         &control,
+                        scoped_reference_refresh,
                         &metrics,
                         &metrics.video_receive_recovery,
                         Instant::now(),
@@ -1380,6 +1608,7 @@ async fn run_datagram_reader(
                     receiver.video_stats(),
                     &inbound,
                     &control,
+                    scoped_reference_refresh,
                     &metrics,
                     &metrics.video_receive_recovery,
                     Instant::now(),
@@ -1439,6 +1668,7 @@ fn handle_video_outcome(
     video_stats: &super::video_datagram::VideoReassemblyStats,
     inbound: &mpsc::Sender<Result<BytesMut, Error>>,
     control: &mpsc::Sender<ReliableOutbound>,
+    scoped_reference_refresh: bool,
     metrics: &QuicApplicationMetrics,
     recovery: &Mutex<VideoReceiveRecovery>,
     now: Instant,
@@ -1451,6 +1681,39 @@ fn handle_video_outcome(
             .saturating_add(video_stats.pre_keyframe_frames),
         Ordering::Relaxed,
     );
+    metrics
+        .video_reassembly_expired
+        .store(video_stats.expired_frames, Ordering::Relaxed);
+    metrics
+        .video_reassembly_evicted
+        .store(video_stats.evicted_frames, Ordering::Relaxed);
+    metrics
+        .video_reassembly_obsolete
+        .store(video_stats.obsolete_frames, Ordering::Relaxed);
+    metrics
+        .video_reassembly_pre_keyframe
+        .store(video_stats.pre_keyframe_frames, Ordering::Relaxed);
+    metrics
+        .video_reassembly_expired_keyframes
+        .store(video_stats.expired_keyframes, Ordering::Relaxed);
+    metrics
+        .video_reassembly_missing_fragments
+        .store(video_stats.missing_fragments, Ordering::Relaxed);
+    metrics
+        .video_reassembly_last_us
+        .store(video_stats.last_frame_assembly_us, Ordering::Relaxed);
+    metrics
+        .video_reassembly_max_us
+        .store(video_stats.max_frame_assembly_us, Ordering::Relaxed);
+    metrics
+        .video_reassembly_max_gap_us
+        .store(video_stats.max_fragment_gap_us, Ordering::Relaxed);
+    metrics
+        .video_reassembly_last_frame_bytes
+        .store(video_stats.last_frame_bytes, Ordering::Relaxed);
+    metrics
+        .video_reassembly_last_frame_fragments
+        .store(video_stats.last_frame_fragments, Ordering::Relaxed);
     let mut needs_keyframe = outcome.request_keyframe || outcome.dropped_frames > 0;
     if outcome.dropped_frames > 0 {
         recovery.lock().unwrap().mark_reference_loss();
@@ -1502,18 +1765,30 @@ fn handle_video_outcome(
         }
     }
     if needs_keyframe {
-        let can_request = recovery.lock().unwrap().can_request_keyframe(now);
-        if can_request {
+        let request = recovery.lock().unwrap().next_keyframe_request(
+            now,
+            scoped_reference_refresh,
+            u64::from(outcome.dropped_frames),
+        );
+        if let Some(request) = request {
+            let (payload, scoped) = match request {
+                VideoKeyframeRequest::Legacy => (refresh_video_message(), false),
+                VideoKeyframeRequest::Scoped(refresh) => {
+                    (video_reference_refresh_message(refresh), true)
+                }
+            };
             match control.try_send(ReliableOutbound {
                 message_type: MessageType::ApplicationControl,
-                payload: Bytes::from(refresh_video_message()),
+                payload: Bytes::from(payload),
             }) {
                 Ok(()) => {
-                    recovery.lock().unwrap().record_keyframe_request(now);
                     metrics
                         .video_keyframe_requests
                         .fetch_add(1, Ordering::Relaxed);
-                    log::debug!("QUIC video recovery requested a fresh keyframe");
+                    log::debug!(
+                        "QUIC video recovery requested a fresh keyframe: scoped={}",
+                        scoped
+                    );
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {}
                 Err(mpsc::error::TrySendError::Closed(_)) => return false,
@@ -1796,6 +2071,30 @@ fn refresh_video_message() -> Vec<u8> {
     message.write_to_bytes().unwrap_or_default()
 }
 
+fn video_reference_refresh(
+    info: VideoSourceInfo,
+    dropped_frames: u64,
+) -> Option<VideoReferenceRefresh> {
+    if info.key.display < 0 || info.key.stream_id == 0 || info.frame_id == 0 {
+        return None;
+    }
+    Some(VideoReferenceRefresh {
+        display: info.key.display,
+        stream_id: info.key.stream_id,
+        received_frame_id: info.frame_id,
+        dropped_frames,
+        ..Default::default()
+    })
+}
+
+fn video_reference_refresh_message(refresh: VideoReferenceRefresh) -> Vec<u8> {
+    let mut misc = Misc::new();
+    misc.set_video_reference_refresh(refresh);
+    let mut message = Message::new();
+    message.set_misc(misc);
+    message.write_to_bytes().unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1915,6 +2214,14 @@ mod tests {
                 flags: if keyframe { FLAG_KEYFRAME } else { 0 },
                 presentation_timestamp_us: frame_id * 1_000,
             },
+            source_info: Some(VideoSourceInfo {
+                key: VideoStreamKey {
+                    display: 0,
+                    stream_id: 7,
+                },
+                frame_id,
+                keyframe,
+            }),
             payload: Bytes::from(vec![frame_id as u8]),
             ordering_epoch,
         }
@@ -2018,23 +2325,161 @@ mod tests {
     }
 
     #[test]
-    fn receiver_keyframe_requests_are_rate_limited() {
+    fn receiver_keyframe_recovery_uses_bounded_backoff() {
         let now = Instant::now();
         let mut recovery = VideoReceiveRecovery::default();
-        assert!(recovery.can_request_keyframe(now));
-        recovery.record_keyframe_request(now);
-        assert!(!recovery.can_request_keyframe(now + Duration::from_millis(499)));
-        assert!(recovery.can_request_keyframe(now + Duration::from_millis(500)));
+        recovery.observe(source_video(7, 4, true));
+
+        assert!(matches!(
+            recovery.next_keyframe_request(now, true, 1),
+            Some(VideoKeyframeRequest::Scoped(_))
+        ));
+        assert!(recovery
+            .next_keyframe_request(now + Duration::from_millis(999), true, 0)
+            .is_none());
+        assert!(matches!(
+            recovery.next_keyframe_request(now + Duration::from_secs(1), true, 0),
+            Some(VideoKeyframeRequest::Scoped(_))
+        ));
+        assert!(recovery
+            .next_keyframe_request(now + Duration::from_secs(2), true, 0)
+            .is_none());
+        assert!(matches!(
+            recovery.next_keyframe_request(now + Duration::from_secs(3), true, 0),
+            Some(VideoKeyframeRequest::Scoped(_))
+        ));
+        assert!(matches!(
+            recovery.next_keyframe_request(now + Duration::from_secs(7), true, 0),
+            Some(VideoKeyframeRequest::Scoped(_))
+        ));
+        assert!(recovery
+            .next_keyframe_request(now + Duration::from_secs(16), true, 0)
+            .is_none());
+        assert!(matches!(
+            recovery.next_keyframe_request(now + Duration::from_secs(17), true, 0),
+            Some(VideoKeyframeRequest::Scoped(_))
+        ));
+    }
+
+    #[test]
+    fn receiver_keyframe_ends_the_pending_recovery_cycle() {
+        let now = Instant::now();
+        let mut recovery = VideoReceiveRecovery::default();
+        recovery.observe(source_video(7, 4, true));
+        recovery.observe(source_video(7, 6, false));
+        assert!(recovery.next_keyframe_request(now, true, 1).is_some());
+        assert_eq!(
+            recovery.observe(source_video(7, 7, true)),
+            VideoReceiveDecision::Accept
+        );
+        assert!(recovery.pending_request.is_none());
+    }
+
+    #[test]
+    fn receiver_recovery_serializes_scoped_reference_refresh_for_v3() {
+        let (inbound, _inbound_rx) = mpsc::channel(1);
+        let (control, mut control_rx) = mpsc::channel(1);
+        let metrics = QuicApplicationMetrics::default();
+        let recovery = Mutex::new(VideoReceiveRecovery::default());
+        recovery.lock().unwrap().observe(source_video(7, 4, true));
+        let outcome = super::super::video_datagram::VideoReassemblyOutcome {
+            request_keyframe: true,
+            dropped_frames: 1,
+            frame: None,
+        };
+        assert!(handle_video_outcome(
+            outcome,
+            &super::super::video_datagram::VideoReassemblyStats::default(),
+            &inbound,
+            &control,
+            true,
+            &metrics,
+            &recovery,
+            Instant::now(),
+        ));
+        let outbound = control_rx.try_recv().unwrap();
+        let message = Message::parse_from_bytes(&outbound.payload).unwrap();
+        let Some(message::Union::Misc(misc)) = message.union else {
+            panic!("expected misc message");
+        };
+        let Some(misc::Union::VideoReferenceRefresh(refresh)) = misc.union else {
+            panic!("expected scoped video reference refresh");
+        };
+        assert_eq!(refresh.display, 0);
+        assert_eq!(refresh.stream_id, 7);
+        assert_eq!(refresh.received_frame_id, 4);
+        assert_eq!(refresh.dropped_frames, 1);
+    }
+
+    #[test]
+    fn receiver_recovery_keeps_legacy_refresh_for_old_quic_protocols() {
+        let (inbound, _inbound_rx) = mpsc::channel(1);
+        let (control, mut control_rx) = mpsc::channel(1);
+        let metrics = QuicApplicationMetrics::default();
+        let recovery = Mutex::new(VideoReceiveRecovery::default());
+        recovery.lock().unwrap().observe(source_video(7, 4, true));
+        let outcome = super::super::video_datagram::VideoReassemblyOutcome {
+            request_keyframe: true,
+            dropped_frames: 1,
+            frame: None,
+        };
+        assert!(handle_video_outcome(
+            outcome,
+            &super::super::video_datagram::VideoReassemblyStats::default(),
+            &inbound,
+            &control,
+            false,
+            &metrics,
+            &recovery,
+            Instant::now(),
+        ));
+        let outbound = control_rx.try_recv().unwrap();
+        let message = Message::parse_from_bytes(&outbound.payload).unwrap();
+        let Some(message::Union::Misc(misc)) = message.union else {
+            panic!("expected misc message");
+        };
+        assert!(matches!(misc.union, Some(misc::Union::RefreshVideo(true))));
+    }
+
+    #[test]
+    fn receiver_recovery_v3_never_falls_back_to_a_global_refresh_without_source_context() {
+        let (inbound, _inbound_rx) = mpsc::channel(1);
+        let (control, mut control_rx) = mpsc::channel(1);
+        let metrics = QuicApplicationMetrics::default();
+        let recovery = Mutex::new(VideoReceiveRecovery::default());
+        let outcome = super::super::video_datagram::VideoReassemblyOutcome {
+            request_keyframe: true,
+            dropped_frames: 1,
+            frame: None,
+        };
+        assert!(handle_video_outcome(
+            outcome,
+            &super::super::video_datagram::VideoReassemblyStats::default(),
+            &inbound,
+            &control,
+            true,
+            &metrics,
+            &recovery,
+            Instant::now(),
+        ));
+        assert!(control_rx.try_recv().is_err());
     }
 
     #[test]
     fn sender_waits_for_a_keyframe_newer_than_every_suppressed_delta() {
         let (refresh, mut refresh_rx) = mpsc::channel(1);
         let metrics = Arc::new(QuicApplicationMetrics::default());
-        let recovery = VideoSendRecovery::new(refresh, metrics.clone());
-        recovery.enter(2, "test loss");
-        recovery.enter(3, "same recovery window");
-        assert_eq!(refresh_rx.try_recv(), Ok(()));
+        let recovery = VideoSendRecovery::new(refresh, true, metrics.clone());
+        recovery.enter(Some(source_video(7, 2, false)), 2, "test loss");
+        recovery.enter(Some(source_video(7, 3, false)), 3, "same recovery window");
+        match refresh_rx.try_recv() {
+            Ok(LocalVideoRefresh::Reference(refresh)) => {
+                assert_eq!(refresh.display, 0);
+                assert_eq!(refresh.stream_id, 7);
+                assert_eq!(refresh.received_frame_id, 2);
+            }
+            _ => panic!("expected scoped reference refresh"),
+        }
         assert!(refresh_rx.try_recv().is_err());
 
         assert!(recovery.suppress_delta(4));
@@ -2054,6 +2499,27 @@ mod tests {
                 .load(Ordering::Relaxed),
             2
         );
+    }
+
+    #[test]
+    fn sender_reference_recovery_keeps_legacy_fallback_for_old_quic_protocols() {
+        let (refresh, mut refresh_rx) = mpsc::channel(1);
+        let metrics = Arc::new(QuicApplicationMetrics::default());
+        let recovery = VideoSendRecovery::new(refresh, false, metrics);
+        recovery.enter(Some(source_video(7, 2, false)), 2, "test loss");
+        assert!(matches!(
+            refresh_rx.try_recv(),
+            Ok(LocalVideoRefresh::Legacy)
+        ));
+    }
+
+    #[test]
+    fn sender_reference_recovery_v3_never_falls_back_to_a_global_refresh_without_source_context() {
+        let (refresh, mut refresh_rx) = mpsc::channel(1);
+        let metrics = Arc::new(QuicApplicationMetrics::default());
+        let recovery = VideoSendRecovery::new(refresh, true, metrics);
+        recovery.enter(None, 2, "test loss");
+        assert!(refresh_rx.try_recv().is_err());
     }
 
     #[test]
@@ -2269,7 +2735,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(client_stream.stats().application_protocol, 2);
+        assert_eq!(client_stream.stats().application_protocol, 3);
         assert!(client_stream.stats().reliable_keyframes);
         assert!(client_stream.stats().reliable_keyframes_sent >= 1);
         assert!(server_stream.stats().reliable_keyframes_received >= 1);

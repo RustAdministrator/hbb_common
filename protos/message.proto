@@ -898,6 +898,13 @@ message VideoFeedback {
   uint64 dropped_frames = 9;
 }
 
+message VideoReferenceRefresh {
+  int32 display = 1;
+  uint64 stream_id = 2;
+  uint64 received_frame_id = 3;
+  uint64 dropped_frames = 4;
+}
+
 message Misc {
   oneof union {
     ChatMessage chat_message = 4;
@@ -939,6 +946,7 @@ message Misc {
     SessionPermissionRequest session_permission_request = 40;
     SessionPermissionResponse session_permission_response = 41;
     VideoFeedback video_feedback = 42;
+    VideoReferenceRefresh video_reference_refresh = 43;
   }
 }
 
