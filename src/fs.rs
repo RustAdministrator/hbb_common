@@ -553,7 +553,8 @@ fn validate_no_symlink_components(base: &PathBuf, name: &str) -> ResultType<()> 
     Ok(())
 }
 
-fn join_validated_path(base: &PathBuf, name: &str) -> ResultType<PathBuf> {
+/// Validate an untrusted relative file name and existing path components before joining it.
+pub fn join_validated_path(base: &PathBuf, name: &str) -> ResultType<PathBuf> {
     validate_file_name_no_traversal(name)?;
     validate_no_symlink_components(base, name)?;
     Ok(TransferJob::join(base, name))
