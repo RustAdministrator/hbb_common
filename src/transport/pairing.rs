@@ -96,6 +96,7 @@ impl TrustedPeerRecord {
 pub trait TrustedPeerStore {
     fn load(&self, peer_id: &str) -> Result<Option<TrustedPeerRecord>, PairingError>;
     fn insert(&mut self, record: TrustedPeerRecord) -> Result<(), PairingError>;
+    fn remove(&mut self, peer_id: &str) -> Result<bool, PairingError>;
 }
 
 #[derive(Default)]
@@ -116,6 +117,11 @@ impl TrustedPeerStore for MemoryTrustedPeerStore {
         }
         self.records.insert(record.peer_id.clone(), record);
         Ok(())
+    }
+
+    fn remove(&mut self, peer_id: &str) -> Result<bool, PairingError> {
+        validate_peer_id(peer_id)?;
+        Ok(self.records.remove(peer_id).is_some())
     }
 }
 
@@ -153,6 +159,30 @@ impl FileTrustedPeerStore {
         }
         records.sort_by(|left, right| left.peer_id.cmp(&right.peer_id));
         Ok(records)
+    }
+
+    pub fn remove_peer_and_aliases(&mut self, peer_id: &str) -> Result<Vec<String>, PairingError> {
+        let Some(target) = self.load(peer_id)? else {
+            return Ok(Vec::new());
+        };
+        let mut matching_ids: Vec<String> = self
+            .load_all()?
+            .into_iter()
+            .filter(|record| {
+                record.identity_key == target.identity_key
+                    && record.certificate_pin == target.certificate_pin
+            })
+            .map(|record| record.peer_id)
+            .collect();
+        matching_ids.retain(|matching_id| matching_id != peer_id);
+        matching_ids.push(peer_id.to_owned());
+        let mut removed_ids = Vec::with_capacity(matching_ids.len());
+        for matching_id in matching_ids {
+            if self.remove(&matching_id)? {
+                removed_ids.push(matching_id);
+            }
+        }
+        Ok(removed_ids)
     }
 }
 
@@ -197,6 +227,15 @@ impl TrustedPeerStore for FileTrustedPeerStore {
             return Err(PairingError::Io(error));
         }
         Ok(())
+    }
+
+    fn remove(&mut self, peer_id: &str) -> Result<bool, PairingError> {
+        let path = self.record_path(peer_id)?;
+        match fs::remove_file(path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(PairingError::Io(error)),
+        }
     }
 }
 
@@ -376,6 +415,9 @@ mod tests {
             store.insert(record),
             Err(PairingError::AlreadyPaired)
         ));
+        assert!(store.remove("peer-1").unwrap());
+        assert!(!store.remove("peer-1").unwrap());
+        assert_eq!(store.load("peer-1").unwrap(), None);
     }
 
     #[test]
@@ -412,6 +454,43 @@ mod tests {
         let records = store.load_all().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].peer_id, "peer-1");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn file_store_removes_peer_and_matching_aliases_only() {
+        let directory = std::env::temp_dir().join(format!(
+            "rustadmin-quic-trust-remove-{}-{}",
+            std::process::id(),
+            crate::rand::random::<u64>()
+        ));
+        let mut store = FileTrustedPeerStore::new(&directory).unwrap();
+        for peer_id in ["peer-1", "192.0.2.10"] {
+            let candidate =
+                PairingCandidate::new(peer_id.to_owned(), [7; 32], vec![1, 2, 3, 4]).unwrap();
+            store
+                .insert(
+                    candidate
+                        .clone()
+                        .confirm(&candidate.fingerprint(), 1)
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        let other = PairingCandidate::new("peer-2".to_owned(), [8; 32], vec![5, 6, 7, 8]).unwrap();
+        store
+            .insert(other.clone().confirm(&other.fingerprint(), 1).unwrap())
+            .unwrap();
+
+        let removed = store.remove_peer_and_aliases("peer-1").unwrap();
+        assert_eq!(removed, ["192.0.2.10", "peer-1"]);
+        assert_eq!(store.load("peer-1").unwrap(), None);
+        assert_eq!(store.load("192.0.2.10").unwrap(), None);
+        assert!(store.load("peer-2").unwrap().is_some());
+        assert!(store
+            .remove_peer_and_aliases("missing-peer")
+            .unwrap()
+            .is_empty());
         fs::remove_dir_all(directory).unwrap();
     }
 }
