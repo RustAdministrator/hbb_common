@@ -32,4 +32,4 @@ jobs:
           fi
 
       - name: Run codec hardening gate
-        run: ./rustdesk-tests/scripts/run_codec_hardening_ci.sh
+        run: bash ./rustdesk-tests/scripts/run_codec_hardening_ci.sh
