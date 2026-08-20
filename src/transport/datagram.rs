@@ -27,7 +27,6 @@ use std::{
 
 pub const DEFAULT_INTERACTIVE_DATAGRAM_RESERVE_BYTES: usize = 64 * 1024;
 pub const MIN_VIDEO_DATAGRAM_QUEUE_BYTES: usize = 192 * 1024;
-pub const MAX_VIDEO_DATAGRAM_QUEUE_BYTES: usize = 512 * 1024;
 const VIDEO_DATAGRAM_QUEUE_TARGET_LATENCY: Duration = Duration::from_millis(120);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -43,6 +42,7 @@ pub struct DatagramSendStats {
     pub send_buffer_space_min: u64,
     pub send_buffer_queued: u64,
     pub video_queue_budget: u64,
+    pub video_queue_delay_us: u64,
     pub audio_packets_dropped: u64,
     pub mouse_updates_dropped: u64,
 }
@@ -61,6 +61,7 @@ struct DatagramSendCounters {
     send_buffer_capacity: AtomicU64,
     send_buffer_queued: AtomicU64,
     video_queue_budget: AtomicU64,
+    video_queue_delay_us: AtomicU64,
     audio_packets_dropped: AtomicU64,
     mouse_updates_dropped: AtomicU64,
 }
@@ -107,12 +108,13 @@ impl QuicDatagramSendCoordinator {
             },
             send_buffer_queued: self.counters.send_buffer_queued.load(Ordering::Relaxed),
             video_queue_budget: self.counters.video_queue_budget.load(Ordering::Relaxed),
+            video_queue_delay_us: self.counters.video_queue_delay_us.load(Ordering::Relaxed),
             audio_packets_dropped: self.counters.audio_packets_dropped.load(Ordering::Relaxed),
             mouse_updates_dropped: self.counters.mouse_updates_dropped.load(Ordering::Relaxed),
         }
     }
 
-    fn record_space(&self, available: usize) -> usize {
+    fn record_space(&self, available: usize) -> (usize, usize) {
         let available = u64::try_from(available).unwrap_or(u64::MAX);
         self.counters
             .send_buffer_space
@@ -129,7 +131,27 @@ impl QuicDatagramSendCoordinator {
         self.counters
             .send_buffer_queued
             .store(queued, Ordering::Relaxed);
-        usize::try_from(queued).unwrap_or(usize::MAX)
+        (
+            usize::try_from(queued).unwrap_or(usize::MAX),
+            usize::try_from(capacity).unwrap_or(usize::MAX),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VideoDatagramAdmissionFailure {
+    InteractiveReserve,
+    VideoQueueBudget,
+    InteractiveReserveAndVideoQueueBudget,
+}
+
+impl VideoDatagramAdmissionFailure {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InteractiveReserve => "interactive-reserve",
+            Self::VideoQueueBudget => "video-queue-budget",
+            Self::InteractiveReserveAndVideoQueueBudget => "interactive-reserve+video-queue-budget",
+        }
     }
 }
 
@@ -139,8 +161,13 @@ pub enum VideoDatagramSendOutcome {
         fragment_count: usize,
     },
     RejectedNoSpace {
+        failure: VideoDatagramAdmissionFailure,
         datagram_bytes: usize,
         available_bytes: usize,
+        queued_bytes: usize,
+        video_queue_budget: usize,
+        interactive_reserve_bytes: usize,
+        queue_delay_us: u64,
     },
 }
 
@@ -222,14 +249,24 @@ impl QuicDatagramSender {
 
         let _gate = self.coordinator.gate.lock().unwrap();
         let available_bytes = self.connection.datagram_send_buffer_space();
-        let queued_bytes = self.coordinator.record_space(available_bytes);
+        let (queued_bytes, send_buffer_capacity) = self.coordinator.record_space(available_bytes);
         let path = self.connection.stats().path;
-        let video_queue_budget = video_datagram_queue_budget(path.cwnd, path.rtt);
+        let video_queue_budget = video_datagram_queue_budget(
+            path.cwnd,
+            path.rtt,
+            send_buffer_capacity,
+            self.coordinator.interactive_reserve_bytes,
+        );
+        let queue_delay_us = video_datagram_queue_delay_us(queued_bytes, path.cwnd, path.rtt);
         self.coordinator.counters.video_queue_budget.store(
             u64::try_from(video_queue_budget).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
-        if !video_frame_fits_send_budget(
+        self.coordinator
+            .counters
+            .video_queue_delay_us
+            .store(queue_delay_us, Ordering::Relaxed);
+        if let Some(failure) = video_frame_admission_failure(
             datagram_bytes,
             available_bytes,
             self.coordinator.interactive_reserve_bytes,
@@ -241,8 +278,13 @@ impl QuicDatagramSender {
                 .video_frames_rejected
                 .fetch_add(1, Ordering::Relaxed);
             return Ok(VideoDatagramSendOutcome::RejectedNoSpace {
+                failure,
                 datagram_bytes,
                 available_bytes,
+                queued_bytes,
+                video_queue_budget,
+                interactive_reserve_bytes: self.coordinator.interactive_reserve_bytes,
+                queue_delay_us,
             });
         }
 
@@ -535,6 +577,7 @@ fn elapsed_us(started: Instant) -> u64 {
     started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
 }
 
+#[cfg(test)]
 fn video_frame_fits_send_budget(
     datagram_bytes: usize,
     available_bytes: usize,
@@ -542,6 +585,23 @@ fn video_frame_fits_send_budget(
     queued_bytes: usize,
     video_queue_budget: usize,
 ) -> bool {
+    video_frame_admission_failure(
+        datagram_bytes,
+        available_bytes,
+        interactive_reserve_bytes,
+        queued_bytes,
+        video_queue_budget,
+    )
+    .is_none()
+}
+
+fn video_frame_admission_failure(
+    datagram_bytes: usize,
+    available_bytes: usize,
+    interactive_reserve_bytes: usize,
+    queued_bytes: usize,
+    video_queue_budget: usize,
+) -> Option<VideoDatagramAdmissionFailure> {
     let preserves_interactive_reserve = datagram_bytes
         .checked_add(interactive_reserve_bytes)
         .map(|required| required <= available_bytes)
@@ -550,26 +610,54 @@ fn video_frame_fits_send_budget(
         .checked_add(datagram_bytes)
         .map(|queued| queued <= video_queue_budget)
         .unwrap_or(false);
-    preserves_interactive_reserve && stays_within_video_queue
+    match (preserves_interactive_reserve, stays_within_video_queue) {
+        (true, true) => None,
+        (false, true) => Some(VideoDatagramAdmissionFailure::InteractiveReserve),
+        (true, false) => Some(VideoDatagramAdmissionFailure::VideoQueueBudget),
+        (false, false) => {
+            Some(VideoDatagramAdmissionFailure::InteractiveReserveAndVideoQueueBudget)
+        }
+    }
 }
 
-fn video_datagram_queue_budget(congestion_window_bytes: u64, rtt: Duration) -> usize {
+fn video_datagram_queue_delay_us(
+    queued_bytes: usize,
+    congestion_window_bytes: u64,
+    rtt: Duration,
+) -> u64 {
+    if queued_bytes == 0 || congestion_window_bytes == 0 {
+        return 0;
+    }
+    let delay_us = (queued_bytes as u128)
+        .saturating_mul(rtt.as_micros())
+        .checked_div(u128::from(congestion_window_bytes))
+        .unwrap_or(u128::from(u64::MAX));
+    delay_us.min(u128::from(u64::MAX)) as u64
+}
+
+fn video_datagram_queue_budget(
+    congestion_window_bytes: u64,
+    rtt: Duration,
+    send_buffer_capacity: usize,
+    interactive_reserve_bytes: usize,
+) -> usize {
     let rtt_us = rtt.as_micros().max(5_000);
     let target_us = VIDEO_DATAGRAM_QUEUE_TARGET_LATENCY.as_micros();
     let latency_budget = u128::from(congestion_window_bytes)
         .saturating_mul(target_us)
         .checked_div(rtt_us)
         .unwrap_or(0);
-    usize::try_from(latency_budget).unwrap_or(usize::MAX).clamp(
-        MIN_VIDEO_DATAGRAM_QUEUE_BYTES,
-        MAX_VIDEO_DATAGRAM_QUEUE_BYTES,
-    )
+    let preferred_budget = usize::try_from(latency_budget)
+        .unwrap_or(usize::MAX)
+        .max(MIN_VIDEO_DATAGRAM_QUEUE_BYTES);
+    preferred_budget.min(send_buffer_capacity.saturating_sub(interactive_reserve_bytes))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        video_datagram_queue_budget, video_frame_fits_send_budget, MAX_VIDEO_DATAGRAM_QUEUE_BYTES,
+        video_datagram_queue_budget, video_datagram_queue_delay_us, video_frame_admission_failure,
+        video_frame_fits_send_budget, VideoDatagramAdmissionFailure,
         MIN_VIDEO_DATAGRAM_QUEUE_BYTES,
     };
     use std::time::Duration;
@@ -608,16 +696,84 @@ mod tests {
     #[test]
     fn video_queue_budget_scales_with_path_and_is_bounded() {
         assert_eq!(
-            video_datagram_queue_budget(16 * 1024, Duration::from_millis(200)),
+            video_datagram_queue_budget(
+                16 * 1024,
+                Duration::from_millis(200),
+                2 * 1024 * 1024,
+                64 * 1024,
+            ),
             MIN_VIDEO_DATAGRAM_QUEUE_BYTES,
         );
         assert_eq!(
-            video_datagram_queue_budget(4 * 1024 * 1024, Duration::from_millis(5)),
-            MAX_VIDEO_DATAGRAM_QUEUE_BYTES,
+            video_datagram_queue_budget(
+                4 * 1024 * 1024,
+                Duration::from_millis(5),
+                2 * 1024 * 1024,
+                64 * 1024,
+            ),
+            (2 * 1024 * 1024) - (64 * 1024),
         );
         assert_eq!(
-            video_datagram_queue_budget(128 * 1024, Duration::from_millis(80)),
+            video_datagram_queue_budget(
+                128 * 1024,
+                Duration::from_millis(80),
+                2 * 1024 * 1024,
+                64 * 1024,
+            ),
             192 * 1024,
+        );
+    }
+
+    #[test]
+    fn video_queue_budget_handles_a_buffer_smaller_than_the_preferred_floor() {
+        assert_eq!(
+            video_datagram_queue_budget(
+                16 * 1024,
+                Duration::from_millis(200),
+                96 * 1024,
+                64 * 1024,
+            ),
+            32 * 1024,
+        );
+    }
+
+    #[test]
+    fn high_bandwidth_path_admits_frame_beyond_the_old_static_ceiling() {
+        let capacity = 2 * 1024 * 1024;
+        let reserve = 64 * 1024;
+        let queued = 503_566;
+        let frame = 24_348;
+        let available = capacity - queued;
+        let budget =
+            video_datagram_queue_budget(512 * 1024, Duration::from_millis(18), capacity, reserve);
+
+        assert!(budget > 512 * 1024);
+        assert!(video_frame_fits_send_budget(
+            frame, available, reserve, queued, budget,
+        ));
+    }
+
+    #[test]
+    fn video_admission_reports_the_limiting_budget() {
+        assert_eq!(
+            video_frame_admission_failure(128_001, 192_000, 64_000, 0, 192_000),
+            Some(VideoDatagramAdmissionFailure::InteractiveReserve)
+        );
+        assert_eq!(
+            video_frame_admission_failure(64_001, 512_000, 64_000, 128_000, 192_000),
+            Some(VideoDatagramAdmissionFailure::VideoQueueBudget)
+        );
+    }
+
+    #[test]
+    fn video_queue_delay_uses_quic_path_rate_without_wall_clock_time() {
+        assert_eq!(
+            video_datagram_queue_delay_us(128 * 1024, 256 * 1024, Duration::from_millis(20)),
+            10_000
+        );
+        assert_eq!(
+            video_datagram_queue_delay_us(128 * 1024, 0, Duration::from_millis(20)),
+            0
         );
     }
 }

@@ -985,6 +985,7 @@ impl QuicApplicationStream {
         stats.datagram_send_buffer_space_min = datagram_send.send_buffer_space_min;
         stats.datagram_send_buffer_queued = datagram_send.send_buffer_queued;
         stats.video_datagram_queue_budget = datagram_send.video_queue_budget;
+        stats.video_datagram_queue_delay_us = datagram_send.video_queue_delay_us;
         stats.audio_datagram_drops = datagram_send.audio_packets_dropped;
         stats.mouse_datagram_drops = datagram_send.mouse_updates_dropped;
         stats
@@ -1478,15 +1479,25 @@ async fn run_video_writer(
         match sender.send_video_frame(item.metadata, &item.payload) {
             Ok(VideoDatagramSendOutcome::Sent { .. }) => {}
             Ok(VideoDatagramSendOutcome::RejectedNoSpace {
+                failure,
                 datagram_bytes,
                 available_bytes,
+                queued_bytes,
+                video_queue_budget,
+                interactive_reserve_bytes,
+                queue_delay_us,
             }) => {
                 log::warn!(
-                    "QUIC video frame rejected before DATAGRAM enqueue: frame_id={}, bytes={}, datagram_bytes={}, available_bytes={}",
+                    "QUIC video frame rejected before DATAGRAM enqueue: frame_id={}, bytes={}, reason={}, datagram_bytes={}, available_bytes={}, queued_bytes={}, queue_budget_bytes={}, interactive_reserve_bytes={}, queue_delay_us={}",
                     item.metadata.frame_id,
                     item.payload.len(),
+                    failure.as_str(),
                     datagram_bytes,
                     available_bytes,
+                    queued_bytes,
+                    video_queue_budget,
+                    interactive_reserve_bytes,
+                    queue_delay_us,
                 );
                 recovery.enter(
                     item.source_info,
