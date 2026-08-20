@@ -30,6 +30,7 @@ use std::{
 pub const ALPN_V1: &[u8] = b"rustadmin-quic-v1";
 pub const ALPN_V2: &[u8] = b"rustadmin-quic-v2";
 pub const ALPN_V3: &[u8] = b"rustadmin-quic-v3";
+pub const ALPN_V4: &[u8] = b"rustadmin-quic-v4";
 pub const ALPN: &[u8] = ALPN_V1;
 pub const DEFAULT_QUIC_PORT: u16 = 48100;
 pub const DEFAULT_INITIAL_MTU: u16 = 1200;
@@ -56,15 +57,20 @@ pub enum QuicApplicationProtocol {
     V1 = 1,
     V2 = 2,
     V3 = 3,
+    V4 = 4,
 }
 
 impl QuicApplicationProtocol {
     pub fn supports_reliable_keyframes(self) -> bool {
-        matches!(self, Self::V2 | Self::V3)
+        matches!(self, Self::V2 | Self::V3 | Self::V4)
     }
 
     pub fn supports_scoped_video_reference_refresh(self) -> bool {
-        matches!(self, Self::V3)
+        matches!(self, Self::V3 | Self::V4)
+    }
+
+    pub fn supports_reliable_keyframe_barrier(self) -> bool {
+        matches!(self, Self::V4)
     }
 }
 
@@ -291,6 +297,7 @@ pub struct QuicConnectionStats {
     pub application_protocol: u16,
     pub negotiated_datagram_size: Option<usize>,
     pub reliable_keyframes: bool,
+    pub reliable_keyframe_barrier: bool,
     pub video_reassembly_drops: u64,
     pub video_reassembly_expired: u64,
     pub video_reassembly_evicted: u64,
@@ -310,6 +317,10 @@ pub struct QuicConnectionStats {
     pub video_recovery_suppressed_frames: u64,
     pub video_sender_replacements: u64,
     pub video_sender_reference_resets: u64,
+    pub video_keyframe_barrier_held: u64,
+    pub video_keyframe_barrier_released: u64,
+    pub video_keyframe_barrier_timeouts: u64,
+    pub video_keyframe_barrier_overflows: u64,
     pub video_datagram_frames_sent: u64,
     pub video_datagram_frames_rejected: u64,
     pub video_datagrams_sent: u64,
@@ -341,6 +352,7 @@ impl QuicConnectionStats {
             application_protocol: 0,
             negotiated_datagram_size: None,
             reliable_keyframes: false,
+            reliable_keyframe_barrier: false,
             video_reassembly_drops: 0,
             video_reassembly_expired: 0,
             video_reassembly_evicted: 0,
@@ -360,6 +372,10 @@ impl QuicConnectionStats {
             video_recovery_suppressed_frames: 0,
             video_sender_replacements: 0,
             video_sender_reference_resets: 0,
+            video_keyframe_barrier_held: 0,
+            video_keyframe_barrier_released: 0,
+            video_keyframe_barrier_timeouts: 0,
+            video_keyframe_barrier_overflows: 0,
             video_datagram_frames_sent: 0,
             video_datagram_frames_rejected: 0,
             video_datagrams_sent: 0,
@@ -925,7 +941,12 @@ fn ensure_udp_enabled() -> Result<(), QuicTransportError> {
 
 fn supported_alpn_protocols(options: &QuicTransportOptions) -> Vec<Vec<u8>> {
     if options.enable_application_protocol_v2 {
-        vec![ALPN_V3.to_vec(), ALPN_V2.to_vec(), ALPN_V1.to_vec()]
+        vec![
+            ALPN_V4.to_vec(),
+            ALPN_V3.to_vec(),
+            ALPN_V2.to_vec(),
+            ALPN_V1.to_vec(),
+        ]
     } else {
         vec![ALPN_V1.to_vec()]
     }
@@ -944,6 +965,7 @@ pub fn negotiated_application_protocol(
             QuicTransportError::Handshake("unexpected TLS handshake metadata".to_owned())
         })?;
     match handshake.protocol.as_deref() {
+        Some(ALPN_V4) => Ok(QuicApplicationProtocol::V4),
         Some(ALPN_V3) => Ok(QuicApplicationProtocol::V3),
         Some(ALPN_V2) => Ok(QuicApplicationProtocol::V2),
         Some(ALPN_V1) => Ok(QuicApplicationProtocol::V1),
@@ -1652,13 +1674,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn alpn_v3_is_preferred_and_older_peers_remain_compatible() {
-        let Some(v3) = negotiate_test_alpn(true, true).await else {
+    async fn alpn_v4_is_preferred_and_older_peers_remain_compatible() {
+        let Some(v4) = negotiate_test_alpn(true, true).await else {
             return;
         };
         assert_eq!(
-            v3,
-            (QuicApplicationProtocol::V3, QuicApplicationProtocol::V3)
+            v4,
+            (QuicApplicationProtocol::V4, QuicApplicationProtocol::V4)
         );
         assert_eq!(
             negotiate_test_alpn(false, true).await,
