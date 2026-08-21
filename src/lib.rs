@@ -678,17 +678,29 @@ mod test {
     }
 
     #[test]
-    fn omitted_and_unknown_movie_profile_values_use_standard_defaults() {
+    fn omitted_and_unknown_movie_profile_values_remain_detectable() {
         let decoded = OptionMessage::parse_from_bytes(&[]).unwrap();
         assert_eq!(
             decoded.video_profile.enum_value_or_default(),
-            option_message::VideoProfile::VideoProfileDefault
+            option_message::VideoProfile::VideoProfileNotSet
         );
 
         let decoded = OptionMessage::parse_from_bytes(&[0xa8, 0x01, 99]).unwrap();
+        assert!(decoded.video_profile.enum_value().is_err());
         assert_eq!(
             decoded.video_profile.enum_value_or_default(),
-            option_message::VideoProfile::VideoProfileDefault
+            option_message::VideoProfile::VideoProfileNotSet
+        );
+
+        let standard = OptionMessage {
+            video_profile: option_message::VideoProfile::VideoProfileStandard.into(),
+            ..Default::default()
+        };
+        let standard =
+            OptionMessage::parse_from_bytes(&standard.write_to_bytes().unwrap()).unwrap();
+        assert_eq!(
+            standard.video_profile.enum_value_or_default(),
+            option_message::VideoProfile::VideoProfileStandard
         );
 
         let encoding = SupportedEncoding::parse_from_bytes(&[]).unwrap();

@@ -718,8 +718,9 @@ message OptionMessage {
     CaptureBackendGdi = 5;
   }
   enum VideoProfile {
-    VideoProfileDefault = 0;
-    VideoProfileMovie = 1;
+    VideoProfileNotSet = 0;
+    VideoProfileStandard = 1;
+    VideoProfileMovie = 2;
   }
   ImageQuality image_quality = 1;
   BoolOption lock_after_session_end = 2;
