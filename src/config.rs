@@ -2532,6 +2532,7 @@ impl PeerConfig {
             keys::OPTION_CODEC_PREFERENCE,
             keys::OPTION_CUSTOM_FPS,
             keys::OPTION_CUSTOM_FPS_MODE,
+            keys::OPTION_VIDEO_PROFILE,
             keys::OPTION_ZOOM_CURSOR,
             keys::OPTION_I444,
             keys::OPTION_SWAP_LEFT_RIGHT_MOUSE,
@@ -2926,6 +2927,7 @@ impl UserDefaultConfig {
             keys::OPTION_CUSTOM_IMAGE_QUALITY => self.get_num_string(key, 50.0, 10.0, 0xFFF as f64),
             keys::OPTION_CUSTOM_FPS => self.get_num_string(key, 30.0, 5.0, 120.0),
             keys::OPTION_CUSTOM_FPS_MODE => self.get_string(key, "adaptive", vec!["fixed"]),
+            keys::OPTION_VIDEO_PROFILE => self.get_string(key, "standard", vec!["movie"]),
             keys::OPTION_ENABLE_FILE_COPY_PASTE => self.get_string(key, "Y", vec!["", "N"]),
             keys::OPTION_EDGE_SCROLL_EDGE_THICKNESS => self.get_num_string(key, 100, 20, 300),
             keys::OPTION_TRACKPAD_SPEED => self.get_num_string(key, 100, 10, 1000),
@@ -3460,6 +3462,7 @@ pub mod keys {
     pub const OPTION_CUSTOM_IMAGE_QUALITY: &str = "custom_image_quality";
     pub const OPTION_CUSTOM_FPS: &str = "custom-fps";
     pub const OPTION_CUSTOM_FPS_MODE: &str = "custom-fps-mode";
+    pub const OPTION_VIDEO_PROFILE: &str = "video-profile";
     pub const OPTION_CODEC_PREFERENCE: &str = "codec-preference";
     pub const OPTION_CAPTURE_BACKEND: &str = "capture-backend";
     pub const OPTION_SYNC_INIT_CLIPBOARD: &str = "sync-init-clipboard";
@@ -3676,6 +3679,7 @@ pub mod keys {
         OPTION_CUSTOM_IMAGE_QUALITY,
         OPTION_CUSTOM_FPS,
         OPTION_CUSTOM_FPS_MODE,
+        OPTION_VIDEO_PROFILE,
         OPTION_CODEC_PREFERENCE,
         OPTION_SYNC_INIT_CLIPBOARD,
         OPTION_TRACKPAD_SPEED,
@@ -3917,6 +3921,22 @@ mod tests {
 
             assert_eq!(cfg.get(keys::OPTION_CODEC_PREFERENCE), codec);
         }
+    }
+
+    #[test]
+    fn test_video_profile_defaults_and_normalizes() {
+        let mut cfg = UserDefaultConfig::default();
+        assert_eq!(cfg.get(keys::OPTION_VIDEO_PROFILE), "standard");
+
+        cfg.options
+            .insert(keys::OPTION_VIDEO_PROFILE.to_owned(), "movie".to_owned());
+        assert_eq!(cfg.get(keys::OPTION_VIDEO_PROFILE), "movie");
+
+        cfg.options.insert(
+            keys::OPTION_VIDEO_PROFILE.to_owned(),
+            "unsupported".to_owned(),
+        );
+        assert_eq!(cfg.get(keys::OPTION_VIDEO_PROFILE), "standard");
     }
 
     #[test]
