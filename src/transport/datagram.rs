@@ -27,7 +27,9 @@ use std::{
 
 pub const DEFAULT_INTERACTIVE_DATAGRAM_RESERVE_BYTES: usize = 64 * 1024;
 pub const MIN_VIDEO_DATAGRAM_QUEUE_BYTES: usize = 192 * 1024;
-const VIDEO_DATAGRAM_QUEUE_TARGET_LATENCY: Duration = Duration::from_millis(120);
+pub const DEFAULT_VIDEO_DATAGRAM_QUEUE_TARGET: Duration = Duration::from_millis(120);
+pub const MOVIE_VIDEO_DATAGRAM_QUEUE_TARGET: Duration = Duration::from_millis(40);
+pub const MOVIE_MIN_VIDEO_DATAGRAM_QUEUE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DatagramSendStats {
@@ -43,6 +45,7 @@ pub struct DatagramSendStats {
     pub send_buffer_queued: u64,
     pub video_queue_budget: u64,
     pub video_queue_delay_us: u64,
+    pub video_queue_target_us: u64,
     pub audio_packets_dropped: u64,
     pub mouse_updates_dropped: u64,
 }
@@ -69,6 +72,8 @@ struct DatagramSendCounters {
 pub struct QuicDatagramSendCoordinator {
     gate: Mutex<()>,
     interactive_reserve_bytes: usize,
+    video_queue_target_us: AtomicU64,
+    min_video_queue_bytes: AtomicU64,
     counters: DatagramSendCounters,
 }
 
@@ -77,6 +82,12 @@ impl QuicDatagramSendCoordinator {
         Arc::new(Self {
             gate: Mutex::new(()),
             interactive_reserve_bytes,
+            video_queue_target_us: AtomicU64::new(
+                DEFAULT_VIDEO_DATAGRAM_QUEUE_TARGET
+                    .as_micros()
+                    .min(u128::from(u64::MAX)) as u64,
+            ),
+            min_video_queue_bytes: AtomicU64::new(MIN_VIDEO_DATAGRAM_QUEUE_BYTES as u64),
             counters: DatagramSendCounters {
                 send_buffer_space_min: AtomicU64::new(u64::MAX),
                 send_buffer_capacity: AtomicU64::new(
@@ -109,9 +120,20 @@ impl QuicDatagramSendCoordinator {
             send_buffer_queued: self.counters.send_buffer_queued.load(Ordering::Relaxed),
             video_queue_budget: self.counters.video_queue_budget.load(Ordering::Relaxed),
             video_queue_delay_us: self.counters.video_queue_delay_us.load(Ordering::Relaxed),
+            video_queue_target_us: self.video_queue_target_us.load(Ordering::Relaxed),
             audio_packets_dropped: self.counters.audio_packets_dropped.load(Ordering::Relaxed),
             mouse_updates_dropped: self.counters.mouse_updates_dropped.load(Ordering::Relaxed),
         }
+    }
+
+    pub fn set_video_queue_policy(&self, target: Duration, minimum_bytes: usize) {
+        let target_us = target.as_micros().clamp(1, u128::from(u64::MAX)) as u64;
+        self.video_queue_target_us
+            .store(target_us, Ordering::Relaxed);
+        self.min_video_queue_bytes.store(
+            u64::try_from(minimum_bytes).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 
     fn record_space(&self, available: usize) -> (usize, usize) {
@@ -256,6 +278,17 @@ impl QuicDatagramSender {
             path.rtt,
             send_buffer_capacity,
             self.coordinator.interactive_reserve_bytes,
+            Duration::from_micros(
+                self.coordinator
+                    .video_queue_target_us
+                    .load(Ordering::Relaxed),
+            ),
+            usize::try_from(
+                self.coordinator
+                    .min_video_queue_bytes
+                    .load(Ordering::Relaxed),
+            )
+            .unwrap_or(usize::MAX),
         );
         let queue_delay_us = video_datagram_queue_delay_us(queued_bytes, path.cwnd, path.rtt);
         self.coordinator.counters.video_queue_budget.store(
@@ -640,16 +673,18 @@ fn video_datagram_queue_budget(
     rtt: Duration,
     send_buffer_capacity: usize,
     interactive_reserve_bytes: usize,
+    target_latency: Duration,
+    minimum_video_queue_bytes: usize,
 ) -> usize {
     let rtt_us = rtt.as_micros().max(5_000);
-    let target_us = VIDEO_DATAGRAM_QUEUE_TARGET_LATENCY.as_micros();
+    let target_us = target_latency.as_micros().max(1);
     let latency_budget = u128::from(congestion_window_bytes)
         .saturating_mul(target_us)
         .checked_div(rtt_us)
         .unwrap_or(0);
     let preferred_budget = usize::try_from(latency_budget)
         .unwrap_or(usize::MAX)
-        .max(MIN_VIDEO_DATAGRAM_QUEUE_BYTES);
+        .max(minimum_video_queue_bytes);
     preferred_budget.min(send_buffer_capacity.saturating_sub(interactive_reserve_bytes))
 }
 
@@ -657,8 +692,9 @@ fn video_datagram_queue_budget(
 mod tests {
     use super::{
         video_datagram_queue_budget, video_datagram_queue_delay_us, video_frame_admission_failure,
-        video_frame_fits_send_budget, VideoDatagramAdmissionFailure,
-        MIN_VIDEO_DATAGRAM_QUEUE_BYTES,
+        video_frame_fits_send_budget, QuicDatagramSendCoordinator, VideoDatagramAdmissionFailure,
+        DEFAULT_VIDEO_DATAGRAM_QUEUE_TARGET, MIN_VIDEO_DATAGRAM_QUEUE_BYTES,
+        MOVIE_MIN_VIDEO_DATAGRAM_QUEUE_BYTES, MOVIE_VIDEO_DATAGRAM_QUEUE_TARGET,
     };
     use std::time::Duration;
 
@@ -701,6 +737,8 @@ mod tests {
                 Duration::from_millis(200),
                 2 * 1024 * 1024,
                 64 * 1024,
+                DEFAULT_VIDEO_DATAGRAM_QUEUE_TARGET,
+                MIN_VIDEO_DATAGRAM_QUEUE_BYTES,
             ),
             MIN_VIDEO_DATAGRAM_QUEUE_BYTES,
         );
@@ -710,6 +748,8 @@ mod tests {
                 Duration::from_millis(5),
                 2 * 1024 * 1024,
                 64 * 1024,
+                DEFAULT_VIDEO_DATAGRAM_QUEUE_TARGET,
+                MIN_VIDEO_DATAGRAM_QUEUE_BYTES,
             ),
             (2 * 1024 * 1024) - (64 * 1024),
         );
@@ -719,6 +759,8 @@ mod tests {
                 Duration::from_millis(80),
                 2 * 1024 * 1024,
                 64 * 1024,
+                DEFAULT_VIDEO_DATAGRAM_QUEUE_TARGET,
+                MIN_VIDEO_DATAGRAM_QUEUE_BYTES,
             ),
             192 * 1024,
         );
@@ -732,6 +774,8 @@ mod tests {
                 Duration::from_millis(200),
                 96 * 1024,
                 64 * 1024,
+                DEFAULT_VIDEO_DATAGRAM_QUEUE_TARGET,
+                MIN_VIDEO_DATAGRAM_QUEUE_BYTES,
             ),
             32 * 1024,
         );
@@ -744,8 +788,14 @@ mod tests {
         let queued = 503_566;
         let frame = 24_348;
         let available = capacity - queued;
-        let budget =
-            video_datagram_queue_budget(512 * 1024, Duration::from_millis(18), capacity, reserve);
+        let budget = video_datagram_queue_budget(
+            512 * 1024,
+            Duration::from_millis(18),
+            capacity,
+            reserve,
+            DEFAULT_VIDEO_DATAGRAM_QUEUE_TARGET,
+            MIN_VIDEO_DATAGRAM_QUEUE_BYTES,
+        );
 
         assert!(budget > 512 * 1024);
         assert!(video_frame_fits_send_budget(
@@ -774,6 +824,47 @@ mod tests {
         assert_eq!(
             video_datagram_queue_delay_us(128 * 1024, 0, Duration::from_millis(20)),
             0
+        );
+    }
+
+    #[test]
+    fn movie_queue_policy_uses_a_lower_latency_budget_and_floor() {
+        let standard = video_datagram_queue_budget(
+            512 * 1024,
+            Duration::from_millis(40),
+            2 * 1024 * 1024,
+            64 * 1024,
+            DEFAULT_VIDEO_DATAGRAM_QUEUE_TARGET,
+            MIN_VIDEO_DATAGRAM_QUEUE_BYTES,
+        );
+        let movie = video_datagram_queue_budget(
+            512 * 1024,
+            Duration::from_millis(40),
+            2 * 1024 * 1024,
+            64 * 1024,
+            MOVIE_VIDEO_DATAGRAM_QUEUE_TARGET,
+            MOVIE_MIN_VIDEO_DATAGRAM_QUEUE_BYTES,
+        );
+
+        assert!(movie < standard);
+        assert_eq!(movie, 512 * 1024);
+    }
+
+    #[test]
+    fn coordinator_switches_queue_target_without_recreation() {
+        let coordinator = QuicDatagramSendCoordinator::new(64 * 1024, 2 * 1024 * 1024);
+        assert_eq!(
+            coordinator.stats().video_queue_target_us,
+            DEFAULT_VIDEO_DATAGRAM_QUEUE_TARGET.as_micros() as u64
+        );
+
+        coordinator.set_video_queue_policy(
+            MOVIE_VIDEO_DATAGRAM_QUEUE_TARGET,
+            MOVIE_MIN_VIDEO_DATAGRAM_QUEUE_BYTES,
+        );
+        assert_eq!(
+            coordinator.stats().video_queue_target_us,
+            MOVIE_VIDEO_DATAGRAM_QUEUE_TARGET.as_micros() as u64
         );
     }
 }

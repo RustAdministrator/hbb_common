@@ -591,6 +591,21 @@ impl Stream {
     }
 
     #[cfg(feature = "quic-transport")]
+    pub fn set_quic_video_datagram_queue_policy(
+        &self,
+        target: Duration,
+        minimum_bytes: usize,
+    ) -> bool {
+        match self {
+            Self::Quic(stream) => {
+                stream.set_video_datagram_queue_policy(target, minimum_bytes);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    #[cfg(feature = "quic-transport")]
     pub fn quic_peer_binding(&self) -> Option<&crate::transport::quic::QuicPeerBinding> {
         match self {
             Self::Quic(stream) => Some(stream.peer_binding()),

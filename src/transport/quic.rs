@@ -333,6 +333,7 @@ pub struct QuicConnectionStats {
     pub datagram_send_buffer_queued: u64,
     pub video_datagram_queue_budget: u64,
     pub video_datagram_queue_delay_us: u64,
+    pub video_datagram_queue_target_us: u64,
     pub audio_datagram_drops: u64,
     pub mouse_datagram_drops: u64,
 }
@@ -388,6 +389,7 @@ impl QuicConnectionStats {
             datagram_send_buffer_queued: 0,
             video_datagram_queue_budget: 0,
             video_datagram_queue_delay_us: 0,
+            video_datagram_queue_target_us: 0,
             audio_datagram_drops: 0,
             mouse_datagram_drops: 0,
         }

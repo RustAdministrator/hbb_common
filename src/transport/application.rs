@@ -1255,6 +1255,7 @@ impl QuicApplicationStream {
         stats.datagram_send_buffer_queued = datagram_send.send_buffer_queued;
         stats.video_datagram_queue_budget = datagram_send.video_queue_budget;
         stats.video_datagram_queue_delay_us = datagram_send.video_queue_delay_us;
+        stats.video_datagram_queue_target_us = datagram_send.video_queue_target_us;
         stats.audio_datagram_drops = datagram_send.audio_packets_dropped;
         stats.mouse_datagram_drops = datagram_send.mouse_updates_dropped;
         stats
@@ -1262,6 +1263,11 @@ impl QuicApplicationStream {
 
     pub fn peer_binding(&self) -> &QuicPeerBinding {
         &self.peer_binding
+    }
+
+    pub fn set_video_datagram_queue_policy(&self, target: Duration, minimum_bytes: usize) {
+        self.datagram_send
+            .set_video_queue_policy(target, minimum_bytes);
     }
 
     pub fn keep_endpoint_alive(&mut self, endpoint: Endpoint) {
