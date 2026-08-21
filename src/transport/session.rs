@@ -21,13 +21,15 @@ pub const CAP_FILE_TRANSFER: u16 = 1 << 3;
 pub const CAP_INPUT_SEND: u16 = 1 << 4;
 pub const CAP_INPUT_RECEIVE: u16 = 1 << 5;
 pub const CAP_RELIABLE_KEYFRAMES: u16 = 1 << 6;
+pub const CAP_RELIABLE_KEYFRAME_BARRIER: u16 = 1 << 7;
 pub const KNOWN_CAPABILITIES: u16 = CAP_HDR
     | CAP_CLIPBOARD_SEND
     | CAP_CLIPBOARD_RECEIVE
     | CAP_FILE_TRANSFER
     | CAP_INPUT_SEND
     | CAP_INPUT_RECEIVE
-    | CAP_RELIABLE_KEYFRAMES;
+    | CAP_RELIABLE_KEYFRAMES
+    | CAP_RELIABLE_KEYFRAME_BARRIER;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -120,6 +122,7 @@ pub struct SessionAgreement {
     pub local_may_send_input: bool,
     pub remote_may_send_input: bool,
     pub reliable_keyframes: bool,
+    pub reliable_keyframe_barrier: bool,
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -310,6 +313,10 @@ pub fn negotiate_session(
         remote_may_send_input: remote.capabilities & CAP_INPUT_SEND != 0
             && local.capabilities & CAP_INPUT_RECEIVE != 0,
         reliable_keyframes: local.capabilities & remote.capabilities & CAP_RELIABLE_KEYFRAMES != 0,
+        reliable_keyframe_barrier: local.capabilities
+            & remote.capabilities
+            & CAP_RELIABLE_KEYFRAME_BARRIER
+            != 0,
     })
 }
 
@@ -373,6 +380,7 @@ pub fn decode_session_agreement(
         local_may_send_input: flags & CAP_INPUT_SEND != 0,
         remote_may_send_input: flags & CAP_INPUT_RECEIVE != 0,
         reliable_keyframes: flags & CAP_RELIABLE_KEYFRAMES != 0,
+        reliable_keyframe_barrier: flags & CAP_RELIABLE_KEYFRAME_BARRIER != 0,
     };
     validate_agreement_fields(&agreement)?;
     Ok(agreement)
@@ -404,6 +412,8 @@ pub fn validate_agreement_for_offer(
         || (agreement.local_may_send_input && local_offer.capabilities & CAP_INPUT_SEND == 0)
         || (agreement.remote_may_send_input && local_offer.capabilities & CAP_INPUT_RECEIVE == 0)
         || (agreement.reliable_keyframes && local_offer.capabilities & CAP_RELIABLE_KEYFRAMES == 0)
+        || (agreement.reliable_keyframe_barrier
+            && local_offer.capabilities & CAP_RELIABLE_KEYFRAME_BARRIER == 0)
     {
         return Err(SessionNegotiationError::InvalidAgreement);
     }
@@ -473,6 +483,7 @@ fn validate_agreement_fields(agreement: &SessionAgreement) -> Result<(), Session
         || agreement.max_video_bitrate_kbps > 1_000_000
         || (agreement.file_transfer_enabled && agreement.max_file_bitrate_kbps == 0)
         || (agreement.hdr && agreement.color_format != ColorFormat::P010)
+        || (agreement.reliable_keyframe_barrier && !agreement.reliable_keyframes)
     {
         return Err(SessionNegotiationError::InvalidAgreement);
     }
@@ -489,6 +500,10 @@ fn agreement_flags(agreement: &SessionAgreement) -> u16 {
         (agreement.local_may_send_input, CAP_INPUT_SEND),
         (agreement.remote_may_send_input, CAP_INPUT_RECEIVE),
         (agreement.reliable_keyframes, CAP_RELIABLE_KEYFRAMES),
+        (
+            agreement.reliable_keyframe_barrier,
+            CAP_RELIABLE_KEYFRAME_BARRIER,
+        ),
     ] {
         if enabled {
             flags |= flag;
@@ -540,6 +555,13 @@ fn validate_offer(offer: &SessionOffer) -> Result<(), SessionNegotiationError> {
     if offer.capabilities & CAP_FILE_TRANSFER != 0 && offer.max_file_bitrate_kbps == 0 {
         return Err(SessionNegotiationError::InvalidBitrate);
     }
+    if offer.capabilities & CAP_RELIABLE_KEYFRAME_BARRIER != 0
+        && offer.capabilities & CAP_RELIABLE_KEYFRAMES == 0
+    {
+        return Err(SessionNegotiationError::InvalidCapabilities(
+            offer.capabilities,
+        ));
+    }
     Ok(())
 }
 
@@ -563,13 +585,14 @@ mod tests {
     fn offer() -> SessionOffer {
         SessionOffer {
             minimum_protocol_version: 1,
-            maximum_protocol_version: 2,
+            maximum_protocol_version: 4,
             capabilities: CAP_CLIPBOARD_SEND
                 | CAP_CLIPBOARD_RECEIVE
                 | CAP_FILE_TRANSFER
                 | CAP_INPUT_SEND
                 | CAP_INPUT_RECEIVE
-                | CAP_RELIABLE_KEYFRAMES,
+                | CAP_RELIABLE_KEYFRAMES
+                | CAP_RELIABLE_KEYFRAME_BARRIER,
             latency_mode: LatencyMode::LowLatency,
             video_codecs: vec![VideoCodec::H265, VideoCodec::H264],
             audio_codecs: vec![AudioCodec::Opus],
@@ -602,7 +625,7 @@ mod tests {
         assert!(validate_agreement_for_offer(&decoded, &local).is_ok());
 
         let mut downgraded = decoded;
-        downgraded.protocol_version = 3;
+        downgraded.protocol_version = 5;
         assert_eq!(
             validate_agreement_for_offer(&downgraded, &local),
             Err(SessionNegotiationError::InvalidAgreement)
@@ -654,8 +677,8 @@ mod tests {
     fn incompatible_protocol_and_codec_fail_cleanly() {
         let local = offer();
         let mut remote = offer();
-        remote.minimum_protocol_version = 3;
-        remote.maximum_protocol_version = 3;
+        remote.minimum_protocol_version = 5;
+        remote.maximum_protocol_version = 5;
         assert_eq!(
             negotiate_session(&local, &remote),
             Err(SessionNegotiationError::IncompatibleProtocol)
@@ -682,5 +705,29 @@ mod tests {
             encode_session_offer(&invalid),
             Err(SessionNegotiationError::InvalidVideoCodecs)
         );
+        invalid = offer();
+        invalid.capabilities &= !CAP_RELIABLE_KEYFRAMES;
+        assert_eq!(
+            encode_session_offer(&invalid),
+            Err(SessionNegotiationError::InvalidCapabilities(
+                invalid.capabilities
+            ))
+        );
+    }
+
+    #[test]
+    fn keyframe_barrier_is_negotiated_only_when_both_peers_support_it() {
+        let local = offer();
+        let mut legacy = offer();
+        legacy.capabilities &= !CAP_RELIABLE_KEYFRAME_BARRIER;
+
+        assert!(
+            negotiate_session(&local, &local)
+                .unwrap()
+                .reliable_keyframe_barrier
+        );
+        let agreement = negotiate_session(&local, &legacy).unwrap();
+        assert!(agreement.reliable_keyframes);
+        assert!(!agreement.reliable_keyframe_barrier);
     }
 }

@@ -18,8 +18,8 @@ use super::{
         decode_session_acceptance, decode_session_offer, encode_session_acceptance,
         encode_session_offer, negotiate_session, validate_session_acceptance, LatencyMode,
         SessionAgreement, SessionOffer, CAP_CLIPBOARD_RECEIVE, CAP_CLIPBOARD_SEND,
-        CAP_FILE_TRANSFER, CAP_INPUT_RECEIVE, CAP_INPUT_SEND, CAP_RELIABLE_KEYFRAMES, COLOR_I420,
-        COLOR_I444, COLOR_NV12, COLOR_P010,
+        CAP_FILE_TRANSFER, CAP_INPUT_RECEIVE, CAP_INPUT_SEND, CAP_RELIABLE_KEYFRAMES,
+        CAP_RELIABLE_KEYFRAME_BARRIER, COLOR_I420, COLOR_I444, COLOR_NV12, COLOR_P010,
     },
     video_datagram::{VideoCodec, VideoFrameMetadata, VideoReassemblyConfig, FLAG_KEYFRAME},
 };
@@ -31,7 +31,7 @@ use protobuf::Message as ProtobufMessage;
 use quinn::{Connection, Endpoint};
 use std::{
     collections::BTreeMap,
-    convert::TryInto,
+    convert::{TryFrom, TryInto},
     io::{Error, ErrorKind},
     net::SocketAddr,
     sync::{
@@ -58,6 +58,10 @@ const VIDEO_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const VIDEO_KEYFRAME_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const VIDEO_KEYFRAME_RETRY_MAX_ATTEMPTS: u8 = 3;
 const VIDEO_KEYFRAME_RECOVERY_CYCLE_COOLDOWN: Duration = Duration::from_secs(10);
+const VIDEO_EPOCH_HOLDBACK_TIMEOUT: Duration = Duration::from_secs(2);
+const VIDEO_EPOCH_HOLDBACK_MAX_FRAMES: usize = 120;
+const VIDEO_EPOCH_HOLDBACK_MAX_BYTES: usize = 16 * 1024 * 1024;
+const MAX_VIDEO_EPOCH_STREAM_STATES: usize = 8;
 const MAX_VIDEO_STREAM_STATES: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,6 +90,12 @@ enum ApplicationClass {
 struct ReliableOutbound {
     message_type: MessageType,
     payload: Bytes,
+}
+
+struct ReliableVideoReceiveContext {
+    control: mpsc::Sender<ReliableOutbound>,
+    scoped_reference_refresh: bool,
+    keyframe_barrier: bool,
 }
 
 struct VideoOutbound {
@@ -121,7 +131,13 @@ struct QuicApplicationMetrics {
     video_recovery_suppressed_frames: AtomicU64,
     video_sender_replacements: AtomicU64,
     video_sender_reference_resets: AtomicU64,
+    video_keyframe_barrier_held: AtomicU64,
+    video_keyframe_barrier_released: AtomicU64,
+    video_keyframe_barrier_timeouts: AtomicU64,
+    video_keyframe_barrier_overflows: AtomicU64,
+    video_delivery_lock: Mutex<()>,
     video_receive_recovery: Mutex<VideoReceiveRecovery>,
+    video_epoch_holdback: Mutex<VideoEpochHoldback>,
 }
 
 struct VideoSendRecovery {
@@ -228,6 +244,203 @@ struct VideoSourceInfo {
     keyframe: bool,
 }
 
+struct HeldVideoFrame {
+    info: VideoSourceInfo,
+    payload: Bytes,
+    received_at: Instant,
+    counted_held: bool,
+}
+
+#[derive(Default)]
+struct VideoEpochStreamState {
+    current_epoch: u64,
+    next_frame_id: u64,
+    pending: BTreeMap<(u64, u64), HeldVideoFrame>,
+    pending_bytes: usize,
+    last_activity: u64,
+}
+
+#[derive(Default)]
+struct VideoEpochHoldback {
+    streams: BTreeMap<VideoStreamKey, VideoEpochStreamState>,
+    activity_generation: u64,
+}
+
+#[derive(Default)]
+struct VideoHoldbackOutcome {
+    ready: Vec<(VideoSourceInfo, Bytes)>,
+    held_frames: usize,
+    released_frames: usize,
+    recovery_required: bool,
+    timed_out_frames: usize,
+    overflowed_frames: usize,
+}
+
+impl VideoEpochHoldback {
+    fn prepare_stream(&mut self, key: VideoStreamKey, outcome: &mut VideoHoldbackOutcome) {
+        self.activity_generation = self.activity_generation.saturating_add(1);
+        if !self.streams.contains_key(&key) && self.streams.len() >= MAX_VIDEO_EPOCH_STREAM_STATES {
+            let oldest = self
+                .streams
+                .iter()
+                .min_by_key(|(_, state)| state.last_activity)
+                .map(|(key, _)| *key);
+            if let Some(oldest) = oldest {
+                if let Some(state) = self.streams.remove(&oldest) {
+                    if !state.pending.is_empty() {
+                        outcome.overflowed_frames = outcome
+                            .overflowed_frames
+                            .saturating_add(state.pending.len());
+                        outcome.recovery_required = true;
+                    }
+                }
+            }
+        }
+        self.streams.entry(key).or_default().last_activity = self.activity_generation;
+    }
+
+    fn admit_delta(
+        &mut self,
+        info: VideoSourceInfo,
+        reference_epoch: u64,
+        payload: Bytes,
+        now: Instant,
+    ) -> VideoHoldbackOutcome {
+        let mut outcome = self.expire(now);
+        if reference_epoch == 0 {
+            outcome.recovery_required = true;
+            return outcome;
+        }
+        let stream_key = info.key;
+        self.prepare_stream(stream_key, &mut outcome);
+        {
+            let state = self.streams.entry(stream_key).or_default();
+            if reference_epoch < state.current_epoch
+                || (reference_epoch == state.current_epoch
+                    && state.next_frame_id != 0
+                    && info.frame_id < state.next_frame_id)
+            {
+                return outcome;
+            }
+            let frame_key = (reference_epoch, info.frame_id);
+            if state.pending.contains_key(&frame_key) {
+                return outcome;
+            }
+            let counted_held = reference_epoch != state.current_epoch
+                || state.next_frame_id == 0
+                || info.frame_id != state.next_frame_id;
+            state.pending_bytes = state.pending_bytes.saturating_add(payload.len());
+            state.pending.insert(
+                frame_key,
+                HeldVideoFrame {
+                    info,
+                    payload,
+                    received_at: now,
+                    counted_held,
+                },
+            );
+            if counted_held {
+                outcome.held_frames = outcome.held_frames.saturating_add(1);
+            }
+        }
+        let (frames, bytes) = self.pending_totals();
+        if frames > VIDEO_EPOCH_HOLDBACK_MAX_FRAMES || bytes > VIDEO_EPOCH_HOLDBACK_MAX_BYTES {
+            outcome.overflowed_frames = outcome.overflowed_frames.saturating_add(frames);
+            outcome.recovery_required = true;
+            self.clear_pending();
+            return outcome;
+        }
+        if let Some(state) = self.streams.get_mut(&stream_key) {
+            let (ready, released_frames) = Self::drain_ready(state);
+            outcome.released_frames = outcome.released_frames.saturating_add(released_frames);
+            outcome.ready.extend(ready);
+        }
+        outcome
+    }
+
+    fn accept_keyframe(
+        &mut self,
+        info: VideoSourceInfo,
+        payload: Bytes,
+        now: Instant,
+    ) -> VideoHoldbackOutcome {
+        let mut outcome = self.expire(now);
+        self.prepare_stream(info.key, &mut outcome);
+        let state = self.streams.entry(info.key).or_default();
+        state.current_epoch = info.frame_id;
+        state.next_frame_id = info.frame_id.saturating_add(1);
+        let obsolete = state
+            .pending
+            .keys()
+            .copied()
+            .filter(|(epoch, frame_id)| *epoch < state.current_epoch || *frame_id <= info.frame_id)
+            .collect::<Vec<_>>();
+        for key in obsolete {
+            if let Some(frame) = state.pending.remove(&key) {
+                state.pending_bytes = state.pending_bytes.saturating_sub(frame.payload.len());
+            }
+        }
+        outcome.ready.push((info, payload));
+        let (ready, released_frames) = Self::drain_ready(state);
+        outcome.released_frames = outcome.released_frames.saturating_add(released_frames);
+        outcome.ready.extend(ready);
+        outcome
+    }
+
+    fn expire(&mut self, now: Instant) -> VideoHoldbackOutcome {
+        let mut outcome = VideoHoldbackOutcome::default();
+        for state in self.streams.values_mut() {
+            let timed_out = state.pending.values().any(|frame| {
+                now.saturating_duration_since(frame.received_at) >= VIDEO_EPOCH_HOLDBACK_TIMEOUT
+            });
+            if timed_out {
+                outcome.timed_out_frames =
+                    outcome.timed_out_frames.saturating_add(state.pending.len());
+                outcome.recovery_required = true;
+                state.pending.clear();
+                state.pending_bytes = 0;
+            }
+        }
+        outcome
+    }
+
+    fn drain_ready(state: &mut VideoEpochStreamState) -> (Vec<(VideoSourceInfo, Bytes)>, usize) {
+        let mut ready = Vec::new();
+        let mut released_frames = 0usize;
+        while state.current_epoch != 0 && state.next_frame_id != 0 {
+            let key = (state.current_epoch, state.next_frame_id);
+            let Some(frame) = state.pending.remove(&key) else {
+                break;
+            };
+            state.pending_bytes = state.pending_bytes.saturating_sub(frame.payload.len());
+            state.next_frame_id = state.next_frame_id.saturating_add(1);
+            if frame.counted_held {
+                released_frames = released_frames.saturating_add(1);
+            }
+            ready.push((frame.info, frame.payload));
+        }
+        (ready, released_frames)
+    }
+
+    fn pending_totals(&self) -> (usize, usize) {
+        self.streams
+            .values()
+            .fold((0usize, 0usize), |total, state| {
+                (
+                    total.0.saturating_add(state.pending.len()),
+                    total.1.saturating_add(state.pending_bytes),
+                )
+            })
+    }
+
+    fn clear_pending(&mut self) {
+        for state in self.streams.values_mut() {
+            state.pending.clear();
+            state.pending_bytes = 0;
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct VideoReceiveState {
     last_frame_id: u64,
@@ -262,6 +475,17 @@ struct VideoReceiveRecovery {
 }
 
 impl VideoReceiveRecovery {
+    fn note_source_context(&mut self, info: VideoSourceInfo) {
+        if info.key.stream_id == 0 || info.frame_id == 0 {
+            return;
+        }
+        if !self.streams.contains_key(&info.key) && self.streams.len() >= MAX_VIDEO_STREAM_STATES {
+            self.streams.pop_first();
+        }
+        self.last_observed = Some(info);
+        self.streams.entry(info.key).or_default();
+    }
+
     fn observe(&mut self, info: VideoSourceInfo) -> VideoReceiveDecision {
         if info.key.stream_id == 0 || info.frame_id == 0 {
             return VideoReceiveDecision::Accept;
@@ -389,6 +613,25 @@ fn should_replace_pending_video(pending: &VideoOutbound, incoming: &VideoOutboun
         return incoming.ordering_epoch > pending.ordering_epoch;
     }
     !pending.is_keyframe() || incoming.is_keyframe()
+}
+
+fn apply_video_reference_epoch(
+    item: &mut VideoOutbound,
+    reference_epochs: &mut BTreeMap<VideoStreamKey, u64>,
+    keyframe_barrier: bool,
+) -> Option<u64> {
+    if !keyframe_barrier {
+        return None;
+    }
+    let info = item.source_info?;
+    if item.is_keyframe() {
+        reference_epochs.insert(info.key, info.frame_id);
+        Some(info.frame_id)
+    } else {
+        item.metadata.presentation_timestamp_us =
+            reference_epochs.get(&info.key).copied().unwrap_or(0);
+        Some(item.metadata.presentation_timestamp_us)
+    }
 }
 
 struct AudioOutbound {
@@ -645,6 +888,12 @@ impl QuicApplicationStream {
                 None,
                 video_ordering.clone(),
                 metrics.clone(),
+                Some(ReliableVideoReceiveContext {
+                    control: control.clone(),
+                    scoped_reference_refresh: application_protocol
+                        .supports_scoped_video_reference_refresh(),
+                    keyframe_barrier: agreement.reliable_keyframe_barrier,
+                }),
             )));
             Some(sender)
         } else {
@@ -669,6 +918,7 @@ impl QuicApplicationStream {
             connection.clone(),
             reliable_video_sender,
             video_send_recovery.clone(),
+            agreement.reliable_keyframe_barrier,
         )));
         tasks.push(tokio::spawn(run_mouse_writer(
             QuicDatagramSender::new(connection.clone(), session_id)
@@ -704,12 +954,14 @@ impl QuicApplicationStream {
             control.clone(),
             connection.clone(),
             application_protocol.supports_scoped_video_reference_refresh(),
+            agreement.reliable_keyframe_barrier,
             metrics.clone(),
         )));
 
         log::info!(
-            "QUIC application channels ready: role={role:?}, protocol={application_protocol:?}, reliable_keyframes={}, local={local_addr}, peer={}, mtu={}, datagram_payload_live={:?}, datagram_payload_negotiated={}",
+            "QUIC application channels ready: role={role:?}, protocol={application_protocol:?}, reliable_keyframes={}, keyframe_barrier={}, local={local_addr}, peer={}, mtu={}, datagram_payload_live={:?}, datagram_payload_negotiated={}",
             agreement.reliable_keyframes,
+            agreement.reliable_keyframe_barrier,
             connection.remote_address(),
             connection.stats().path.current_mtu,
             connection.max_datagram_size(),
@@ -908,6 +1160,7 @@ impl QuicApplicationStream {
         stats.application_protocol = self.application_protocol as u16;
         stats.negotiated_datagram_size = Some(usize::from(self.agreement.max_datagram_payload));
         stats.reliable_keyframes = self.agreement.reliable_keyframes;
+        stats.reliable_keyframe_barrier = self.agreement.reliable_keyframe_barrier;
         stats.video_reassembly_drops = self.metrics.video_reassembly_drops.load(Ordering::Relaxed);
         stats.video_reassembly_expired = self
             .metrics
@@ -973,6 +1226,22 @@ impl QuicApplicationStream {
             .metrics
             .video_sender_reference_resets
             .load(Ordering::Relaxed);
+        stats.video_keyframe_barrier_held = self
+            .metrics
+            .video_keyframe_barrier_held
+            .load(Ordering::Relaxed);
+        stats.video_keyframe_barrier_released = self
+            .metrics
+            .video_keyframe_barrier_released
+            .load(Ordering::Relaxed);
+        stats.video_keyframe_barrier_timeouts = self
+            .metrics
+            .video_keyframe_barrier_timeouts
+            .load(Ordering::Relaxed);
+        stats.video_keyframe_barrier_overflows = self
+            .metrics
+            .video_keyframe_barrier_overflows
+            .load(Ordering::Relaxed);
         let datagram_send = self.datagram_send.stats();
         stats.video_datagram_frames_sent = datagram_send.video_frames_sent;
         stats.video_datagram_frames_rejected = datagram_send.video_frames_rejected;
@@ -985,6 +1254,7 @@ impl QuicApplicationStream {
         stats.datagram_send_buffer_space_min = datagram_send.send_buffer_space_min;
         stats.datagram_send_buffer_queued = datagram_send.send_buffer_queued;
         stats.video_datagram_queue_budget = datagram_send.video_queue_budget;
+        stats.video_datagram_queue_delay_us = datagram_send.video_queue_delay_us;
         stats.audio_datagram_drops = datagram_send.audio_packets_dropped;
         stats.mouse_datagram_drops = datagram_send.mouse_updates_dropped;
         stats
@@ -1060,13 +1330,14 @@ async fn negotiate_application_session(
         }
     };
     log::info!(
-        "QUIC session negotiated: protocol={}, video={:?}, audio={:?}, color={:?}, mtu_payload={}, reliable_keyframes={}, max_fps={}, file_kbps={}",
+        "QUIC session negotiated: protocol={}, video={:?}, audio={:?}, color={:?}, mtu_payload={}, reliable_keyframes={}, keyframe_barrier={}, max_fps={}, file_kbps={}",
         agreement.protocol_version,
         agreement.video_codec,
         agreement.audio_codec,
         agreement.color_format,
         agreement.max_datagram_payload,
         agreement.reliable_keyframes,
+        agreement.reliable_keyframe_barrier,
         agreement.max_fps,
         agreement.max_file_bitrate_kbps
     );
@@ -1107,6 +1378,11 @@ fn application_session_offer(
             | CAP_INPUT_RECEIVE
             | if application_protocol.supports_reliable_keyframes() {
                 CAP_RELIABLE_KEYFRAMES
+            } else {
+                0
+            }
+            | if application_protocol.supports_reliable_keyframe_barrier() {
+                CAP_RELIABLE_KEYFRAME_BARRIER
             } else {
                 0
             },
@@ -1243,6 +1519,7 @@ fn spawn_reliable_channel(
         internal_control,
         video_ordering,
         metrics,
+        None,
     ));
     (outbound, [writer, reader])
 }
@@ -1284,6 +1561,7 @@ async fn run_reliable_reader(
     internal_control: Option<mpsc::Sender<ReliableOutbound>>,
     video_ordering: Arc<VideoOrderingGate>,
     metrics: Arc<QuicApplicationMetrics>,
+    video_context: Option<ReliableVideoReceiveContext>,
 ) {
     loop {
         let message = match receiver.receive().await {
@@ -1361,16 +1639,85 @@ async fn run_reliable_reader(
             }
         }
         let reliable_video = if expected_kind == ReliableChannelKind::Video {
-            match video_source_info(&message.payload) {
-                Ok(info) => Some(info),
+            let info = match video_source_info(&message.payload) {
+                Ok(info) if info.keyframe => info,
+                Ok(_) => {
+                    report_terminal_error(
+                        &inbound,
+                        &connection,
+                        "reliable video channel received a delta frame".to_owned(),
+                    )
+                    .await;
+                    return;
+                }
                 Err(error) => {
                     report_terminal_error(&inbound, &connection, error.to_string()).await;
                     return;
                 }
-            }
+            };
+            Some(info)
         } else {
             None
         };
+        if let (Some(info), Some(context)) = (reliable_video, video_context.as_ref()) {
+            if context.keyframe_barrier {
+                metrics
+                    .reliable_keyframes_received
+                    .fetch_add(1, Ordering::Relaxed);
+                let _delivery_guard = metrics.video_delivery_lock.lock().unwrap();
+                let outcome = metrics
+                    .video_epoch_holdback
+                    .lock()
+                    .unwrap()
+                    .accept_keyframe(
+                        info,
+                        Bytes::copy_from_slice(&message.payload),
+                        Instant::now(),
+                    );
+                log::debug!(
+                    "QUIC video keyframe barrier opened: display={}, stream={}, epoch={}, released_frames={}",
+                    info.key.display,
+                    info.key.stream_id,
+                    info.frame_id,
+                    outcome.released_frames,
+                );
+                record_video_holdback_metrics(&outcome, &metrics);
+                let mut needs_keyframe = outcome.recovery_required;
+                if needs_keyframe {
+                    metrics
+                        .video_receive_recovery
+                        .lock()
+                        .unwrap()
+                        .mark_reference_loss();
+                }
+                for (ready_info, payload) in outcome.ready {
+                    let (alive, frame_needs_keyframe) = deliver_video_payload(
+                        ready_info,
+                        payload,
+                        &inbound,
+                        &metrics,
+                        &metrics.video_receive_recovery,
+                    );
+                    if !alive {
+                        return;
+                    }
+                    needs_keyframe |= frame_needs_keyframe;
+                }
+                if needs_keyframe
+                    && !request_video_keyframe(
+                        &context.control,
+                        context.scoped_reference_refresh,
+                        &metrics,
+                        &metrics.video_receive_recovery,
+                        Instant::now(),
+                        0,
+                    )
+                {
+                    return;
+                }
+                continue;
+            }
+        }
         if inbound
             .send(Ok(BytesMut::from(message.payload.as_slice())))
             .await
@@ -1414,8 +1761,10 @@ async fn run_video_writer(
     connection: Connection,
     mut reliable_sender: Option<ReliableChannelSender>,
     recovery: Arc<VideoSendRecovery>,
+    keyframe_barrier: bool,
 ) {
     let started = Instant::now();
+    let mut reference_epochs = BTreeMap::<VideoStreamKey, u64>::new();
     loop {
         let mut item = video.take().await;
         while !video_ordering.is_open(item.ordering_epoch) {
@@ -1452,6 +1801,8 @@ async fn run_video_writer(
         if !item.is_keyframe() && recovery.suppress_delta(item.metadata.frame_id) {
             continue;
         }
+        let reference_epoch =
+            apply_video_reference_epoch(&mut item, &mut reference_epochs, keyframe_barrier);
         if item.is_keyframe() {
             if let Some(reliable_sender) = reliable_sender.as_mut() {
                 let timestamp = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
@@ -1467,9 +1818,10 @@ async fn run_video_writer(
                     .reliable_keyframes_sent
                     .fetch_add(1, Ordering::Relaxed);
                 log::debug!(
-                    "QUIC reliable keyframe sent: frame_id={}, bytes={}",
+                    "QUIC reliable keyframe sent: frame_id={}, bytes={}, barrier_epoch={:?}",
                     item.metadata.frame_id,
-                    item.payload.len()
+                    item.payload.len(),
+                    reference_epoch,
                 );
                 recovery.keyframe_sent(item.metadata.frame_id);
                 continue;
@@ -1478,15 +1830,25 @@ async fn run_video_writer(
         match sender.send_video_frame(item.metadata, &item.payload) {
             Ok(VideoDatagramSendOutcome::Sent { .. }) => {}
             Ok(VideoDatagramSendOutcome::RejectedNoSpace {
+                failure,
                 datagram_bytes,
                 available_bytes,
+                queued_bytes,
+                video_queue_budget,
+                interactive_reserve_bytes,
+                queue_delay_us,
             }) => {
                 log::warn!(
-                    "QUIC video frame rejected before DATAGRAM enqueue: frame_id={}, bytes={}, datagram_bytes={}, available_bytes={}",
+                    "QUIC video frame rejected before DATAGRAM enqueue: frame_id={}, bytes={}, reason={}, datagram_bytes={}, available_bytes={}, queued_bytes={}, queue_budget_bytes={}, interactive_reserve_bytes={}, queue_delay_us={}",
                     item.metadata.frame_id,
                     item.payload.len(),
+                    failure.as_str(),
                     datagram_bytes,
                     available_bytes,
+                    queued_bytes,
+                    video_queue_budget,
+                    interactive_reserve_bytes,
+                    queue_delay_us,
                 );
                 recovery.enter(
                     item.source_info,
@@ -1562,6 +1924,7 @@ async fn run_datagram_reader(
     control: mpsc::Sender<ReliableOutbound>,
     connection: Connection,
     scoped_reference_refresh: bool,
+    keyframe_barrier: bool,
     metrics: Arc<QuicApplicationMetrics>,
 ) {
     let mut received_audio_format = None;
@@ -1581,13 +1944,16 @@ async fn run_datagram_reader(
             }
             _ = video_expiry.tick() => {
                 let outcome = receiver.expire_video(Instant::now());
-                if (outcome.dropped_frames > 0 || outcome.request_keyframe)
+                if (keyframe_barrier
+                    || outcome.dropped_frames > 0
+                    || outcome.request_keyframe)
                     && !handle_video_outcome(
                         outcome,
                         receiver.video_stats(),
                         &inbound,
                         &control,
                         scoped_reference_refresh,
+                        keyframe_barrier,
                         &metrics,
                         &metrics.video_receive_recovery,
                         Instant::now(),
@@ -1609,6 +1975,7 @@ async fn run_datagram_reader(
                     &inbound,
                     &control,
                     scoped_reference_refresh,
+                    keyframe_barrier,
                     &metrics,
                     &metrics.video_receive_recovery,
                     Instant::now(),
@@ -1663,12 +2030,136 @@ async fn run_datagram_reader(
     }
 }
 
+fn record_video_holdback_metrics(outcome: &VideoHoldbackOutcome, metrics: &QuicApplicationMetrics) {
+    metrics.video_keyframe_barrier_held.fetch_add(
+        u64::try_from(outcome.held_frames).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+    metrics.video_keyframe_barrier_released.fetch_add(
+        u64::try_from(outcome.released_frames).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+    metrics.video_keyframe_barrier_timeouts.fetch_add(
+        u64::try_from(outcome.timed_out_frames).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+    metrics.video_keyframe_barrier_overflows.fetch_add(
+        u64::try_from(outcome.overflowed_frames).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+    if outcome.timed_out_frames > 0 {
+        log::warn!(
+            "QUIC video keyframe barrier timed out: dropped_held_frames={}",
+            outcome.timed_out_frames
+        );
+    }
+    if outcome.overflowed_frames > 0 {
+        log::warn!(
+            "QUIC video keyframe barrier overflowed: dropped_held_frames={}",
+            outcome.overflowed_frames
+        );
+    }
+}
+
+fn deliver_video_payload(
+    info: VideoSourceInfo,
+    payload: Bytes,
+    inbound: &mpsc::Sender<Result<BytesMut, Error>>,
+    metrics: &QuicApplicationMetrics,
+    recovery: &Mutex<VideoReceiveRecovery>,
+) -> (bool, bool) {
+    let decision = {
+        let mut recovery = recovery.lock().unwrap();
+        recovery.observe(info)
+    };
+    match decision {
+        VideoReceiveDecision::Accept => {
+            match inbound.try_send(Ok(BytesMut::from(payload.as_ref()))) {
+                Ok(()) => {
+                    let needs_keyframe =
+                        info.keyframe && recovery.lock().unwrap().has_unrecovered_streams();
+                    (true, needs_keyframe)
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    recovery.lock().unwrap().mark_reference_loss();
+                    metrics
+                        .video_recovery_suppressed_frames
+                        .fetch_add(1, Ordering::Relaxed);
+                    (true, true)
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => (false, false),
+            }
+        }
+        VideoReceiveDecision::Suppress => {
+            metrics
+                .video_recovery_suppressed_frames
+                .fetch_add(1, Ordering::Relaxed);
+            (true, true)
+        }
+        VideoReceiveDecision::SuppressAfterGap => {
+            log::warn!(
+                "QUIC video source gap: display={}, stream={}, frame={}; suppressing deltas until keyframe",
+                info.key.display,
+                info.key.stream_id,
+                info.frame_id,
+            );
+            metrics
+                .video_source_frame_gaps
+                .fetch_add(1, Ordering::Relaxed);
+            metrics
+                .video_recovery_suppressed_frames
+                .fetch_add(1, Ordering::Relaxed);
+            (true, true)
+        }
+    }
+}
+
+fn request_video_keyframe(
+    control: &mpsc::Sender<ReliableOutbound>,
+    scoped_reference_refresh: bool,
+    metrics: &QuicApplicationMetrics,
+    recovery: &Mutex<VideoReceiveRecovery>,
+    now: Instant,
+    dropped_frames: u64,
+) -> bool {
+    let request = recovery.lock().unwrap().next_keyframe_request(
+        now,
+        scoped_reference_refresh,
+        dropped_frames,
+    );
+    let Some(request) = request else {
+        return true;
+    };
+    let (payload, scoped) = match request {
+        VideoKeyframeRequest::Legacy => (refresh_video_message(), false),
+        VideoKeyframeRequest::Scoped(refresh) => (video_reference_refresh_message(refresh), true),
+    };
+    match control.try_send(ReliableOutbound {
+        message_type: MessageType::ApplicationControl,
+        payload: Bytes::from(payload),
+    }) {
+        Ok(()) => {
+            metrics
+                .video_keyframe_requests
+                .fetch_add(1, Ordering::Relaxed);
+            log::debug!(
+                "QUIC video recovery requested a fresh keyframe: scoped={}",
+                scoped
+            );
+            true
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => true,
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+    }
+}
+
 fn handle_video_outcome(
     outcome: super::video_datagram::VideoReassemblyOutcome,
     video_stats: &super::video_datagram::VideoReassemblyStats,
     inbound: &mpsc::Sender<Result<BytesMut, Error>>,
     control: &mpsc::Sender<ReliableOutbound>,
     scoped_reference_refresh: bool,
+    keyframe_barrier: bool,
     metrics: &QuicApplicationMetrics,
     recovery: &Mutex<VideoReceiveRecovery>,
     now: Instant,
@@ -1714,88 +2205,65 @@ fn handle_video_outcome(
     metrics
         .video_reassembly_last_frame_fragments
         .store(video_stats.last_frame_fragments, Ordering::Relaxed);
+    let _delivery_guard = metrics.video_delivery_lock.lock().unwrap();
     let mut needs_keyframe = outcome.request_keyframe || outcome.dropped_frames > 0;
     if outcome.dropped_frames > 0 {
         recovery.lock().unwrap().mark_reference_loss();
     }
-    if let Some(frame) = outcome.frame {
-        match video_source_info(&frame.payload) {
-            Ok(info) => match recovery.lock().unwrap().observe(info) {
-                VideoReceiveDecision::Accept => {
-                    match inbound.try_send(Ok(BytesMut::from(frame.payload.as_slice()))) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            recovery.lock().unwrap().mark_reference_loss();
-                            metrics
-                                .video_recovery_suppressed_frames
-                                .fetch_add(1, Ordering::Relaxed);
-                            needs_keyframe = true;
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => return false,
-                    }
-                    if info.keyframe {
-                        needs_keyframe = recovery.lock().unwrap().has_unrecovered_streams();
-                    }
+    let holdback_outcome = if keyframe_barrier {
+        if let Some(frame) = outcome.frame {
+            match video_source_info(&frame.payload) {
+                Ok(info) => {
+                    recovery.lock().unwrap().note_source_context(info);
+                    metrics.video_epoch_holdback.lock().unwrap().admit_delta(
+                        info,
+                        frame.metadata.presentation_timestamp_us,
+                        Bytes::from(frame.payload),
+                        now,
+                    )
                 }
-                VideoReceiveDecision::Suppress => {
-                    metrics
-                        .video_recovery_suppressed_frames
-                        .fetch_add(1, Ordering::Relaxed);
-                    needs_keyframe = true;
+                Err(error) => {
+                    log::warn!("Invalid QUIC video application payload was discarded: {error}");
+                    VideoHoldbackOutcome::default()
                 }
-                VideoReceiveDecision::SuppressAfterGap => {
-                    log::warn!(
-                        "QUIC video source gap: display={}, stream={}, frame={}; suppressing deltas until keyframe",
-                        info.key.display,
-                        info.key.stream_id,
-                        info.frame_id,
-                    );
-                    metrics
-                        .video_source_frame_gaps
-                        .fetch_add(1, Ordering::Relaxed);
-                    metrics
-                        .video_recovery_suppressed_frames
-                        .fetch_add(1, Ordering::Relaxed);
-                    needs_keyframe = true;
+            }
+        } else {
+            metrics.video_epoch_holdback.lock().unwrap().expire(now)
+        }
+    } else {
+        let mut legacy = VideoHoldbackOutcome::default();
+        if let Some(frame) = outcome.frame {
+            match video_source_info(&frame.payload) {
+                Ok(info) => legacy.ready.push((info, Bytes::from(frame.payload))),
+                Err(error) => {
+                    log::warn!("Invalid QUIC video application payload was discarded: {error}");
                 }
-            },
-            Err(error) => {
-                log::warn!("Invalid QUIC video application payload was discarded: {error}");
             }
         }
+        legacy
+    };
+    record_video_holdback_metrics(&holdback_outcome, metrics);
+    if holdback_outcome.recovery_required {
+        recovery.lock().unwrap().mark_reference_loss();
+        needs_keyframe = true;
     }
-    if needs_keyframe {
-        let request = recovery.lock().unwrap().next_keyframe_request(
-            now,
+    for (info, payload) in holdback_outcome.ready {
+        let (alive, frame_needs_keyframe) =
+            deliver_video_payload(info, payload, inbound, metrics, recovery);
+        if !alive {
+            return false;
+        }
+        needs_keyframe |= frame_needs_keyframe;
+    }
+    !needs_keyframe
+        || request_video_keyframe(
+            control,
             scoped_reference_refresh,
+            metrics,
+            recovery,
+            now,
             u64::from(outcome.dropped_frames),
-        );
-        if let Some(request) = request {
-            let (payload, scoped) = match request {
-                VideoKeyframeRequest::Legacy => (refresh_video_message(), false),
-                VideoKeyframeRequest::Scoped(refresh) => {
-                    (video_reference_refresh_message(refresh), true)
-                }
-            };
-            match control.try_send(ReliableOutbound {
-                message_type: MessageType::ApplicationControl,
-                payload: Bytes::from(payload),
-            }) {
-                Ok(()) => {
-                    metrics
-                        .video_keyframe_requests
-                        .fetch_add(1, Ordering::Relaxed);
-                    log::debug!(
-                        "QUIC video recovery requested a fresh keyframe: scoped={}",
-                        scoped
-                    );
-                }
-                Err(mpsc::error::TrySendError::Full(_)) => {}
-                Err(mpsc::error::TrySendError::Closed(_)) => return false,
-            }
-        }
-    }
-    true
+        )
 }
 
 async fn report_terminal_error(
@@ -2227,6 +2695,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn v4_deltas_are_tagged_with_the_latest_source_keyframe() {
+        let mut epochs = BTreeMap::new();
+        let mut keyframe = outbound_video(10, true, 0);
+        let mut delta = outbound_video(11, false, 0);
+
+        assert_eq!(
+            apply_video_reference_epoch(&mut keyframe, &mut epochs, true),
+            Some(10)
+        );
+        assert_eq!(
+            apply_video_reference_epoch(&mut delta, &mut epochs, true),
+            Some(10)
+        );
+        assert_eq!(delta.metadata.presentation_timestamp_us, 10);
+
+        let mut legacy = outbound_video(12, false, 0);
+        assert_eq!(
+            apply_video_reference_epoch(&mut legacy, &mut epochs, false),
+            None
+        );
+        assert_eq!(legacy.metadata.presentation_timestamp_us, 12_000);
+    }
+
     #[tokio::test]
     async fn latest_video_slot_preserves_pending_keyframe_from_same_epoch_delta() {
         let slot = LatestSlot::new();
@@ -2376,6 +2868,152 @@ mod tests {
     }
 
     #[test]
+    fn keyframe_barrier_holds_future_deltas_and_releases_them_in_order() {
+        let now = Instant::now();
+        let mut holdback = VideoEpochHoldback::default();
+        let held_11 = holdback.admit_delta(
+            source_video(7, 11, false),
+            10,
+            Bytes::from_static(b"delta-11"),
+            now,
+        );
+        let held_13 = holdback.admit_delta(
+            source_video(7, 13, false),
+            10,
+            Bytes::from_static(b"delta-13"),
+            now,
+        );
+        assert!(held_11.ready.is_empty());
+        assert!(held_13.ready.is_empty());
+
+        let keyframe = holdback.accept_keyframe(
+            source_video(7, 10, true),
+            Bytes::from_static(b"keyframe-10"),
+            now,
+        );
+        assert_eq!(
+            keyframe
+                .ready
+                .iter()
+                .map(|(info, _)| info.frame_id)
+                .collect::<Vec<_>>(),
+            vec![10, 11]
+        );
+
+        let filled_gap = holdback.admit_delta(
+            source_video(7, 12, false),
+            10,
+            Bytes::from_static(b"delta-12"),
+            now,
+        );
+        assert_eq!(
+            filled_gap
+                .ready
+                .iter()
+                .map(|(info, _)| info.frame_id)
+                .collect::<Vec<_>>(),
+            vec![12, 13]
+        );
+    }
+
+    #[test]
+    fn keyframe_barrier_times_out_without_unbounded_holdback() {
+        let now = Instant::now();
+        let mut holdback = VideoEpochHoldback::default();
+        let held = holdback.admit_delta(
+            source_video(7, 11, false),
+            10,
+            Bytes::from_static(b"delta-11"),
+            now,
+        );
+        assert_eq!(held.held_frames, 1);
+
+        let expired = holdback.expire(now + VIDEO_EPOCH_HOLDBACK_TIMEOUT);
+        assert!(expired.recovery_required);
+        assert_eq!(expired.timed_out_frames, 1);
+        assert_eq!(holdback.pending_totals(), (0, 0));
+    }
+
+    #[test]
+    fn keyframe_barrier_timeout_keeps_scoped_recovery_context() {
+        let now = Instant::now();
+        let mut recovery = VideoReceiveRecovery::default();
+        recovery.note_source_context(source_video(7, 11, false));
+        recovery.mark_reference_loss();
+
+        match recovery.next_keyframe_request(now, true, 1) {
+            Some(VideoKeyframeRequest::Scoped(refresh)) => {
+                assert_eq!(refresh.display, 0);
+                assert_eq!(refresh.stream_id, 7);
+                assert_eq!(refresh.received_frame_id, 11);
+                assert_eq!(refresh.dropped_frames, 1);
+            }
+            _ => panic!("expected scoped recovery for a held delta"),
+        }
+    }
+
+    #[test]
+    fn keyframe_barrier_rejects_unbounded_future_epochs() {
+        let now = Instant::now();
+        let mut holdback = VideoEpochHoldback::default();
+        let mut overflow = VideoHoldbackOutcome::default();
+        for frame_id in 1..=VIDEO_EPOCH_HOLDBACK_MAX_FRAMES + 1 {
+            overflow = holdback.admit_delta(
+                source_video(7, frame_id as u64, false),
+                10,
+                Bytes::from_static(b"delta"),
+                now,
+            );
+        }
+        assert!(overflow.recovery_required);
+        assert!(overflow.overflowed_frames > 0);
+        assert_eq!(holdback.pending_totals(), (0, 0));
+    }
+
+    #[test]
+    fn keyframe_barrier_bounds_stream_states_and_evicts_least_recently_used() {
+        let now = Instant::now();
+        let mut holdback = VideoEpochHoldback::default();
+        for display in 0..MAX_VIDEO_EPOCH_STREAM_STATES {
+            let info = VideoSourceInfo {
+                key: VideoStreamKey {
+                    display: display as i32,
+                    stream_id: display as u64 + 1,
+                },
+                frame_id: 1,
+                keyframe: true,
+            };
+            holdback.accept_keyframe(info, Bytes::from_static(b"keyframe"), now);
+        }
+
+        let primary = VideoSourceInfo {
+            key: VideoStreamKey {
+                display: 0,
+                stream_id: 1,
+            },
+            frame_id: 2,
+            keyframe: true,
+        };
+        holdback.accept_keyframe(primary, Bytes::from_static(b"keyframe"), now);
+        let newest = VideoSourceInfo {
+            key: VideoStreamKey {
+                display: MAX_VIDEO_EPOCH_STREAM_STATES as i32,
+                stream_id: MAX_VIDEO_EPOCH_STREAM_STATES as u64 + 1,
+            },
+            frame_id: 1,
+            keyframe: true,
+        };
+        holdback.accept_keyframe(newest, Bytes::from_static(b"keyframe"), now);
+
+        assert_eq!(holdback.streams.len(), MAX_VIDEO_EPOCH_STREAM_STATES);
+        assert!(holdback.streams.contains_key(&primary.key));
+        assert!(!holdback.streams.contains_key(&VideoStreamKey {
+            display: 1,
+            stream_id: 2,
+        }));
+    }
+
+    #[test]
     fn receiver_recovery_serializes_scoped_reference_refresh_for_v3() {
         let (inbound, _inbound_rx) = mpsc::channel(1);
         let (control, mut control_rx) = mpsc::channel(1);
@@ -2393,6 +3031,7 @@ mod tests {
             &inbound,
             &control,
             true,
+            false,
             &metrics,
             &recovery,
             Instant::now(),
@@ -2429,6 +3068,7 @@ mod tests {
             &inbound,
             &control,
             false,
+            false,
             &metrics,
             &recovery,
             Instant::now(),
@@ -2458,6 +3098,7 @@ mod tests {
             &inbound,
             &control,
             true,
+            false,
             &metrics,
             &recovery,
             Instant::now(),
@@ -2735,8 +3376,9 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(client_stream.stats().application_protocol, 3);
+        assert_eq!(client_stream.stats().application_protocol, 4);
         assert!(client_stream.stats().reliable_keyframes);
+        assert!(client_stream.stats().reliable_keyframe_barrier);
         assert!(client_stream.stats().reliable_keyframes_sent >= 1);
         assert!(server_stream.stats().reliable_keyframes_received >= 1);
 
