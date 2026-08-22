@@ -55,6 +55,7 @@ const AUDIO_OUTBOUND_CAPACITY: usize = 64;
 const CHANNEL_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 const V2_MAX_APPLICATION_DATAGRAM_SIZE: usize = 1300;
 const VIDEO_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const VIDEO_KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const VIDEO_KEYFRAME_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const VIDEO_KEYFRAME_RETRY_MAX_ATTEMPTS: u8 = 3;
 const VIDEO_KEYFRAME_RECOVERY_CYCLE_COOLDOWN: Duration = Duration::from_secs(10);
@@ -475,6 +476,7 @@ struct VideoReceiveRecovery {
     streams: BTreeMap<VideoStreamKey, VideoReceiveState>,
     last_observed: Option<VideoSourceInfo>,
     pending_request: Option<PendingVideoRecovery>,
+    last_keyframe_request_at: Option<Instant>,
 }
 
 impl VideoReceiveRecovery {
@@ -494,6 +496,10 @@ impl VideoReceiveRecovery {
             return VideoReceiveDecision::Accept;
         }
         if info.keyframe {
+            let replaced_stream = self
+                .streams
+                .keys()
+                .any(|key| key.display == info.key.display && *key != info.key);
             self.streams.retain(|key, _| {
                 key.display != info.key.display || key.stream_id == info.key.stream_id
             });
@@ -503,6 +509,9 @@ impl VideoReceiveRecovery {
                 })
             }) {
                 self.pending_request = None;
+            }
+            if replaced_stream {
+                self.last_keyframe_request_at = None;
             }
         }
         if !self.streams.contains_key(&info.key) && self.streams.len() >= MAX_VIDEO_STREAM_STATES {
@@ -579,6 +588,13 @@ impl VideoReceiveRecovery {
                 .zip(source)
                 .is_some_and(|(pending, source)| pending.key != source.key)
         });
+        if !is_new_stream
+            && self.last_keyframe_request_at.is_some_and(|last| {
+                now.saturating_duration_since(last) < VIDEO_KEYFRAME_REQUEST_MIN_INTERVAL
+            })
+        {
+            return None;
+        }
         let due = match self.pending_request {
             None => true,
             Some(_) if is_new_stream => true,
@@ -609,6 +625,7 @@ impl VideoReceiveRecovery {
             requested_at: now,
             retries,
         });
+        self.last_keyframe_request_at = Some(now);
         match (scoped_reference_refresh, source) {
             (true, Some(source)) => {
                 video_reference_refresh(source, dropped_frames).map(VideoKeyframeRequest::Scoped)
@@ -2910,6 +2927,16 @@ mod tests {
             VideoReceiveDecision::Accept
         );
         assert!(recovery.pending_request.is_none());
+        assert_eq!(
+            recovery.observe(source_video(7, 9, false)),
+            VideoReceiveDecision::SuppressAfterGap
+        );
+        assert!(recovery
+            .next_keyframe_request(now + Duration::from_millis(999), true, 1)
+            .is_none());
+        assert!(recovery
+            .next_keyframe_request(now + VIDEO_KEYFRAME_REQUEST_MIN_INTERVAL, true, 1)
+            .is_some());
     }
 
     #[test]
