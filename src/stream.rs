@@ -606,6 +606,27 @@ impl Stream {
     }
 
     #[cfg(feature = "quic-transport")]
+    pub fn begin_quic_teardown(&self, reason: &[u8]) -> bool {
+        match self {
+            Self::Quic(stream) => {
+                stream.begin_teardown(reason);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    #[cfg(feature = "quic-transport")]
+    pub async fn wait_quic_closed(&self, timeout: Duration) -> bool {
+        match self {
+            Self::Quic(stream) => tokio::time::timeout(timeout, stream.wait_closed())
+                .await
+                .is_ok(),
+            _ => false,
+        }
+    }
+
+    #[cfg(feature = "quic-transport")]
     pub fn quic_peer_binding(&self) -> Option<&crate::transport::quic::QuicPeerBinding> {
         match self {
             Self::Quic(stream) => Some(stream.peer_binding()),
@@ -800,7 +821,11 @@ impl Stream {
                     .await
             }
             #[cfg(feature = "quic-transport")]
-            Self::Quic(stream) => stream.enqueue(Bytes::from(msg.write_to_bytes()?)),
+            Self::Quic(stream) => {
+                stream
+                    .enqueue_control_and_wait(Bytes::from(msg.write_to_bytes()?))
+                    .await
+            }
             _ => self.send(msg).await,
         }
     }

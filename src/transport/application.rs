@@ -9,7 +9,7 @@ use super::{
     protocol::MessageType,
     quic::{
         negotiated_application_protocol, AuthenticatedControlChannel, QuicApplicationProtocol,
-        QuicConnectionStats, QuicPeerBinding, QuicTransportError,
+        QuicConnectionStats, QuicPeerBinding, QuicTransportError, ReliableKeyframeMark,
     },
     reliable::{
         ReliableChannel, ReliableChannelKind, ReliableChannelReceiver, ReliableChannelSender,
@@ -41,7 +41,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::{mpsc, Notify},
+    sync::{mpsc, oneshot, Notify},
     task::JoinHandle,
 };
 
@@ -60,10 +60,19 @@ const VIDEO_KEYFRAME_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const VIDEO_KEYFRAME_RETRY_MAX_ATTEMPTS: u8 = 3;
 const VIDEO_KEYFRAME_RECOVERY_CYCLE_COOLDOWN: Duration = Duration::from_secs(10);
 const VIDEO_EPOCH_HOLDBACK_TIMEOUT: Duration = Duration::from_secs(2);
+const VIDEO_EPOCH_REORDER_MIN: Duration = Duration::from_millis(40);
+const VIDEO_EPOCH_REORDER_MAX: Duration = Duration::from_millis(120);
+const VIDEO_EPOCH_REORDER_JITTER: Duration = Duration::from_millis(10);
 const VIDEO_EPOCH_HOLDBACK_MAX_FRAMES: usize = 120;
 const VIDEO_EPOCH_HOLDBACK_MAX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_VIDEO_EPOCH_STREAM_STATES: usize = 8;
 const MAX_VIDEO_STREAM_STATES: usize = 16;
+
+fn video_epoch_reorder_window(rtt: Duration) -> Duration {
+    rtt.saturating_mul(2)
+        .saturating_add(VIDEO_EPOCH_REORDER_JITTER)
+        .clamp(VIDEO_EPOCH_REORDER_MIN, VIDEO_EPOCH_REORDER_MAX)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApplicationQuicRole {
@@ -91,6 +100,7 @@ enum ApplicationClass {
 struct ReliableOutbound {
     message_type: MessageType,
     payload: Bytes,
+    completion: Option<oneshot::Sender<Result<(), String>>>,
 }
 
 struct ReliableVideoReceiveContext {
@@ -111,6 +121,14 @@ enum LocalVideoRefresh {
     Reference(VideoReferenceRefresh),
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ReliableKeyframeState {
+    display: i32,
+    stream_id: u64,
+    barrier_epoch: u64,
+    sent_at: Instant,
+}
+
 #[derive(Default)]
 struct QuicApplicationMetrics {
     video_reassembly_drops: AtomicU64,
@@ -127,15 +145,21 @@ struct QuicApplicationMetrics {
     video_reassembly_last_frame_fragments: AtomicU64,
     video_keyframe_requests: AtomicU64,
     reliable_keyframes_sent: AtomicU64,
+    reliable_keyframe_last_bytes: AtomicU64,
+    reliable_keyframe_last_state: Mutex<Option<ReliableKeyframeState>>,
     reliable_keyframes_received: AtomicU64,
     video_source_frame_gaps: AtomicU64,
     video_recovery_suppressed_frames: AtomicU64,
     video_sender_replacements: AtomicU64,
     video_sender_reference_resets: AtomicU64,
+    video_datagram_frames_rejected_teardown: AtomicU64,
+    video_frames_discarded_teardown: AtomicU64,
     video_keyframe_barrier_held: AtomicU64,
     video_keyframe_barrier_released: AtomicU64,
     video_keyframe_barrier_timeouts: AtomicU64,
     video_keyframe_barrier_overflows: AtomicU64,
+    video_keyframe_barrier_gap_events: AtomicU64,
+    video_keyframe_barrier_gap_skipped_frames: AtomicU64,
     video_delivery_lock: Mutex<()>,
     video_receive_recovery: Mutex<VideoReceiveRecovery>,
     video_epoch_holdback: Mutex<VideoEpochHoldback>,
@@ -187,7 +211,7 @@ impl VideoSendRecovery {
                 .fetch_add(1, Ordering::Relaxed);
             if self.scoped_reference_refresh {
                 if let Some(refresh) = source_info
-                    .and_then(|info| video_reference_refresh(info, 1))
+                    .and_then(|info| video_reference_refresh(info, 1, false))
                     .map(LocalVideoRefresh::Reference)
                 {
                     let _ = self.refresh.try_send(refresh);
@@ -243,6 +267,7 @@ struct VideoSourceInfo {
     key: VideoStreamKey,
     frame_id: u64,
     keyframe: bool,
+    codec: VideoCodec,
 }
 
 struct HeldVideoFrame {
@@ -258,6 +283,7 @@ struct VideoEpochStreamState {
     next_frame_id: u64,
     pending: BTreeMap<(u64, u64), HeldVideoFrame>,
     pending_bytes: usize,
+    gap_started_at: Option<Instant>,
     last_activity: u64,
 }
 
@@ -273,6 +299,9 @@ struct VideoHoldbackOutcome {
     held_frames: usize,
     released_frames: usize,
     recovery_required: bool,
+    strict_recovery_required: bool,
+    gap_events: usize,
+    gap_skipped_frames: u64,
     timed_out_frames: usize,
     overflowed_frames: usize,
 }
@@ -293,6 +322,7 @@ impl VideoEpochHoldback {
                             .overflowed_frames
                             .saturating_add(state.pending.len());
                         outcome.recovery_required = true;
+                        outcome.strict_recovery_required = true;
                     }
                 }
             }
@@ -306,10 +336,12 @@ impl VideoEpochHoldback {
         reference_epoch: u64,
         payload: Bytes,
         now: Instant,
+        reorder_window: Duration,
     ) -> VideoHoldbackOutcome {
-        let mut outcome = self.expire(now);
+        let mut outcome = self.expire(now, reorder_window);
         if reference_epoch == 0 {
             outcome.recovery_required = true;
+            outcome.strict_recovery_required = true;
             return outcome;
         }
         let stream_key = info.key;
@@ -348,12 +380,20 @@ impl VideoEpochHoldback {
         if frames > VIDEO_EPOCH_HOLDBACK_MAX_FRAMES || bytes > VIDEO_EPOCH_HOLDBACK_MAX_BYTES {
             outcome.overflowed_frames = outcome.overflowed_frames.saturating_add(frames);
             outcome.recovery_required = true;
+            outcome.strict_recovery_required = true;
             self.clear_pending();
             return outcome;
         }
         if let Some(state) = self.streams.get_mut(&stream_key) {
-            let (ready, released_frames) = Self::drain_ready(state);
+            let (ready, released_frames, skipped_frames) =
+                Self::drain_ready(state, now, reorder_window);
             outcome.released_frames = outcome.released_frames.saturating_add(released_frames);
+            if skipped_frames > 0 {
+                outcome.gap_events = outcome.gap_events.saturating_add(1);
+                outcome.gap_skipped_frames =
+                    outcome.gap_skipped_frames.saturating_add(skipped_frames);
+                outcome.recovery_required = true;
+            }
             outcome.ready.extend(ready);
         }
         outcome
@@ -364,15 +404,17 @@ impl VideoEpochHoldback {
         info: VideoSourceInfo,
         payload: Bytes,
         now: Instant,
+        reorder_window: Duration,
     ) -> VideoHoldbackOutcome {
         self.streams.retain(|key, _| {
             key.display != info.key.display || key.stream_id == info.key.stream_id
         });
-        let mut outcome = self.expire(now);
+        let mut outcome = self.expire(now, reorder_window);
         self.prepare_stream(info.key, &mut outcome);
         let state = self.streams.entry(info.key).or_default();
         state.current_epoch = info.frame_id;
         state.next_frame_id = info.frame_id.saturating_add(1);
+        state.gap_started_at = None;
         let obsolete = state
             .pending
             .keys()
@@ -385,36 +427,85 @@ impl VideoEpochHoldback {
             }
         }
         outcome.ready.push((info, payload));
-        let (ready, released_frames) = Self::drain_ready(state);
+        let (ready, released_frames, skipped_frames) =
+            Self::drain_ready(state, now, reorder_window);
         outcome.released_frames = outcome.released_frames.saturating_add(released_frames);
+        if skipped_frames > 0 {
+            outcome.gap_events = outcome.gap_events.saturating_add(1);
+            outcome.gap_skipped_frames = outcome.gap_skipped_frames.saturating_add(skipped_frames);
+            outcome.recovery_required = true;
+        }
         outcome.ready.extend(ready);
         outcome
     }
 
-    fn expire(&mut self, now: Instant) -> VideoHoldbackOutcome {
+    fn expire(&mut self, now: Instant, reorder_window: Duration) -> VideoHoldbackOutcome {
         let mut outcome = VideoHoldbackOutcome::default();
         for state in self.streams.values_mut() {
-            let timed_out = state.pending.values().any(|frame| {
-                now.saturating_duration_since(frame.received_at) >= VIDEO_EPOCH_HOLDBACK_TIMEOUT
-            });
-            if timed_out {
-                outcome.timed_out_frames =
-                    outcome.timed_out_frames.saturating_add(state.pending.len());
+            let (ready, released_frames, skipped_frames) =
+                Self::drain_ready(state, now, reorder_window);
+            outcome.released_frames = outcome.released_frames.saturating_add(released_frames);
+            outcome.ready.extend(ready);
+            if skipped_frames > 0 {
+                outcome.gap_events = outcome.gap_events.saturating_add(1);
+                outcome.gap_skipped_frames =
+                    outcome.gap_skipped_frames.saturating_add(skipped_frames);
                 outcome.recovery_required = true;
-                state.pending.clear();
-                state.pending_bytes = 0;
+            }
+            let timed_out = state
+                .pending
+                .iter()
+                .filter_map(|(key, frame)| {
+                    (now.saturating_duration_since(frame.received_at)
+                        >= VIDEO_EPOCH_HOLDBACK_TIMEOUT)
+                        .then_some(*key)
+                })
+                .collect::<Vec<_>>();
+            for key in timed_out {
+                if let Some(frame) = state.pending.remove(&key) {
+                    state.pending_bytes = state.pending_bytes.saturating_sub(frame.payload.len());
+                    outcome.timed_out_frames = outcome.timed_out_frames.saturating_add(1);
+                }
+            }
+            if outcome.timed_out_frames > 0 {
+                outcome.recovery_required = true;
+                outcome.strict_recovery_required = true;
             }
         }
         outcome
     }
 
-    fn drain_ready(state: &mut VideoEpochStreamState) -> (Vec<(VideoSourceInfo, Bytes)>, usize) {
+    fn drain_ready(
+        state: &mut VideoEpochStreamState,
+        now: Instant,
+        reorder_window: Duration,
+    ) -> (Vec<(VideoSourceInfo, Bytes)>, usize, u64) {
         let mut ready = Vec::new();
         let mut released_frames = 0usize;
+        let mut skipped_frames = 0u64;
         while state.current_epoch != 0 && state.next_frame_id != 0 {
             let key = (state.current_epoch, state.next_frame_id);
-            let Some(frame) = state.pending.remove(&key) else {
-                break;
+            let frame = if let Some(frame) = state.pending.remove(&key) {
+                state.gap_started_at = None;
+                frame
+            } else {
+                let next_available = state.pending.keys().find_map(|(epoch, frame_id)| {
+                    (*epoch == state.current_epoch && *frame_id > state.next_frame_id)
+                        .then_some(*frame_id)
+                });
+                let Some(next_available) = next_available else {
+                    state.gap_started_at = None;
+                    break;
+                };
+                let gap_started_at = state.gap_started_at.get_or_insert(now);
+                if now.saturating_duration_since(*gap_started_at) < reorder_window {
+                    break;
+                }
+                skipped_frames = skipped_frames
+                    .saturating_add(next_available.saturating_sub(state.next_frame_id));
+                state.next_frame_id = next_available;
+                state.gap_started_at = None;
+                continue;
             };
             state.pending_bytes = state.pending_bytes.saturating_sub(frame.payload.len());
             state.next_frame_id = state.next_frame_id.saturating_add(1);
@@ -423,7 +514,7 @@ impl VideoEpochHoldback {
             }
             ready.push((frame.info, frame.payload));
         }
-        (ready, released_frames)
+        (ready, released_frames, skipped_frames)
     }
 
     fn pending_totals(&self) -> (usize, usize) {
@@ -441,6 +532,7 @@ impl VideoEpochHoldback {
         for state in self.streams.values_mut() {
             state.pending.clear();
             state.pending_bytes = 0;
+            state.gap_started_at = None;
         }
     }
 }
@@ -449,11 +541,20 @@ impl VideoEpochHoldback {
 struct VideoReceiveState {
     last_frame_id: u64,
     awaiting_keyframe: bool,
+    codec: Option<VideoCodec>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VideoPayloadDelivery {
+    alive: bool,
+    needs_keyframe: bool,
+    strict_recovery: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum VideoReceiveDecision {
     Accept,
+    AcceptAfterGap,
     Suppress,
     SuppressAfterGap,
 }
@@ -463,6 +564,7 @@ struct PendingVideoRecovery {
     source: Option<VideoSourceInfo>,
     requested_at: Instant,
     retries: u8,
+    strict_recovery: bool,
 }
 
 #[derive(Debug)]
@@ -488,10 +590,14 @@ impl VideoReceiveRecovery {
             self.streams.pop_first();
         }
         self.last_observed = Some(info);
-        self.streams.entry(info.key).or_default();
+        self.streams.entry(info.key).or_default().codec = Some(info.codec);
     }
 
-    fn observe(&mut self, info: VideoSourceInfo) -> VideoReceiveDecision {
+    fn observe(
+        &mut self,
+        info: VideoSourceInfo,
+        strict_gap_recovery: bool,
+    ) -> VideoReceiveDecision {
         if info.key.stream_id == 0 || info.frame_id == 0 {
             return VideoReceiveDecision::Accept;
         }
@@ -519,6 +625,7 @@ impl VideoReceiveRecovery {
         }
         self.last_observed = Some(info);
         let state = self.streams.entry(info.key).or_default();
+        state.codec = Some(info.codec);
         if info.keyframe {
             if self.pending_request.is_some_and(|pending| {
                 pending
@@ -539,8 +646,12 @@ impl VideoReceiveRecovery {
             return VideoReceiveDecision::Suppress;
         }
         if info.frame_id != state.last_frame_id.saturating_add(1) {
-            state.awaiting_keyframe = true;
-            return VideoReceiveDecision::SuppressAfterGap;
+            if strict_gap_recovery {
+                state.awaiting_keyframe = true;
+                return VideoReceiveDecision::SuppressAfterGap;
+            }
+            state.last_frame_id = info.frame_id;
+            return VideoReceiveDecision::AcceptAfterGap;
         }
         state.last_frame_id = info.frame_id;
         VideoReceiveDecision::Accept
@@ -561,6 +672,7 @@ impl VideoReceiveRecovery {
                 key: *key,
                 frame_id: state.last_frame_id,
                 keyframe: false,
+                codec: state.codec.unwrap_or(VideoCodec::Raw),
             })
         })
     }
@@ -571,11 +683,27 @@ impl VideoReceiveRecovery {
             .is_some_and(|state| state.awaiting_keyframe)
     }
 
+    #[cfg(test)]
     fn next_keyframe_request(
         &mut self,
         now: Instant,
         scoped_reference_refresh: bool,
         dropped_frames: u64,
+    ) -> Option<VideoKeyframeRequest> {
+        self.next_keyframe_request_with_recovery(
+            now,
+            scoped_reference_refresh,
+            dropped_frames,
+            false,
+        )
+    }
+
+    fn next_keyframe_request_with_recovery(
+        &mut self,
+        now: Instant,
+        scoped_reference_refresh: bool,
+        dropped_frames: u64,
+        strict_recovery: bool,
     ) -> Option<VideoKeyframeRequest> {
         let source = self.latest_source();
         if scoped_reference_refresh && source.is_none() {
@@ -588,7 +716,16 @@ impl VideoReceiveRecovery {
                 .zip(source)
                 .is_some_and(|(pending, source)| pending.key != source.key)
         });
+        // Reassembly can request an advisory refresh before the reorder window
+        // confirms a reference gap. Let that request become strict immediately;
+        // otherwise the minimum interval can leave the decoder suppressed.
+        let strict_escalation = scoped_reference_refresh
+            && strict_recovery
+            && !self
+                .pending_request
+                .is_some_and(|pending| pending.strict_recovery);
         if !is_new_stream
+            && !strict_escalation
             && self.last_keyframe_request_at.is_some_and(|last| {
                 now.saturating_duration_since(last) < VIDEO_KEYFRAME_REQUEST_MIN_INTERVAL
             })
@@ -608,27 +745,49 @@ impl VideoReceiveRecovery {
                     >= VIDEO_KEYFRAME_RECOVERY_CYCLE_COOLDOWN
             }
         };
-        if !due {
+        if !due && !strict_escalation {
             return None;
         }
 
-        let retries = match self.pending_request {
-            Some(pending)
-                if !is_new_stream && pending.retries < VIDEO_KEYFRAME_RETRY_MAX_ATTEMPTS =>
-            {
-                pending.retries.saturating_add(1)
+        let retries = if strict_escalation {
+            self.pending_request.map_or(0, |pending| pending.retries)
+        } else {
+            match self.pending_request {
+                Some(pending)
+                    if !is_new_stream && pending.retries < VIDEO_KEYFRAME_RETRY_MAX_ATTEMPTS =>
+                {
+                    pending.retries.saturating_add(1)
+                }
+                _ => 0,
             }
-            _ => 0,
         };
+        let strict_recovery = strict_recovery
+            || (!is_new_stream
+                && self
+                    .pending_request
+                    .is_some_and(|pending| pending.strict_recovery));
+        if strict_escalation {
+            if let Some(source) = source {
+                log::debug!(
+                    "QUIC video recovery escalated pending advisory to strict: display={}, stream={}, received={}, previous_retries={}",
+                    source.key.display,
+                    source.key.stream_id,
+                    source.frame_id,
+                    self.pending_request.map_or(0, |pending| pending.retries),
+                );
+            }
+        }
         self.pending_request = Some(PendingVideoRecovery {
             source,
             requested_at: now,
             retries,
+            strict_recovery,
         });
         self.last_keyframe_request_at = Some(now);
         match (scoped_reference_refresh, source) {
             (true, Some(source)) => {
-                video_reference_refresh(source, dropped_frames).map(VideoKeyframeRequest::Scoped)
+                video_reference_refresh(source, dropped_frames, strict_recovery)
+                    .map(VideoKeyframeRequest::Scoped)
             }
             (false, _) => Some(VideoKeyframeRequest::Legacy),
             (true, None) => None,
@@ -810,6 +969,7 @@ pub struct QuicApplicationStream {
     next_transport_frame_id: AtomicU64,
     video_ordering: Arc<VideoOrderingGate>,
     raw_mode: AtomicBool,
+    closing: Arc<AtomicBool>,
     agreement: SessionAgreement,
     application_protocol: QuicApplicationProtocol,
     metrics: Arc<QuicApplicationMetrics>,
@@ -846,6 +1006,7 @@ impl QuicApplicationStream {
         let mut tasks = Vec::with_capacity(16);
         let video_ordering = VideoOrderingGate::new();
         let metrics = Arc::new(QuicApplicationMetrics::default());
+        let closing = Arc::new(AtomicBool::new(false));
         let (video_refresh_tx, video_refresh_rx) = mpsc::channel(1);
         let video_send_recovery = VideoSendRecovery::new(
             video_refresh_tx,
@@ -953,6 +1114,7 @@ impl QuicApplicationStream {
             reliable_video_sender,
             video_send_recovery.clone(),
             agreement.reliable_keyframe_barrier,
+            closing.clone(),
         )));
         tasks.push(tokio::spawn(run_mouse_writer(
             QuicDatagramSender::new(connection.clone(), session_id)
@@ -1020,6 +1182,7 @@ impl QuicApplicationStream {
             next_transport_frame_id: AtomicU64::new(1),
             video_ordering,
             raw_mode: AtomicBool::new(false),
+            closing,
             agreement,
             application_protocol,
             metrics,
@@ -1030,12 +1193,33 @@ impl QuicApplicationStream {
     }
 
     pub fn enqueue(&self, payload: Bytes) -> crate::ResultType<()> {
+        if self.closing.load(Ordering::Acquire) {
+            if !self.raw_mode.load(Ordering::Acquire)
+                && Message::parse_from_bytes(&payload)
+                    .ok()
+                    .and_then(|message| classify_message(&message).ok())
+                    .is_some_and(|class| matches!(class, ApplicationClass::Video(_)))
+            {
+                self.metrics
+                    .video_frames_discarded_teardown
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            return Ok(());
+        }
+        if let Some(reason) = self.connection.close_reason() {
+            return Err(Error::new(
+                ErrorKind::BrokenPipe,
+                format!("QUIC application connection closed: {reason}"),
+            )
+            .into());
+        }
         if self.raw_mode.load(Ordering::Acquire) {
             return self
                 .control
                 .try_send(ReliableOutbound {
                     message_type: MessageType::ApplicationRaw,
                     payload,
+                    completion: None,
                 })
                 .map_err(map_try_send_error);
         }
@@ -1053,6 +1237,7 @@ impl QuicApplicationStream {
             return match self.control.try_send(ReliableOutbound {
                 message_type: MessageType::VideoOrdering,
                 payload: Bytes::from(ordered_payload),
+                completion: None,
             }) {
                 Ok(()) => Ok(()),
                 Err(error) => {
@@ -1134,10 +1319,67 @@ impl QuicApplicationStream {
                     .try_send(ReliableOutbound {
                         message_type,
                         payload,
+                        completion: None,
                     })
                     .map_err(map_try_send_error)
             }
         }
+    }
+
+    pub async fn enqueue_control_and_wait(&self, payload: Bytes) -> crate::ResultType<()> {
+        if self.closing.load(Ordering::Acquire) {
+            return Err(Error::new(ErrorKind::BrokenPipe, "QUIC application is closing").into());
+        }
+        if let Some(reason) = self.connection.close_reason() {
+            return Err(Error::new(
+                ErrorKind::BrokenPipe,
+                format!("QUIC application connection closed: {reason}"),
+            )
+            .into());
+        }
+        if self.raw_mode.load(Ordering::Acquire) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "confirmed QUIC control writes are unavailable in raw mode",
+            )
+            .into());
+        }
+        let message = Message::parse_from_bytes(&payload)
+            .map_err(|error| Error::new(ErrorKind::InvalidData, error.to_string()))?;
+        if !matches!(classify_message(&message)?, ApplicationClass::Control) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "confirmed QUIC write requires an application control message",
+            )
+            .into());
+        }
+        let (completion, completed) = oneshot::channel();
+        self.control
+            .send(ReliableOutbound {
+                message_type: MessageType::ApplicationControl,
+                payload,
+                completion: Some(completion),
+            })
+            .await
+            .map_err(|_| {
+                Error::new(
+                    ErrorKind::BrokenPipe,
+                    "QUIC application control writer is closed",
+                )
+            })?;
+        match completed.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(detail)) => Err(Error::new(ErrorKind::BrokenPipe, detail).into()),
+            Err(_) => Err(Error::new(
+                ErrorKind::BrokenPipe,
+                "QUIC application control writer stopped before confirmation",
+            )
+            .into()),
+        }
+    }
+
+    pub async fn wait_closed(&self) {
+        let _ = self.connection.closed().await;
     }
 
     fn enqueue_audio(&self, payload: Bytes) -> crate::ResultType<()> {
@@ -1148,6 +1390,7 @@ impl QuicApplicationStream {
                 .try_send(ReliableOutbound {
                     message_type: MessageType::ApplicationControl,
                     payload,
+                    completion: None,
                 })
                 .map_err(map_try_send_error);
         };
@@ -1242,6 +1485,24 @@ impl QuicApplicationStream {
             self.metrics.video_keyframe_requests.load(Ordering::Relaxed);
         stats.reliable_keyframes_sent =
             self.metrics.reliable_keyframes_sent.load(Ordering::Relaxed);
+        stats.reliable_keyframe_last_bytes = self
+            .metrics
+            .reliable_keyframe_last_bytes
+            .load(Ordering::Relaxed);
+        stats.reliable_keyframe_last_mark = self
+            .metrics
+            .reliable_keyframe_last_state
+            .lock()
+            .unwrap()
+            .map(|state| ReliableKeyframeMark {
+                display: state.display,
+                stream_id: state.stream_id,
+                barrier_epoch: state.barrier_epoch,
+                age_us: Instant::now()
+                    .saturating_duration_since(state.sent_at)
+                    .as_micros()
+                    .min(u128::from(u64::MAX)) as u64,
+            });
         stats.reliable_keyframes_received = self
             .metrics
             .reliable_keyframes_received
@@ -1276,14 +1537,39 @@ impl QuicApplicationStream {
             .metrics
             .video_keyframe_barrier_overflows
             .load(Ordering::Relaxed);
+        stats.video_keyframe_barrier_gap_events = self
+            .metrics
+            .video_keyframe_barrier_gap_events
+            .load(Ordering::Relaxed);
+        stats.video_keyframe_barrier_gap_skipped_frames = self
+            .metrics
+            .video_keyframe_barrier_gap_skipped_frames
+            .load(Ordering::Relaxed);
+        let rejected_teardown = self
+            .metrics
+            .video_datagram_frames_rejected_teardown
+            .load(Ordering::Relaxed);
         let datagram_send = self.datagram_send.stats();
+        let rejected_teardown = rejected_teardown.min(datagram_send.video_frames_rejected);
         stats.video_datagram_frames_sent = datagram_send.video_frames_sent;
         stats.video_datagram_frames_rejected = datagram_send.video_frames_rejected;
+        stats.video_datagram_frames_rejected_teardown = rejected_teardown;
+        stats.video_datagram_frames_rejected_active = datagram_send
+            .video_frames_rejected
+            .saturating_sub(rejected_teardown);
+        stats.video_frames_discarded_teardown = self
+            .metrics
+            .video_frames_discarded_teardown
+            .load(Ordering::Relaxed);
         stats.video_datagrams_sent = datagram_send.video_datagrams_sent;
         stats.video_datagram_frame_bytes = datagram_send.video_frame_bytes;
         stats.video_datagram_frame_bytes_peak = datagram_send.video_frame_bytes_peak;
         stats.video_datagram_frame_fragments = datagram_send.video_frame_fragments;
         stats.video_datagram_frame_fragments_peak = datagram_send.video_frame_fragments_peak;
+        stats.video_datagram_frame_bytes_p95 = datagram_send.video_frame_datagram_bytes_p95;
+        stats.video_datagram_frame_bytes_p99 = datagram_send.video_frame_datagram_bytes_p99;
+        stats.video_datagram_required_bytes_p95 = datagram_send.video_frame_required_bytes_p95;
+        stats.video_datagram_required_bytes_p99 = datagram_send.video_frame_required_bytes_p99;
         stats.datagram_send_buffer_space = datagram_send.send_buffer_space;
         stats.datagram_send_buffer_space_min = datagram_send.send_buffer_space_min;
         stats.datagram_send_buffer_queued = datagram_send.send_buffer_queued;
@@ -1311,12 +1597,21 @@ impl QuicApplicationStream {
     pub fn set_raw(&self) {
         self.raw_mode.store(true, Ordering::Release);
     }
+
+    pub fn begin_teardown(&self, reason: &[u8]) {
+        if !self.closing.swap(true, Ordering::AcqRel) {
+            log::debug!(
+                "QUIC application teardown started: {}",
+                String::from_utf8_lossy(reason)
+            );
+            self.connection.close(0u32.into(), reason);
+        }
+    }
 }
 
 impl Drop for QuicApplicationStream {
     fn drop(&mut self) {
-        self.connection
-            .close(0u32.into(), b"application stream dropped");
+        self.begin_teardown(b"application stream dropped");
         for task in &self.tasks {
             task.abort();
         }
@@ -1573,8 +1868,13 @@ async fn run_reliable_writer(
 ) {
     let started = Instant::now();
     while let Some(message) = outbound.recv().await {
+        let ReliableOutbound {
+            message_type,
+            payload,
+            completion,
+        } = message;
         if let Some(kbps) = bandwidth_limit_kbps.filter(|value| *value > 0) {
-            let bits = (message.payload.len() as u128).saturating_mul(8);
+            let bits = (payload.len() as u128).saturating_mul(8);
             let delay_us = bits
                 .saturating_mul(1_000)
                 .div_ceil(u128::from(kbps))
@@ -1582,12 +1882,20 @@ async fn run_reliable_writer(
             tokio::time::sleep(Duration::from_micros(delay_us)).await;
         }
         let timestamp = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-        if let Err(error) = sender
-            .send(message.message_type, 0, timestamp, &message.payload)
-            .await
-        {
-            report_terminal_error(&inbound, &connection, error.to_string()).await;
-            return;
+        match sender.send(message_type, 0, timestamp, &payload).await {
+            Ok(_) => {
+                if let Some(completion) = completion {
+                    let _ = completion.send(Ok(()));
+                }
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                if let Some(completion) = completion {
+                    let _ = completion.send(Err(detail.clone()));
+                }
+                report_terminal_error(&inbound, &connection, detail).await;
+                return;
+            }
         }
     }
     let _ = sender.finish();
@@ -1653,6 +1961,7 @@ async fn run_reliable_reader(
                         .send(ReliableOutbound {
                             message_type: MessageType::VideoOrderingAck,
                             payload: Bytes::copy_from_slice(&epoch.to_be_bytes()),
+                            completion: None,
                         })
                         .await
                         .is_err()
@@ -1713,17 +2022,25 @@ async fn run_reliable_reader(
                         info,
                         Bytes::copy_from_slice(&message.payload),
                         Instant::now(),
+                        video_epoch_reorder_window(connection.stats().path.rtt),
                     );
+                let path = connection.stats().path;
                 log::debug!(
-                    "QUIC video keyframe barrier opened: display={}, stream={}, epoch={}, released_frames={}",
+                    "QUIC video keyframe barrier opened: display={}, stream={}, epoch={}, released_frames={}, rtt_us={}, cwnd={}, lost_packets={}, lost_bytes={}, sent_packets={}",
                     info.key.display,
                     info.key.stream_id,
                     info.frame_id,
                     outcome.released_frames,
+                    path.rtt.as_micros(),
+                    path.cwnd,
+                    path.lost_packets,
+                    path.lost_bytes,
+                    path.sent_packets,
                 );
                 record_video_holdback_metrics(&outcome, &metrics);
                 let mut needs_keyframe = outcome.recovery_required;
-                if needs_keyframe {
+                let mut strict_recovery_required = outcome.strict_recovery_required;
+                if outcome.strict_recovery_required {
                     metrics
                         .video_receive_recovery
                         .lock()
@@ -1731,17 +2048,19 @@ async fn run_reliable_reader(
                         .mark_reference_loss();
                 }
                 for (ready_info, payload) in outcome.ready {
-                    let (alive, frame_needs_keyframe) = deliver_video_payload(
+                    let delivery = deliver_video_payload(
                         ready_info,
                         payload,
                         &inbound,
                         &metrics,
                         &metrics.video_receive_recovery,
+                        false,
                     );
-                    if !alive {
+                    if !delivery.alive {
                         return;
                     }
-                    needs_keyframe |= frame_needs_keyframe;
+                    needs_keyframe |= delivery.needs_keyframe;
+                    strict_recovery_required |= delivery.strict_recovery;
                 }
                 if needs_keyframe
                     && !request_video_keyframe(
@@ -1751,6 +2070,7 @@ async fn run_reliable_reader(
                         &metrics.video_receive_recovery,
                         Instant::now(),
                         0,
+                        strict_recovery_required,
                     )
                 {
                     return;
@@ -1769,7 +2089,11 @@ async fn run_reliable_reader(
             metrics
                 .reliable_keyframes_received
                 .fetch_add(1, Ordering::Relaxed);
-            let _ = metrics.video_receive_recovery.lock().unwrap().observe(info);
+            let _ = metrics
+                .video_receive_recovery
+                .lock()
+                .unwrap()
+                .observe(info, false);
         }
     }
 }
@@ -1802,13 +2126,25 @@ async fn run_video_writer(
     mut reliable_sender: Option<ReliableChannelSender>,
     recovery: Arc<VideoSendRecovery>,
     keyframe_barrier: bool,
+    closing: Arc<AtomicBool>,
 ) {
     let started = Instant::now();
     let mut reference_epochs = BTreeMap::<VideoStreamKey, u64>::new();
     loop {
-        let mut item = video.take().await;
+        let mut item = tokio::select! {
+            item = video.take() => item,
+            _ = connection.closed() => return,
+        };
+        if closing.load(Ordering::Acquire) || connection.close_reason().is_some() {
+            video_ordering.cancel_epoch(item.ordering_epoch);
+            return;
+        }
         while !video_ordering.is_open(item.ordering_epoch) {
             tokio::select! {
+                _ = connection.closed() => {
+                    video_ordering.cancel_epoch(item.ordering_epoch);
+                    return;
+                },
                 _ = video_ordering.wait(item.ordering_epoch) => {},
                 newer = video.take() => {
                     if should_replace_pending_video(&item, &newer) {
@@ -1857,11 +2193,33 @@ async fn run_video_writer(
                     .metrics
                     .reliable_keyframes_sent
                     .fetch_add(1, Ordering::Relaxed);
+                recovery
+                    .metrics
+                    .reliable_keyframe_last_bytes
+                    .store(item.payload.len() as u64, Ordering::Relaxed);
+                if let (Some(source), Some(barrier_epoch)) = (item.source_info, reference_epoch) {
+                    *recovery
+                        .metrics
+                        .reliable_keyframe_last_state
+                        .lock()
+                        .unwrap() = Some(ReliableKeyframeState {
+                        display: source.key.display,
+                        stream_id: source.key.stream_id,
+                        barrier_epoch,
+                        sent_at: Instant::now(),
+                    });
+                }
+                let path = connection.stats().path;
                 log::debug!(
-                    "QUIC reliable keyframe sent: frame_id={}, bytes={}, barrier_epoch={:?}",
+                    "QUIC reliable keyframe sent: frame_id={}, bytes={}, barrier_epoch={:?}, rtt_us={}, cwnd={}, lost_packets={}, lost_bytes={}, sent_packets={}",
                     item.metadata.frame_id,
                     item.payload.len(),
                     reference_epoch,
+                    path.rtt.as_micros(),
+                    path.cwnd,
+                    path.lost_packets,
+                    path.lost_bytes,
+                    path.sent_packets,
                 );
                 recovery.keyframe_sent(item.metadata.frame_id);
                 continue;
@@ -1877,9 +2235,27 @@ async fn run_video_writer(
                 video_queue_budget,
                 interactive_reserve_bytes,
                 queue_delay_us,
+                datagram_bytes_p95,
+                datagram_bytes_p99,
+                required_bytes_p95,
+                required_bytes_p99,
             }) => {
+                if closing.load(Ordering::Acquire) || connection.close_reason().is_some() {
+                    video_ordering.cancel_epoch(item.ordering_epoch);
+                    recovery
+                        .metrics
+                        .video_datagram_frames_rejected_teardown
+                        .fetch_add(1, Ordering::Relaxed);
+                    log::debug!(
+                        "QUIC video frame rejected during teardown: frame_id={}, bytes={}, reason={}",
+                        item.metadata.frame_id,
+                        item.payload.len(),
+                        failure.as_str(),
+                    );
+                    return;
+                }
                 log::warn!(
-                    "QUIC video frame rejected before DATAGRAM enqueue: frame_id={}, bytes={}, reason={}, datagram_bytes={}, available_bytes={}, queued_bytes={}, queue_budget_bytes={}, interactive_reserve_bytes={}, queue_delay_us={}",
+                    "QUIC video frame rejected before DATAGRAM enqueue: frame_id={}, bytes={}, reason={}, datagram_bytes={}, available_bytes={}, queued_bytes={}, queue_budget_bytes={}, interactive_reserve_bytes={}, queue_delay_us={}, datagram_p95_p99={}/{}, required_p95_p99={}/{}",
                     item.metadata.frame_id,
                     item.payload.len(),
                     failure.as_str(),
@@ -1889,6 +2265,10 @@ async fn run_video_writer(
                     video_queue_budget,
                     interactive_reserve_bytes,
                     queue_delay_us,
+                    datagram_bytes_p95,
+                    datagram_bytes_p99,
+                    required_bytes_p95,
+                    required_bytes_p99,
                 );
                 recovery.enter(
                     item.source_info,
@@ -1997,6 +2377,7 @@ async fn run_datagram_reader(
                         &metrics,
                         &metrics.video_receive_recovery,
                         Instant::now(),
+                        video_epoch_reorder_window(connection.stats().path.rtt),
                     )
                 {
                     return;
@@ -2019,6 +2400,7 @@ async fn run_datagram_reader(
                     &metrics,
                     &metrics.video_receive_recovery,
                     Instant::now(),
+                    video_epoch_reorder_window(connection.stats().path.rtt),
                 ) {
                     return;
                 }
@@ -2087,6 +2469,20 @@ fn record_video_holdback_metrics(outcome: &VideoHoldbackOutcome, metrics: &QuicA
         u64::try_from(outcome.overflowed_frames).unwrap_or(u64::MAX),
         Ordering::Relaxed,
     );
+    metrics.video_keyframe_barrier_gap_events.fetch_add(
+        u64::try_from(outcome.gap_events).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+    metrics
+        .video_keyframe_barrier_gap_skipped_frames
+        .fetch_add(outcome.gap_skipped_frames, Ordering::Relaxed);
+    if outcome.gap_skipped_frames > 0 {
+        log::warn!(
+            "QUIC video reorder window elapsed: gap_events={}, skipped_source_frames={}; continuing deltas while requesting a keyframe",
+            outcome.gap_events,
+            outcome.gap_skipped_frames,
+        );
+    }
     if outcome.timed_out_frames > 0 {
         log::warn!(
             "QUIC video keyframe barrier timed out: dropped_held_frames={}",
@@ -2107,34 +2503,65 @@ fn deliver_video_payload(
     inbound: &mpsc::Sender<Result<BytesMut, Error>>,
     metrics: &QuicApplicationMetrics,
     recovery: &Mutex<VideoReceiveRecovery>,
-) -> (bool, bool) {
+    strict_gap_recovery: bool,
+) -> VideoPayloadDelivery {
+    let strict_gap_recovery = strict_gap_recovery || info.codec.is_reference_sensitive();
     let decision = {
         let mut recovery = recovery.lock().unwrap();
-        recovery.observe(info)
+        recovery.observe(info, strict_gap_recovery)
     };
     match decision {
-        VideoReceiveDecision::Accept => {
+        VideoReceiveDecision::Accept | VideoReceiveDecision::AcceptAfterGap => {
+            let accepted_after_gap = decision == VideoReceiveDecision::AcceptAfterGap;
+            if accepted_after_gap {
+                log::warn!(
+                    "QUIC video source gap: display={}, stream={}, frame={}; continuing deltas while requesting a keyframe",
+                    info.key.display,
+                    info.key.stream_id,
+                    info.frame_id,
+                );
+                metrics
+                    .video_source_frame_gaps
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             match inbound.try_send(Ok(BytesMut::from(payload.as_ref()))) {
                 Ok(()) => {
-                    let needs_keyframe = info.keyframe
-                        && recovery.lock().unwrap().stream_awaiting_keyframe(info.key);
-                    (true, needs_keyframe)
+                    let needs_keyframe = accepted_after_gap
+                        || (info.keyframe
+                            && recovery.lock().unwrap().stream_awaiting_keyframe(info.key));
+                    VideoPayloadDelivery {
+                        alive: true,
+                        needs_keyframe,
+                        strict_recovery: false,
+                    }
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     recovery.lock().unwrap().mark_reference_loss();
                     metrics
                         .video_recovery_suppressed_frames
                         .fetch_add(1, Ordering::Relaxed);
-                    (true, true)
+                    VideoPayloadDelivery {
+                        alive: true,
+                        needs_keyframe: true,
+                        strict_recovery: true,
+                    }
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => (false, false),
+                Err(mpsc::error::TrySendError::Closed(_)) => VideoPayloadDelivery {
+                    alive: false,
+                    needs_keyframe: false,
+                    strict_recovery: false,
+                },
             }
         }
         VideoReceiveDecision::Suppress => {
             metrics
                 .video_recovery_suppressed_frames
                 .fetch_add(1, Ordering::Relaxed);
-            (true, true)
+            VideoPayloadDelivery {
+                alive: true,
+                needs_keyframe: true,
+                strict_recovery: strict_gap_recovery,
+            }
         }
         VideoReceiveDecision::SuppressAfterGap => {
             log::warn!(
@@ -2149,7 +2576,11 @@ fn deliver_video_payload(
             metrics
                 .video_recovery_suppressed_frames
                 .fetch_add(1, Ordering::Relaxed);
-            (true, true)
+            VideoPayloadDelivery {
+                alive: true,
+                needs_keyframe: true,
+                strict_recovery: true,
+            }
         }
     }
 }
@@ -2161,30 +2592,44 @@ fn request_video_keyframe(
     recovery: &Mutex<VideoReceiveRecovery>,
     now: Instant,
     dropped_frames: u64,
+    strict_recovery: bool,
 ) -> bool {
-    let request = recovery.lock().unwrap().next_keyframe_request(
-        now,
-        scoped_reference_refresh,
-        dropped_frames,
-    );
+    let request = recovery
+        .lock()
+        .unwrap()
+        .next_keyframe_request_with_recovery(
+            now,
+            scoped_reference_refresh,
+            dropped_frames,
+            strict_recovery,
+        );
     let Some(request) = request else {
         return true;
     };
-    let (payload, scoped) = match request {
-        VideoKeyframeRequest::Legacy => (refresh_video_message(), false),
-        VideoKeyframeRequest::Scoped(refresh) => (video_reference_refresh_message(refresh), true),
+    let (payload, scoped, request_is_strict) = match request {
+        VideoKeyframeRequest::Legacy => (refresh_video_message(), false, false),
+        VideoKeyframeRequest::Scoped(refresh) => {
+            let request_is_strict = refresh.strict_recovery;
+            (
+                video_reference_refresh_message(refresh),
+                true,
+                request_is_strict,
+            )
+        }
     };
     match control.try_send(ReliableOutbound {
         message_type: MessageType::ApplicationControl,
         payload: Bytes::from(payload),
+        completion: None,
     }) {
         Ok(()) => {
             metrics
                 .video_keyframe_requests
                 .fetch_add(1, Ordering::Relaxed);
             log::debug!(
-                "QUIC video recovery requested a fresh keyframe: scoped={}",
-                scoped
+                "QUIC video recovery requested a fresh keyframe: scoped={}, strict={}",
+                scoped,
+                request_is_strict,
             );
             true
         }
@@ -2203,6 +2648,7 @@ fn handle_video_outcome(
     metrics: &QuicApplicationMetrics,
     recovery: &Mutex<VideoReceiveRecovery>,
     now: Instant,
+    reorder_window: Duration,
 ) -> bool {
     metrics.video_reassembly_drops.store(
         video_stats
@@ -2246,8 +2692,14 @@ fn handle_video_outcome(
         .video_reassembly_last_frame_fragments
         .store(video_stats.last_frame_fragments, Ordering::Relaxed);
     let _delivery_guard = metrics.video_delivery_lock.lock().unwrap();
+    let strict_reassembly_loss = outcome.dropped_frames > 0
+        && recovery
+            .lock()
+            .unwrap()
+            .latest_source()
+            .is_some_and(|source| source.codec.is_reference_sensitive());
     let mut needs_keyframe = outcome.request_keyframe || outcome.dropped_frames > 0;
-    if outcome.dropped_frames > 0 {
+    if outcome.dropped_frames > 0 && (!keyframe_barrier || strict_reassembly_loss) {
         recovery.lock().unwrap().mark_reference_loss();
     }
     let holdback_outcome = if keyframe_barrier {
@@ -2260,6 +2712,7 @@ fn handle_video_outcome(
                         frame.metadata.presentation_timestamp_us,
                         Bytes::from(frame.payload),
                         now,
+                        reorder_window,
                     )
                 }
                 Err(error) => {
@@ -2268,7 +2721,11 @@ fn handle_video_outcome(
                 }
             }
         } else {
-            metrics.video_epoch_holdback.lock().unwrap().expire(now)
+            metrics
+                .video_epoch_holdback
+                .lock()
+                .unwrap()
+                .expire(now, reorder_window)
         }
     } else {
         let mut legacy = VideoHoldbackOutcome::default();
@@ -2283,17 +2740,22 @@ fn handle_video_outcome(
         legacy
     };
     record_video_holdback_metrics(&holdback_outcome, metrics);
-    if holdback_outcome.recovery_required {
+    let mut strict_recovery_required =
+        strict_reassembly_loss || holdback_outcome.strict_recovery_required;
+    if holdback_outcome.strict_recovery_required {
         recovery.lock().unwrap().mark_reference_loss();
+    }
+    if holdback_outcome.recovery_required {
         needs_keyframe = true;
     }
     for (info, payload) in holdback_outcome.ready {
-        let (alive, frame_needs_keyframe) =
-            deliver_video_payload(info, payload, inbound, metrics, recovery);
-        if !alive {
+        let delivery =
+            deliver_video_payload(info, payload, inbound, metrics, recovery, !keyframe_barrier);
+        if !delivery.alive {
             return false;
         }
-        needs_keyframe |= frame_needs_keyframe;
+        needs_keyframe |= delivery.needs_keyframe;
+        strict_recovery_required |= delivery.strict_recovery;
     }
     !needs_keyframe
         || request_video_keyframe(
@@ -2303,6 +2765,7 @@ fn handle_video_outcome(
             recovery,
             now,
             u64::from(outcome.dropped_frames),
+            strict_recovery_required,
         )
 }
 
@@ -2528,6 +2991,7 @@ fn video_source_info(payload: &[u8]) -> Result<VideoSourceInfo, QuicTransportErr
         },
         frame_id: frame.frame_id,
         keyframe: metadata.flags & FLAG_KEYFRAME != 0,
+        codec: metadata.codec,
     })
 }
 
@@ -2582,6 +3046,7 @@ fn refresh_video_message() -> Vec<u8> {
 fn video_reference_refresh(
     info: VideoSourceInfo,
     dropped_frames: u64,
+    strict_recovery: bool,
 ) -> Option<VideoReferenceRefresh> {
     if info.key.display < 0 || info.key.stream_id == 0 || info.frame_id == 0 {
         return None;
@@ -2591,6 +3056,7 @@ fn video_reference_refresh(
         stream_id: info.key.stream_id,
         received_frame_id: info.frame_id,
         dropped_frames,
+        strict_recovery,
         ..Default::default()
     })
 }
@@ -2729,6 +3195,7 @@ mod tests {
                 },
                 frame_id,
                 keyframe,
+                codec: VideoCodec::H264,
             }),
             payload: Bytes::from(vec![frame_id as u8]),
             ordering_epoch,
@@ -2796,10 +3263,21 @@ mod tests {
         frame_id: u64,
         keyframe: bool,
     ) -> VideoSourceInfo {
+        source_video_for_display_codec(display, stream_id, frame_id, keyframe, VideoCodec::H264)
+    }
+
+    fn source_video_for_display_codec(
+        display: i32,
+        stream_id: u64,
+        frame_id: u64,
+        keyframe: bool,
+        codec: VideoCodec,
+    ) -> VideoSourceInfo {
         VideoSourceInfo {
             key: VideoStreamKey { display, stream_id },
             frame_id,
             keyframe,
+            codec,
         }
     }
 
@@ -2807,28 +3285,214 @@ mod tests {
         source_video_for_display(0, stream_id, frame_id, keyframe)
     }
 
+    fn source_video_with_codec(
+        stream_id: u64,
+        frame_id: u64,
+        keyframe: bool,
+        codec: VideoCodec,
+    ) -> VideoSourceInfo {
+        source_video_for_display_codec(0, stream_id, frame_id, keyframe, codec)
+    }
+
     #[test]
     fn receiver_suppresses_deltas_after_a_source_gap_until_keyframe() {
         let mut recovery = VideoReceiveRecovery::default();
         assert_eq!(
-            recovery.observe(source_video(7, 1, true)),
+            recovery.observe(source_video(7, 1, true), true),
             VideoReceiveDecision::Accept
         );
         assert_eq!(
-            recovery.observe(source_video(7, 3, false)),
+            recovery.observe(source_video(7, 3, false), true),
             VideoReceiveDecision::SuppressAfterGap
         );
         assert_eq!(
-            recovery.observe(source_video(7, 4, false)),
+            recovery.observe(source_video(7, 4, false), true),
             VideoReceiveDecision::Suppress
         );
         assert_eq!(
-            recovery.observe(source_video(7, 5, true)),
+            recovery.observe(source_video(7, 5, true), true),
             VideoReceiveDecision::Accept
         );
         assert_eq!(
-            recovery.observe(source_video(7, 6, false)),
+            recovery.observe(source_video(7, 6, false), true),
             VideoReceiveDecision::Accept
+        );
+    }
+
+    #[test]
+    fn receiver_continues_after_a_source_gap_with_reliable_keyframe_repair() {
+        let mut recovery = VideoReceiveRecovery::default();
+        assert_eq!(
+            recovery.observe(source_video_with_codec(7, 1, true, VideoCodec::Vp9), false),
+            VideoReceiveDecision::Accept
+        );
+        assert_eq!(
+            recovery.observe(source_video_with_codec(7, 3, false, VideoCodec::Vp9), false),
+            VideoReceiveDecision::AcceptAfterGap
+        );
+        assert_eq!(
+            recovery.observe(source_video_with_codec(7, 4, false, VideoCodec::Vp9), false),
+            VideoReceiveDecision::Accept
+        );
+        assert!(!recovery
+            .stream_awaiting_keyframe(source_video_with_codec(7, 4, false, VideoCodec::Vp9).key));
+    }
+
+    #[test]
+    fn barrier_suppresses_reference_sensitive_deltas_after_source_gap() {
+        for codec in [VideoCodec::H264, VideoCodec::H265, VideoCodec::Av1] {
+            let (inbound, mut inbound_rx) = mpsc::channel(4);
+            let metrics = QuicApplicationMetrics::default();
+            let recovery = Mutex::new(VideoReceiveRecovery::default());
+
+            let keyframe = deliver_video_payload(
+                source_video_with_codec(7, 1, true, codec),
+                Bytes::from_static(b"keyframe"),
+                &inbound,
+                &metrics,
+                &recovery,
+                false,
+            );
+            assert!(keyframe.alive);
+            assert!(!keyframe.needs_keyframe);
+            assert!(inbound_rx.try_recv().is_ok());
+
+            let gap = deliver_video_payload(
+                source_video_with_codec(7, 3, false, codec),
+                Bytes::from_static(b"broken-delta"),
+                &inbound,
+                &metrics,
+                &recovery,
+                false,
+            );
+            assert_eq!(
+                gap,
+                VideoPayloadDelivery {
+                    alive: true,
+                    needs_keyframe: true,
+                    strict_recovery: true,
+                }
+            );
+            assert!(inbound_rx.try_recv().is_err());
+
+            let recovered = deliver_video_payload(
+                source_video_with_codec(7, 4, true, codec),
+                Bytes::from_static(b"recovery-keyframe"),
+                &inbound,
+                &metrics,
+                &recovery,
+                false,
+            );
+            assert!(recovered.alive);
+            assert!(!recovered.strict_recovery);
+            assert!(inbound_rx.try_recv().is_ok());
+        }
+    }
+
+    #[test]
+    fn barrier_keeps_vp9_gap_delivery_lenient() {
+        let (inbound, mut inbound_rx) = mpsc::channel(4);
+        let metrics = QuicApplicationMetrics::default();
+        let recovery = Mutex::new(VideoReceiveRecovery::default());
+        let keyframe = deliver_video_payload(
+            source_video_with_codec(7, 1, true, VideoCodec::Vp9),
+            Bytes::from_static(b"keyframe"),
+            &inbound,
+            &metrics,
+            &recovery,
+            false,
+        );
+        assert!(keyframe.alive);
+        assert!(inbound_rx.try_recv().is_ok());
+
+        let gap = deliver_video_payload(
+            source_video_with_codec(7, 3, false, VideoCodec::Vp9),
+            Bytes::from_static(b"delta"),
+            &inbound,
+            &metrics,
+            &recovery,
+            false,
+        );
+        assert!(gap.alive);
+        assert!(gap.needs_keyframe);
+        assert!(!gap.strict_recovery);
+        assert!(inbound_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn reference_sensitive_gap_serializes_strict_scoped_refresh() {
+        let (inbound, mut inbound_rx) = mpsc::channel(4);
+        let (control, mut control_rx) = mpsc::channel(1);
+        let metrics = QuicApplicationMetrics::default();
+        let recovery = Mutex::new(VideoReceiveRecovery::default());
+        assert!(
+            deliver_video_payload(
+                source_video_with_codec(7, 1, true, VideoCodec::H264),
+                Bytes::from_static(b"keyframe"),
+                &inbound,
+                &metrics,
+                &recovery,
+                false,
+            )
+            .alive
+        );
+        assert!(inbound_rx.try_recv().is_ok());
+        let gap = deliver_video_payload(
+            source_video_with_codec(7, 3, false, VideoCodec::H264),
+            Bytes::from_static(b"broken-delta"),
+            &inbound,
+            &metrics,
+            &recovery,
+            false,
+        );
+        assert!(gap.strict_recovery);
+        assert!(request_video_keyframe(
+            &control,
+            true,
+            &metrics,
+            &recovery,
+            Instant::now(),
+            1,
+            gap.strict_recovery,
+        ));
+
+        let outbound = control_rx.try_recv().unwrap();
+        let message = Message::parse_from_bytes(&outbound.payload).unwrap();
+        let Some(message::Union::Misc(misc)) = message.union else {
+            panic!("expected misc message");
+        };
+        let Some(misc::Union::VideoReferenceRefresh(refresh)) = misc.union else {
+            panic!("expected scoped video reference refresh");
+        };
+        assert_eq!(refresh.stream_id, 7);
+        assert_eq!(refresh.received_frame_id, 3);
+        assert!(refresh.strict_recovery);
+    }
+
+    #[test]
+    fn full_decode_queue_marks_reference_recovery_strict() {
+        let (inbound, _inbound_rx) = mpsc::channel(1);
+        let metrics = QuicApplicationMetrics::default();
+        let recovery = Mutex::new(VideoReceiveRecovery::default());
+        inbound
+            .try_send(Ok(BytesMut::from(&b"occupied"[..])))
+            .unwrap();
+
+        let delivery = deliver_video_payload(
+            source_video_with_codec(7, 1, true, VideoCodec::H264),
+            Bytes::from_static(b"keyframe"),
+            &inbound,
+            &metrics,
+            &recovery,
+            false,
+        );
+        assert_eq!(
+            delivery,
+            VideoPayloadDelivery {
+                alive: true,
+                needs_keyframe: true,
+                strict_recovery: true,
+            }
         );
     }
 
@@ -2836,19 +3500,19 @@ mod tests {
     fn receiver_recovery_isolated_per_video_stream() {
         let mut recovery = VideoReceiveRecovery::default();
         assert_eq!(
-            recovery.observe(source_video(1, 1, true)),
+            recovery.observe(source_video(1, 1, true), true),
             VideoReceiveDecision::Accept
         );
         assert_eq!(
-            recovery.observe(source_video_for_display(1, 2, 1, true)),
+            recovery.observe(source_video_for_display(1, 2, 1, true), true),
             VideoReceiveDecision::Accept
         );
         assert_eq!(
-            recovery.observe(source_video(1, 3, false)),
+            recovery.observe(source_video(1, 3, false), true),
             VideoReceiveDecision::SuppressAfterGap
         );
         assert_eq!(
-            recovery.observe(source_video_for_display(1, 2, 2, false)),
+            recovery.observe(source_video_for_display(1, 2, 2, false), true),
             VideoReceiveDecision::Accept
         );
     }
@@ -2857,13 +3521,16 @@ mod tests {
     fn receiver_new_stream_keyframe_retires_previous_stream_on_same_display() {
         let mut recovery = VideoReceiveRecovery::default();
         assert_eq!(
-            recovery.observe(source_video(7, 1, true)),
+            recovery.observe(source_video(7, 1, true), true),
             VideoReceiveDecision::Accept
         );
         recovery.mark_reference_loss();
 
         let replacement = source_video(8, 1, true);
-        assert_eq!(recovery.observe(replacement), VideoReceiveDecision::Accept);
+        assert_eq!(
+            recovery.observe(replacement, true),
+            VideoReceiveDecision::Accept
+        );
         assert_eq!(recovery.streams.len(), 1);
         assert!(recovery.streams.contains_key(&replacement.key));
         assert!(!recovery.stream_awaiting_keyframe(replacement.key));
@@ -2873,7 +3540,7 @@ mod tests {
     fn legacy_unstamped_video_frames_remain_compatible() {
         let mut recovery = VideoReceiveRecovery::default();
         assert_eq!(
-            recovery.observe(source_video(0, 0, false)),
+            recovery.observe(source_video(0, 0, false), true),
             VideoReceiveDecision::Accept
         );
     }
@@ -2882,7 +3549,7 @@ mod tests {
     fn receiver_keyframe_recovery_uses_bounded_backoff() {
         let now = Instant::now();
         let mut recovery = VideoReceiveRecovery::default();
-        recovery.observe(source_video(7, 4, true));
+        recovery.observe(source_video(7, 4, true), true);
 
         assert!(matches!(
             recovery.next_keyframe_request(now, true, 1),
@@ -2916,19 +3583,142 @@ mod tests {
     }
 
     #[test]
-    fn receiver_keyframe_ends_the_pending_recovery_cycle() {
+    fn strict_recovery_flag_survives_scoped_request_retries() {
         let now = Instant::now();
         let mut recovery = VideoReceiveRecovery::default();
-        recovery.observe(source_video(7, 4, true));
-        recovery.observe(source_video(7, 6, false));
-        assert!(recovery.next_keyframe_request(now, true, 1).is_some());
+        recovery.observe(source_video(7, 4, true), true);
+
+        let first = recovery.next_keyframe_request_with_recovery(now, true, 1, true);
+        let Some(VideoKeyframeRequest::Scoped(first)) = first else {
+            panic!("expected strict scoped recovery request");
+        };
+        assert!(first.strict_recovery);
+
+        let retry = recovery.next_keyframe_request_with_recovery(
+            now + VIDEO_KEYFRAME_REQUEST_MIN_INTERVAL,
+            true,
+            0,
+            false,
+        );
+        let Some(VideoKeyframeRequest::Scoped(retry)) = retry else {
+            panic!("expected strict scoped recovery retry");
+        };
+        assert!(retry.strict_recovery);
+    }
+
+    #[test]
+    fn strict_recovery_escalates_pending_advisory_inside_minimum_interval() {
+        let now = Instant::now();
+        let mut recovery = VideoReceiveRecovery::default();
+        recovery.observe(source_video(7, 4, true), true);
+
+        let advisory = recovery.next_keyframe_request_with_recovery(now, true, 1, false);
+        let Some(VideoKeyframeRequest::Scoped(advisory)) = advisory else {
+            panic!("expected advisory scoped recovery request");
+        };
+        assert!(!advisory.strict_recovery);
+
+        let strict_at = now + VIDEO_EPOCH_REORDER_MIN;
+        let strict = recovery.next_keyframe_request_with_recovery(strict_at, true, 0, true);
+        let Some(VideoKeyframeRequest::Scoped(strict)) = strict else {
+            panic!("expected immediate strict recovery escalation");
+        };
+        assert!(strict.strict_recovery);
+
+        assert!(
+            recovery
+                .next_keyframe_request_with_recovery(
+                    strict_at + VIDEO_EPOCH_REORDER_MIN,
+                    true,
+                    0,
+                    true,
+                )
+                .is_none()
+        );
+
+        let retry = recovery.next_keyframe_request_with_recovery(
+            strict_at + VIDEO_KEYFRAME_RETRY_INITIAL_DELAY,
+            true,
+            0,
+            false,
+        );
+        let Some(VideoKeyframeRequest::Scoped(retry)) = retry else {
+            panic!("expected strict recovery retry after normal backoff");
+        };
+        assert!(retry.strict_recovery);
+    }
+
+    #[test]
+    fn strict_recovery_escalates_after_keyframe_clears_pending_request() {
+        let now = Instant::now();
+        let mut recovery = VideoReceiveRecovery::default();
+        recovery.observe(source_video(7, 4, true), true);
+        assert!(recovery
+            .next_keyframe_request_with_recovery(now, true, 1, false)
+            .is_some());
+
         assert_eq!(
-            recovery.observe(source_video(7, 7, true)),
+            recovery.observe(source_video(7, 5, true), true),
             VideoReceiveDecision::Accept
         );
         assert!(recovery.pending_request.is_none());
         assert_eq!(
-            recovery.observe(source_video(7, 9, false)),
+            recovery.observe(source_video(7, 7, false), true),
+            VideoReceiveDecision::SuppressAfterGap
+        );
+
+        let strict = recovery.next_keyframe_request_with_recovery(
+            now + VIDEO_EPOCH_REORDER_MIN,
+            true,
+            1,
+            true,
+        );
+        let Some(VideoKeyframeRequest::Scoped(strict)) = strict else {
+            panic!("expected strict recovery after the completed advisory cycle");
+        };
+        assert!(strict.strict_recovery);
+    }
+
+    #[test]
+    fn receiver_retry_can_advance_received_frame_without_recovery_progress() {
+        let now = Instant::now();
+        let mut recovery = VideoReceiveRecovery::default();
+        recovery.observe(source_video(7, 4, true), true);
+        assert_eq!(
+            recovery.observe(source_video(7, 6, false), true),
+            VideoReceiveDecision::SuppressAfterGap
+        );
+        let first = match recovery.next_keyframe_request(now, true, 1) {
+            Some(VideoKeyframeRequest::Scoped(request)) => request,
+            _ => panic!("expected first scoped recovery request"),
+        };
+        assert_eq!(first.received_frame_id, 6);
+
+        assert_eq!(
+            recovery.observe(source_video(7, 7, false), true),
+            VideoReceiveDecision::Suppress
+        );
+        let retry = match recovery.next_keyframe_request(now + Duration::from_secs(1), true, 1) {
+            Some(VideoKeyframeRequest::Scoped(request)) => request,
+            _ => panic!("expected scoped recovery retry"),
+        };
+        assert_eq!(retry.received_frame_id, 7);
+    }
+
+    #[test]
+    fn receiver_keyframe_ends_the_pending_recovery_cycle() {
+        let now = Instant::now();
+        let mut recovery = VideoReceiveRecovery::default();
+        recovery.observe(source_video(7, 4, true), true);
+        recovery.observe(source_video(7, 6, false), true);
+        assert!(recovery.next_keyframe_request(now, true, 1).is_some());
+        assert_eq!(
+            recovery.observe(source_video(7, 7, true), true),
+            VideoReceiveDecision::Accept
+        );
+        assert!(recovery.pending_request.is_none());
+        assert_eq!(
+            recovery.observe(source_video(7, 9, false), true),
             VideoReceiveDecision::SuppressAfterGap
         );
         assert!(recovery
@@ -2948,6 +3738,7 @@ mod tests {
             10,
             Bytes::from_static(b"old-delta"),
             now,
+            VIDEO_EPOCH_REORDER_MIN,
         );
         assert_eq!(old.held_frames, 1);
 
@@ -2955,6 +3746,7 @@ mod tests {
             source_video(8, 1, true),
             Bytes::from_static(b"new-keyframe"),
             now + VIDEO_EPOCH_HOLDBACK_TIMEOUT,
+            VIDEO_EPOCH_REORDER_MIN,
         );
         assert!(!replacement.recovery_required);
         assert_eq!(replacement.timed_out_frames, 0);
@@ -2971,12 +3763,14 @@ mod tests {
             10,
             Bytes::from_static(b"delta-11"),
             now,
+            VIDEO_EPOCH_REORDER_MIN,
         );
         let held_13 = holdback.admit_delta(
             source_video(7, 13, false),
             10,
             Bytes::from_static(b"delta-13"),
             now,
+            VIDEO_EPOCH_REORDER_MIN,
         );
         assert!(held_11.ready.is_empty());
         assert!(held_13.ready.is_empty());
@@ -2985,6 +3779,7 @@ mod tests {
             source_video(7, 10, true),
             Bytes::from_static(b"keyframe-10"),
             now,
+            VIDEO_EPOCH_REORDER_MIN,
         );
         assert_eq!(
             keyframe
@@ -3000,6 +3795,7 @@ mod tests {
             10,
             Bytes::from_static(b"delta-12"),
             now,
+            VIDEO_EPOCH_REORDER_MIN,
         );
         assert_eq!(
             filled_gap
@@ -3012,6 +3808,75 @@ mod tests {
     }
 
     #[test]
+    fn keyframe_barrier_skips_a_missing_delta_after_the_reorder_window() {
+        let now = Instant::now();
+        let mut holdback = VideoEpochHoldback::default();
+        let keyframe = holdback.accept_keyframe(
+            source_video(7, 10, true),
+            Bytes::from_static(b"keyframe-10"),
+            now,
+            VIDEO_EPOCH_REORDER_MIN,
+        );
+        assert_eq!(keyframe.ready.len(), 1);
+
+        let held = holdback.admit_delta(
+            source_video(7, 12, false),
+            10,
+            Bytes::from_static(b"delta-12"),
+            now,
+            VIDEO_EPOCH_REORDER_MIN,
+        );
+        assert!(held.ready.is_empty());
+        assert_eq!(held.held_frames, 1);
+
+        let released = holdback.expire(now + VIDEO_EPOCH_REORDER_MIN, VIDEO_EPOCH_REORDER_MIN);
+        assert_eq!(released.gap_events, 1);
+        assert_eq!(released.gap_skipped_frames, 1);
+        assert!(released.recovery_required);
+        assert!(!released.strict_recovery_required);
+        assert_eq!(released.timed_out_frames, 0);
+        assert_eq!(
+            released
+                .ready
+                .iter()
+                .map(|(info, _)| info.frame_id)
+                .collect::<Vec<_>>(),
+            vec![12]
+        );
+    }
+
+    #[test]
+    fn keyframe_barrier_hard_timeout_preserves_fresh_held_frames() {
+        let now = Instant::now();
+        let mut holdback = VideoEpochHoldback::default();
+        holdback.accept_keyframe(
+            source_video(7, 10, true),
+            Bytes::from_static(b"keyframe-10"),
+            now,
+            VIDEO_EPOCH_REORDER_MIN,
+        );
+        holdback.admit_delta(
+            source_video(7, 21, false),
+            20,
+            Bytes::from_static(b"old-future-delta"),
+            now,
+            VIDEO_EPOCH_REORDER_MIN,
+        );
+        holdback.admit_delta(
+            source_video(7, 22, false),
+            20,
+            Bytes::from_static(b"fresh-future-delta"),
+            now + VIDEO_EPOCH_HOLDBACK_TIMEOUT - Duration::from_millis(1),
+            VIDEO_EPOCH_REORDER_MIN,
+        );
+
+        let expired = holdback.expire(now + VIDEO_EPOCH_HOLDBACK_TIMEOUT, VIDEO_EPOCH_REORDER_MIN);
+        assert_eq!(expired.timed_out_frames, 1);
+        assert!(expired.strict_recovery_required);
+        assert_eq!(holdback.pending_totals().0, 1);
+    }
+
+    #[test]
     fn keyframe_barrier_times_out_without_unbounded_holdback() {
         let now = Instant::now();
         let mut holdback = VideoEpochHoldback::default();
@@ -3020,10 +3885,11 @@ mod tests {
             10,
             Bytes::from_static(b"delta-11"),
             now,
+            VIDEO_EPOCH_REORDER_MIN,
         );
         assert_eq!(held.held_frames, 1);
 
-        let expired = holdback.expire(now + VIDEO_EPOCH_HOLDBACK_TIMEOUT);
+        let expired = holdback.expire(now + VIDEO_EPOCH_HOLDBACK_TIMEOUT, VIDEO_EPOCH_REORDER_MIN);
         assert!(expired.recovery_required);
         assert_eq!(expired.timed_out_frames, 1);
         assert_eq!(holdback.pending_totals(), (0, 0));
@@ -3058,6 +3924,7 @@ mod tests {
                 10,
                 Bytes::from_static(b"delta"),
                 now,
+                VIDEO_EPOCH_REORDER_MIN,
             );
         }
         assert!(overflow.recovery_required);
@@ -3077,8 +3944,14 @@ mod tests {
                 },
                 frame_id: 1,
                 keyframe: true,
+                codec: VideoCodec::H264,
             };
-            holdback.accept_keyframe(info, Bytes::from_static(b"keyframe"), now);
+            holdback.accept_keyframe(
+                info,
+                Bytes::from_static(b"keyframe"),
+                now,
+                VIDEO_EPOCH_REORDER_MIN,
+            );
         }
 
         let primary = VideoSourceInfo {
@@ -3088,8 +3961,14 @@ mod tests {
             },
             frame_id: 2,
             keyframe: true,
+            codec: VideoCodec::H264,
         };
-        holdback.accept_keyframe(primary, Bytes::from_static(b"keyframe"), now);
+        holdback.accept_keyframe(
+            primary,
+            Bytes::from_static(b"keyframe"),
+            now,
+            VIDEO_EPOCH_REORDER_MIN,
+        );
         let newest = VideoSourceInfo {
             key: VideoStreamKey {
                 display: MAX_VIDEO_EPOCH_STREAM_STATES as i32,
@@ -3097,8 +3976,14 @@ mod tests {
             },
             frame_id: 1,
             keyframe: true,
+            codec: VideoCodec::H264,
         };
-        holdback.accept_keyframe(newest, Bytes::from_static(b"keyframe"), now);
+        holdback.accept_keyframe(
+            newest,
+            Bytes::from_static(b"keyframe"),
+            now,
+            VIDEO_EPOCH_REORDER_MIN,
+        );
 
         assert_eq!(holdback.streams.len(), MAX_VIDEO_EPOCH_STREAM_STATES);
         assert!(holdback.streams.contains_key(&primary.key));
@@ -3114,7 +3999,10 @@ mod tests {
         let (control, mut control_rx) = mpsc::channel(1);
         let metrics = QuicApplicationMetrics::default();
         let recovery = Mutex::new(VideoReceiveRecovery::default());
-        recovery.lock().unwrap().observe(source_video(7, 4, true));
+        recovery
+            .lock()
+            .unwrap()
+            .observe(source_video(7, 4, true), true);
         let outcome = super::super::video_datagram::VideoReassemblyOutcome {
             request_keyframe: true,
             dropped_frames: 1,
@@ -3130,6 +4018,7 @@ mod tests {
             &metrics,
             &recovery,
             Instant::now(),
+            VIDEO_EPOCH_REORDER_MIN,
         ));
         let outbound = control_rx.try_recv().unwrap();
         let message = Message::parse_from_bytes(&outbound.payload).unwrap();
@@ -3143,6 +4032,45 @@ mod tests {
         assert_eq!(refresh.stream_id, 7);
         assert_eq!(refresh.received_frame_id, 4);
         assert_eq!(refresh.dropped_frames, 1);
+        assert!(refresh.strict_recovery);
+    }
+
+    #[test]
+    fn reference_tolerant_reassembly_drop_remains_advisory() {
+        let (inbound, _inbound_rx) = mpsc::channel(1);
+        let (control, mut control_rx) = mpsc::channel(1);
+        let metrics = QuicApplicationMetrics::default();
+        let recovery = Mutex::new(VideoReceiveRecovery::default());
+        recovery
+            .lock()
+            .unwrap()
+            .observe(source_video_with_codec(7, 4, true, VideoCodec::Vp9), true);
+        let outcome = super::super::video_datagram::VideoReassemblyOutcome {
+            request_keyframe: true,
+            dropped_frames: 1,
+            frame: None,
+        };
+        assert!(handle_video_outcome(
+            outcome,
+            &super::super::video_datagram::VideoReassemblyStats::default(),
+            &inbound,
+            &control,
+            true,
+            true,
+            &metrics,
+            &recovery,
+            Instant::now(),
+            VIDEO_EPOCH_REORDER_MIN,
+        ));
+        let outbound = control_rx.try_recv().unwrap();
+        let message = Message::parse_from_bytes(&outbound.payload).unwrap();
+        let Some(message::Union::Misc(misc)) = message.union else {
+            panic!("expected misc message");
+        };
+        let Some(misc::Union::VideoReferenceRefresh(refresh)) = misc.union else {
+            panic!("expected scoped video reference refresh");
+        };
+        assert!(!refresh.strict_recovery);
     }
 
     #[test]
@@ -3151,7 +4079,10 @@ mod tests {
         let (control, mut control_rx) = mpsc::channel(1);
         let metrics = QuicApplicationMetrics::default();
         let recovery = Mutex::new(VideoReceiveRecovery::default());
-        recovery.lock().unwrap().observe(source_video(7, 4, true));
+        recovery
+            .lock()
+            .unwrap()
+            .observe(source_video(7, 4, true), true);
         let outcome = super::super::video_datagram::VideoReassemblyOutcome {
             request_keyframe: true,
             dropped_frames: 1,
@@ -3167,6 +4098,7 @@ mod tests {
             &metrics,
             &recovery,
             Instant::now(),
+            VIDEO_EPOCH_REORDER_MIN,
         ));
         let outbound = control_rx.try_recv().unwrap();
         let message = Message::parse_from_bytes(&outbound.payload).unwrap();
@@ -3197,6 +4129,7 @@ mod tests {
             &metrics,
             &recovery,
             Instant::now(),
+            VIDEO_EPOCH_REORDER_MIN,
         ));
         assert!(control_rx.try_recv().is_err());
     }
@@ -3256,6 +4189,26 @@ mod tests {
         let recovery = VideoSendRecovery::new(refresh, true, metrics);
         recovery.enter(None, 2, "test loss");
         assert!(refresh_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelling_video_ordering_epoch_releases_waiter() {
+        let ordering = VideoOrderingGate::new();
+        let epoch = ordering.next_epoch().unwrap();
+        assert!(!ordering.is_open(epoch));
+
+        let waiter = {
+            let ordering = ordering.clone();
+            tokio::spawn(async move { ordering.wait(epoch).await })
+        };
+        tokio::task::yield_now().await;
+        ordering.cancel_epoch(epoch);
+
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("cancelled ordering epoch must release its waiter")
+            .expect("ordering waiter task must complete");
+        assert!(ordering.is_open(epoch));
     }
 
     #[test]
@@ -3401,6 +4354,8 @@ mod tests {
             .unwrap();
 
         let mut frame = VideoFrame {
+            display: 0,
+            stream_id: 7,
             frame_id: 1,
             capture_time_ms: 3,
             ..Default::default()
@@ -3471,14 +4426,24 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(client_stream.stats().application_protocol, 4);
-        assert!(client_stream.stats().reliable_keyframes);
-        assert!(client_stream.stats().reliable_keyframe_barrier);
-        assert!(client_stream.stats().reliable_keyframes_sent >= 1);
+        let client_stats = client_stream.stats();
+        assert_eq!(client_stats.application_protocol, 4);
+        assert!(client_stats.reliable_keyframes);
+        assert!(client_stats.reliable_keyframe_barrier);
+        assert!(client_stats.reliable_keyframes_sent >= 1);
+        assert!(client_stats.reliable_keyframe_last_bytes >= 4_000);
+        let mark = client_stats
+            .reliable_keyframe_last_mark
+            .expect("reliable keyframe send must publish its barrier mark");
+        assert_eq!(mark.display, 0);
+        assert_eq!(mark.stream_id, 7);
+        assert_eq!(mark.barrier_epoch, 1);
         assert!(server_stream.stats().reliable_keyframes_received >= 1);
 
         let mut delta = Message::new();
         let mut delta_frame = VideoFrame {
+            display: 0,
+            stream_id: 7,
             frame_id: 2,
             capture_time_ms: 4,
             ..Default::default()
@@ -3510,6 +4475,32 @@ mod tests {
         .await
         .expect("DATAGRAM delta must follow a reliable startup keyframe");
 
+        let mut close_misc = Misc::new();
+        close_misc.set_close_reason(String::new());
+        let mut close_message = Message::new();
+        close_message.set_misc(close_misc);
+        client_stream
+            .enqueue_control_and_wait(Bytes::from(close_message.write_to_bytes().unwrap()))
+            .await
+            .expect("confirmed QUIC control write must reach the reliable writer");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let bytes = server_stream.next().await.unwrap().unwrap();
+                let message = Message::parse_from_bytes(&bytes).unwrap();
+                if matches!(
+                    message.union,
+                    Some(message::Union::Misc(Misc {
+                        union: Some(misc::Union::CloseReason(_)),
+                        ..
+                    }))
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("peer must receive the confirmed QUIC close reason");
+
         client_stream.set_raw();
         client_stream
             .enqueue(Bytes::from_static(b"raw-port-forward-payload"))
@@ -3524,5 +4515,24 @@ mod tests {
         })
         .await
         .unwrap();
+
+        server_stream.begin_teardown(b"test teardown");
+        server_stream.begin_teardown(b"duplicate test teardown");
+        server_stream
+            .enqueue(Bytes::from(delta.write_to_bytes().unwrap()))
+            .expect("late video enqueue must not replace the real close reason");
+        let teardown_stats = server_stream.stats();
+        assert_eq!(teardown_stats.video_frames_discarded_teardown, 1);
+        assert_eq!(
+            teardown_stats.video_datagram_frames_rejected_active
+                + teardown_stats.video_datagram_frames_rejected_teardown,
+            teardown_stats.video_datagram_frames_rejected,
+        );
+        tokio::time::timeout(Duration::from_secs(1), client_stream.connection.closed())
+            .await
+            .expect("peer must observe QUIC teardown");
+        assert!(client_stream
+            .enqueue(Bytes::from(delta.write_to_bytes().unwrap()))
+            .is_err());
     }
 }
