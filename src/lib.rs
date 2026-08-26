@@ -570,7 +570,8 @@ mod test {
     use super::*;
     use crate::{
         message_proto::{
-            message, misc, Message, Misc, SupportedDecoding, TestDelay, VideoFeedback, VideoFrame,
+            message, misc, option_message, Message, Misc, OptionMessage, SupportedDecoding,
+            SupportedEncoding, TestDelay, VideoFeedback, VideoFrame,
         },
         protobuf::Message as _,
     };
@@ -599,6 +600,10 @@ mod test {
             received_frame_id: 11,
             decoded_frame_id: 10,
             render_submitted_frame_id: 10,
+            display_refresh_millihz: 120_000,
+            presentation_late_frames: 2,
+            presentation_dropped_frames: 1,
+            presentation_jitter_p95_us: 1_500,
             ..Default::default()
         });
         let mut feedback_message = Message::new();
@@ -613,6 +618,10 @@ mod test {
         };
         assert_eq!(feedback.stream_id, 7);
         assert_eq!(feedback.render_submitted_frame_id, 10);
+        assert_eq!(feedback.display_refresh_millihz, 120_000);
+        assert_eq!(feedback.presentation_late_frames, 2);
+        assert_eq!(feedback.presentation_dropped_frames, 1);
+        assert_eq!(feedback.presentation_jitter_p95_us, 1_500);
 
         let decoding = SupportedDecoding {
             video_feedback: true,
@@ -626,12 +635,82 @@ mod test {
             video_delivery_phase: "recovering".to_owned(),
             video_recovery_count: 3,
             video_stall_ms: 750,
+            requested_video_profile: "movie".to_owned(),
+            effective_video_profile: "movie-full".to_owned(),
+            target_fps: 60,
+            pacing_fps: 30,
+            encoded_fps_x100: 2_997,
+            host_pipeline_p95_us: 12_000,
+            movie_fallback_reason: "none".to_owned(),
+            movie_playout_delay_ms: 50,
             ..Default::default()
         };
         let decoded = TestDelay::parse_from_bytes(&delay.write_to_bytes().unwrap()).unwrap();
         assert_eq!(decoded.video_delivery_phase, "recovering");
         assert_eq!(decoded.video_recovery_count, 3);
         assert_eq!(decoded.video_stall_ms, 750);
+        assert_eq!(decoded.requested_video_profile, "movie");
+        assert_eq!(decoded.effective_video_profile, "movie-full");
+        assert_eq!(decoded.target_fps, 60);
+        assert_eq!(decoded.pacing_fps, 30);
+        assert_eq!(decoded.encoded_fps_x100, 2_997);
+        assert_eq!(decoded.host_pipeline_p95_us, 12_000);
+        assert_eq!(decoded.movie_fallback_reason, "none");
+        assert_eq!(decoded.movie_playout_delay_ms, 50);
+
+        let options = OptionMessage {
+            video_profile: option_message::VideoProfile::VideoProfileMovie.into(),
+            ..Default::default()
+        };
+        let decoded = OptionMessage::parse_from_bytes(&options.write_to_bytes().unwrap()).unwrap();
+        assert_eq!(
+            decoded.video_profile.enum_value_or_default(),
+            option_message::VideoProfile::VideoProfileMovie
+        );
+
+        let encoding = SupportedEncoding {
+            movie_mode: true,
+            ..Default::default()
+        };
+        let decoded =
+            SupportedEncoding::parse_from_bytes(&encoding.write_to_bytes().unwrap()).unwrap();
+        assert!(decoded.movie_mode);
+    }
+
+    #[test]
+    fn omitted_and_unknown_movie_profile_values_remain_detectable() {
+        let decoded = OptionMessage::parse_from_bytes(&[]).unwrap();
+        assert_eq!(
+            decoded.video_profile.enum_value_or_default(),
+            option_message::VideoProfile::VideoProfileNotSet
+        );
+
+        let decoded = OptionMessage::parse_from_bytes(&[0xa8, 0x01, 99]).unwrap();
+        assert!(decoded.video_profile.enum_value().is_err());
+        assert_eq!(
+            decoded.video_profile.enum_value_or_default(),
+            option_message::VideoProfile::VideoProfileNotSet
+        );
+
+        let standard = OptionMessage {
+            video_profile: option_message::VideoProfile::VideoProfileStandard.into(),
+            ..Default::default()
+        };
+        let standard =
+            OptionMessage::parse_from_bytes(&standard.write_to_bytes().unwrap()).unwrap();
+        assert_eq!(
+            standard.video_profile.enum_value_or_default(),
+            option_message::VideoProfile::VideoProfileStandard
+        );
+
+        let encoding = SupportedEncoding::parse_from_bytes(&[]).unwrap();
+        assert!(!encoding.movie_mode);
+        let feedback = VideoFeedback::parse_from_bytes(&[]).unwrap();
+        assert_eq!(feedback.display_refresh_millihz, 0);
+        assert_eq!(feedback.presentation_late_frames, 0);
+        let delay = TestDelay::parse_from_bytes(&[]).unwrap();
+        assert!(delay.requested_video_profile.is_empty());
+        assert_eq!(delay.pacing_fps, 0);
     }
 
     #[test]

@@ -55,6 +55,7 @@ const AUDIO_OUTBOUND_CAPACITY: usize = 64;
 const CHANNEL_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 const V2_MAX_APPLICATION_DATAGRAM_SIZE: usize = 1300;
 const VIDEO_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const VIDEO_KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const VIDEO_KEYFRAME_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const VIDEO_KEYFRAME_RETRY_MAX_ATTEMPTS: u8 = 3;
 const VIDEO_KEYFRAME_RECOVERY_CYCLE_COOLDOWN: Duration = Duration::from_secs(10);
@@ -364,6 +365,9 @@ impl VideoEpochHoldback {
         payload: Bytes,
         now: Instant,
     ) -> VideoHoldbackOutcome {
+        self.streams.retain(|key, _| {
+            key.display != info.key.display || key.stream_id == info.key.stream_id
+        });
         let mut outcome = self.expire(now);
         self.prepare_stream(info.key, &mut outcome);
         let state = self.streams.entry(info.key).or_default();
@@ -472,6 +476,7 @@ struct VideoReceiveRecovery {
     streams: BTreeMap<VideoStreamKey, VideoReceiveState>,
     last_observed: Option<VideoSourceInfo>,
     pending_request: Option<PendingVideoRecovery>,
+    last_keyframe_request_at: Option<Instant>,
 }
 
 impl VideoReceiveRecovery {
@@ -489,6 +494,25 @@ impl VideoReceiveRecovery {
     fn observe(&mut self, info: VideoSourceInfo) -> VideoReceiveDecision {
         if info.key.stream_id == 0 || info.frame_id == 0 {
             return VideoReceiveDecision::Accept;
+        }
+        if info.keyframe {
+            let replaced_stream = self
+                .streams
+                .keys()
+                .any(|key| key.display == info.key.display && *key != info.key);
+            self.streams.retain(|key, _| {
+                key.display != info.key.display || key.stream_id == info.key.stream_id
+            });
+            if self.pending_request.is_some_and(|pending| {
+                pending.source.is_some_and(|source| {
+                    source.key.display == info.key.display && source.key != info.key
+                })
+            }) {
+                self.pending_request = None;
+            }
+            if replaced_stream {
+                self.last_keyframe_request_at = None;
+            }
         }
         if !self.streams.contains_key(&info.key) && self.streams.len() >= MAX_VIDEO_STREAM_STATES {
             self.streams.pop_first();
@@ -541,8 +565,10 @@ impl VideoReceiveRecovery {
         })
     }
 
-    fn has_unrecovered_streams(&self) -> bool {
-        self.streams.values().any(|state| state.awaiting_keyframe)
+    fn stream_awaiting_keyframe(&self, key: VideoStreamKey) -> bool {
+        self.streams
+            .get(&key)
+            .is_some_and(|state| state.awaiting_keyframe)
     }
 
     fn next_keyframe_request(
@@ -562,6 +588,13 @@ impl VideoReceiveRecovery {
                 .zip(source)
                 .is_some_and(|(pending, source)| pending.key != source.key)
         });
+        if !is_new_stream
+            && self.last_keyframe_request_at.is_some_and(|last| {
+                now.saturating_duration_since(last) < VIDEO_KEYFRAME_REQUEST_MIN_INTERVAL
+            })
+        {
+            return None;
+        }
         let due = match self.pending_request {
             None => true,
             Some(_) if is_new_stream => true,
@@ -592,6 +625,7 @@ impl VideoReceiveRecovery {
             requested_at: now,
             retries,
         });
+        self.last_keyframe_request_at = Some(now);
         match (scoped_reference_refresh, source) {
             (true, Some(source)) => {
                 video_reference_refresh(source, dropped_frames).map(VideoKeyframeRequest::Scoped)
@@ -1255,6 +1289,7 @@ impl QuicApplicationStream {
         stats.datagram_send_buffer_queued = datagram_send.send_buffer_queued;
         stats.video_datagram_queue_budget = datagram_send.video_queue_budget;
         stats.video_datagram_queue_delay_us = datagram_send.video_queue_delay_us;
+        stats.video_datagram_queue_target_us = datagram_send.video_queue_target_us;
         stats.audio_datagram_drops = datagram_send.audio_packets_dropped;
         stats.mouse_datagram_drops = datagram_send.mouse_updates_dropped;
         stats
@@ -1262,6 +1297,11 @@ impl QuicApplicationStream {
 
     pub fn peer_binding(&self) -> &QuicPeerBinding {
         &self.peer_binding
+    }
+
+    pub fn set_video_datagram_queue_policy(&self, target: Duration, minimum_bytes: usize) {
+        self.datagram_send
+            .set_video_queue_policy(target, minimum_bytes);
     }
 
     pub fn keep_endpoint_alive(&mut self, endpoint: Endpoint) {
@@ -2076,8 +2116,8 @@ fn deliver_video_payload(
         VideoReceiveDecision::Accept => {
             match inbound.try_send(Ok(BytesMut::from(payload.as_ref()))) {
                 Ok(()) => {
-                    let needs_keyframe =
-                        info.keyframe && recovery.lock().unwrap().has_unrecovered_streams();
+                    let needs_keyframe = info.keyframe
+                        && recovery.lock().unwrap().stream_awaiting_keyframe(info.key);
                     (true, needs_keyframe)
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -2750,15 +2790,21 @@ mod tests {
         ));
     }
 
-    fn source_video(stream_id: u64, frame_id: u64, keyframe: bool) -> VideoSourceInfo {
+    fn source_video_for_display(
+        display: i32,
+        stream_id: u64,
+        frame_id: u64,
+        keyframe: bool,
+    ) -> VideoSourceInfo {
         VideoSourceInfo {
-            key: VideoStreamKey {
-                display: 0,
-                stream_id,
-            },
+            key: VideoStreamKey { display, stream_id },
             frame_id,
             keyframe,
         }
+    }
+
+    fn source_video(stream_id: u64, frame_id: u64, keyframe: bool) -> VideoSourceInfo {
+        source_video_for_display(0, stream_id, frame_id, keyframe)
     }
 
     #[test]
@@ -2794,7 +2840,7 @@ mod tests {
             VideoReceiveDecision::Accept
         );
         assert_eq!(
-            recovery.observe(source_video(2, 1, true)),
+            recovery.observe(source_video_for_display(1, 2, 1, true)),
             VideoReceiveDecision::Accept
         );
         assert_eq!(
@@ -2802,9 +2848,25 @@ mod tests {
             VideoReceiveDecision::SuppressAfterGap
         );
         assert_eq!(
-            recovery.observe(source_video(2, 2, false)),
+            recovery.observe(source_video_for_display(1, 2, 2, false)),
             VideoReceiveDecision::Accept
         );
+    }
+
+    #[test]
+    fn receiver_new_stream_keyframe_retires_previous_stream_on_same_display() {
+        let mut recovery = VideoReceiveRecovery::default();
+        assert_eq!(
+            recovery.observe(source_video(7, 1, true)),
+            VideoReceiveDecision::Accept
+        );
+        recovery.mark_reference_loss();
+
+        let replacement = source_video(8, 1, true);
+        assert_eq!(recovery.observe(replacement), VideoReceiveDecision::Accept);
+        assert_eq!(recovery.streams.len(), 1);
+        assert!(recovery.streams.contains_key(&replacement.key));
+        assert!(!recovery.stream_awaiting_keyframe(replacement.key));
     }
 
     #[test]
@@ -2865,6 +2927,39 @@ mod tests {
             VideoReceiveDecision::Accept
         );
         assert!(recovery.pending_request.is_none());
+        assert_eq!(
+            recovery.observe(source_video(7, 9, false)),
+            VideoReceiveDecision::SuppressAfterGap
+        );
+        assert!(recovery
+            .next_keyframe_request(now + Duration::from_millis(999), true, 1)
+            .is_none());
+        assert!(recovery
+            .next_keyframe_request(now + VIDEO_KEYFRAME_REQUEST_MIN_INTERVAL, true, 1)
+            .is_some());
+    }
+
+    #[test]
+    fn keyframe_barrier_new_stream_discards_old_same_display_holdback() {
+        let now = Instant::now();
+        let mut holdback = VideoEpochHoldback::default();
+        let old = holdback.admit_delta(
+            source_video(7, 13, false),
+            10,
+            Bytes::from_static(b"old-delta"),
+            now,
+        );
+        assert_eq!(old.held_frames, 1);
+
+        let replacement = holdback.accept_keyframe(
+            source_video(8, 1, true),
+            Bytes::from_static(b"new-keyframe"),
+            now + VIDEO_EPOCH_HOLDBACK_TIMEOUT,
+        );
+        assert!(!replacement.recovery_required);
+        assert_eq!(replacement.timed_out_frames, 0);
+        assert_eq!(holdback.streams.len(), 1);
+        assert!(holdback.streams.contains_key(&source_video(8, 1, true).key));
     }
 
     #[test]

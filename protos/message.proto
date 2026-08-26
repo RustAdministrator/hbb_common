@@ -133,6 +133,7 @@ message SupportedEncoding {
   bool av1_hw = 6;
   bool h264_hq = 7;
   bool h265_hq = 8;
+  bool movie_mode = 9;
 }
 
 message PeerInfo {
@@ -716,6 +717,11 @@ message OptionMessage {
     CaptureBackendWinMag = 4;
     CaptureBackendGdi = 5;
   }
+  enum VideoProfile {
+    VideoProfileNotSet = 0;
+    VideoProfileStandard = 1;
+    VideoProfileMovie = 2;
+  }
   ImageQuality image_quality = 1;
   BoolOption lock_after_session_end = 2;
   BoolOption show_remote_cursor = 3;
@@ -738,6 +744,7 @@ message OptionMessage {
   BoolOption terminal_persistent = 18;
   BoolOption show_my_cursor = 19;
   CaptureBackend capture_backend = 20;
+  VideoProfile video_profile = 21;
 }
 
 message TestDelay {
@@ -752,6 +759,14 @@ message TestDelay {
   string video_delivery_phase = 9;
   uint64 video_recovery_count = 10;
   uint64 video_stall_ms = 11;
+  string requested_video_profile = 12;
+  string effective_video_profile = 13;
+  uint32 target_fps = 14;
+  uint32 pacing_fps = 15;
+  uint32 encoded_fps_x100 = 16;
+  uint32 host_pipeline_p95_us = 17;
+  string movie_fallback_reason = 18;
+  uint32 movie_playout_delay_ms = 19;
 }
 
 message PublicKey {
@@ -896,6 +911,10 @@ message VideoFeedback {
   uint32 decode_time_us = 7;
   uint32 render_submit_time_us = 8;
   uint64 dropped_frames = 9;
+  uint32 display_refresh_millihz = 10;
+  uint64 presentation_late_frames = 11;
+  uint64 presentation_dropped_frames = 12;
+  uint32 presentation_jitter_p95_us = 13;
 }
 
 message VideoReferenceRefresh {
