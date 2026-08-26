@@ -26,6 +26,12 @@ pub enum VideoCodec {
     Raw = 6,
 }
 
+impl VideoCodec {
+    pub fn is_reference_sensitive(self) -> bool {
+        matches!(self, Self::H264 | Self::H265 | Self::Av1)
+    }
+}
+
 impl TryFrom<u8> for VideoCodec {
     type Error = VideoDatagramError;
 

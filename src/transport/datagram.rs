@@ -11,7 +11,7 @@ use super::{
     quic::QuicTransportError,
     video_datagram::{
         fragment_video_frame, VideoDatagramError, VideoFrameMetadata, VideoReassembler,
-        VideoReassemblyConfig, VideoReassemblyOutcome, VideoReassemblyStats,
+        VideoReassemblyConfig, VideoReassemblyOutcome, VideoReassemblyStats, FLAG_KEYFRAME,
     },
 };
 use bytes::Bytes;
@@ -30,6 +30,119 @@ pub const MIN_VIDEO_DATAGRAM_QUEUE_BYTES: usize = 192 * 1024;
 pub const DEFAULT_VIDEO_DATAGRAM_QUEUE_TARGET: Duration = Duration::from_millis(120);
 pub const MOVIE_VIDEO_DATAGRAM_QUEUE_TARGET: Duration = Duration::from_millis(40);
 pub const MOVIE_MIN_VIDEO_DATAGRAM_QUEUE_BYTES: usize = 64 * 1024;
+const VIDEO_FRAME_SIZE_WINDOW: usize = 512;
+const VIDEO_FRAME_PERCENTILE_PUBLISH_INTERVAL: Duration = Duration::from_millis(500);
+const VIDEO_FRAME_SIZE_WINDOW_IDLE_RESET: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy, Debug, Default)]
+struct VideoFrameSizeSample {
+    datagram_bytes: u32,
+    required_bytes: u32,
+}
+
+struct VideoFrameSizeWindow {
+    samples: [VideoFrameSizeSample; VIDEO_FRAME_SIZE_WINDOW],
+    len: usize,
+    next: usize,
+    last_published_at: Instant,
+    last_recorded_at: Option<Instant>,
+}
+
+impl VideoFrameSizeWindow {
+    fn new(now: Instant) -> Self {
+        Self {
+            samples: [VideoFrameSizeSample::default(); VIDEO_FRAME_SIZE_WINDOW],
+            len: 0,
+            next: 0,
+            last_published_at: now,
+            last_recorded_at: None,
+        }
+    }
+
+    fn record(&mut self, now: Instant, datagram_bytes: usize, required_bytes: usize) {
+        if self.last_recorded_at.is_some_and(|last| {
+            now.saturating_duration_since(last) >= VIDEO_FRAME_SIZE_WINDOW_IDLE_RESET
+        }) {
+            self.len = 0;
+            self.next = 0;
+        }
+        self.last_recorded_at = Some(now);
+        self.samples[self.next] = VideoFrameSizeSample {
+            datagram_bytes: datagram_bytes.min(u32::MAX as usize) as u32,
+            required_bytes: required_bytes.min(u32::MAX as usize) as u32,
+        };
+        self.next = (self.next + 1) % VIDEO_FRAME_SIZE_WINDOW;
+        self.len = self.len.saturating_add(1).min(VIDEO_FRAME_SIZE_WINDOW);
+    }
+
+    fn percentiles(&self) -> (u64, u64, u64, u64) {
+        if self.len == 0 {
+            return (0, 0, 0, 0);
+        }
+        let mut datagram = [0u32; VIDEO_FRAME_SIZE_WINDOW];
+        let mut required = [0u32; VIDEO_FRAME_SIZE_WINDOW];
+        for (index, sample) in self.samples[..self.len].iter().enumerate() {
+            datagram[index] = sample.datagram_bytes;
+            required[index] = sample.required_bytes;
+        }
+        datagram[..self.len].sort_unstable();
+        required[..self.len].sort_unstable();
+        let p95 = nearest_rank_index(self.len, 95);
+        let p99 = nearest_rank_index(self.len, 99);
+        (
+            u64::from(datagram[p95]),
+            u64::from(datagram[p99]),
+            u64::from(required[p95]),
+            u64::from(required[p99]),
+        )
+    }
+
+    fn publish_if_due(&mut self, now: Instant, counters: &DatagramSendCounters) {
+        if now.saturating_duration_since(self.last_published_at)
+            < VIDEO_FRAME_PERCENTILE_PUBLISH_INTERVAL
+        {
+            return;
+        }
+        self.last_published_at = now;
+        let (datagram_p95, datagram_p99, required_p95, required_p99) = self.percentiles();
+        counters
+            .video_frame_datagram_bytes_p95
+            .store(datagram_p95, Ordering::Relaxed);
+        counters
+            .video_frame_datagram_bytes_p99
+            .store(datagram_p99, Ordering::Relaxed);
+        counters
+            .video_frame_required_bytes_p95
+            .store(required_p95, Ordering::Relaxed);
+        counters
+            .video_frame_required_bytes_p99
+            .store(required_p99, Ordering::Relaxed);
+    }
+}
+
+fn nearest_rank_index(len: usize, percentile: usize) -> usize {
+    // Nearest-rank percentile over the filled sample count, not ring capacity.
+    len.saturating_mul(percentile)
+        .saturating_add(99)
+        .checked_div(100)
+        .unwrap_or(1)
+        .saturating_sub(1)
+        .min(len.saturating_sub(1))
+}
+
+fn record_delta_frame_size(
+    window: &mut VideoFrameSizeWindow,
+    metadata: VideoFrameMetadata,
+    now: Instant,
+    datagram_bytes: usize,
+    required_bytes: usize,
+) -> bool {
+    if metadata.flags & FLAG_KEYFRAME != 0 {
+        return false;
+    }
+    window.record(now, datagram_bytes, required_bytes);
+    true
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DatagramSendStats {
@@ -40,6 +153,10 @@ pub struct DatagramSendStats {
     pub video_frame_bytes_peak: u64,
     pub video_frame_fragments: u64,
     pub video_frame_fragments_peak: u64,
+    pub video_frame_datagram_bytes_p95: u64,
+    pub video_frame_datagram_bytes_p99: u64,
+    pub video_frame_required_bytes_p95: u64,
+    pub video_frame_required_bytes_p99: u64,
     pub send_buffer_space: u64,
     pub send_buffer_space_min: u64,
     pub send_buffer_queued: u64,
@@ -59,6 +176,10 @@ struct DatagramSendCounters {
     video_frame_bytes_peak: AtomicU64,
     video_frame_fragments: AtomicU64,
     video_frame_fragments_peak: AtomicU64,
+    video_frame_datagram_bytes_p95: AtomicU64,
+    video_frame_datagram_bytes_p99: AtomicU64,
+    video_frame_required_bytes_p95: AtomicU64,
+    video_frame_required_bytes_p99: AtomicU64,
     send_buffer_space: AtomicU64,
     send_buffer_space_min: AtomicU64,
     send_buffer_capacity: AtomicU64,
@@ -110,6 +231,22 @@ impl QuicDatagramSendCoordinator {
             video_frame_fragments_peak: self
                 .counters
                 .video_frame_fragments_peak
+                .load(Ordering::Relaxed),
+            video_frame_datagram_bytes_p95: self
+                .counters
+                .video_frame_datagram_bytes_p95
+                .load(Ordering::Relaxed),
+            video_frame_datagram_bytes_p99: self
+                .counters
+                .video_frame_datagram_bytes_p99
+                .load(Ordering::Relaxed),
+            video_frame_required_bytes_p95: self
+                .counters
+                .video_frame_required_bytes_p95
+                .load(Ordering::Relaxed),
+            video_frame_required_bytes_p99: self
+                .counters
+                .video_frame_required_bytes_p99
                 .load(Ordering::Relaxed),
             send_buffer_space: self.counters.send_buffer_space.load(Ordering::Relaxed),
             send_buffer_space_min: if send_buffer_space_min == u64::MAX {
@@ -190,6 +327,10 @@ pub enum VideoDatagramSendOutcome {
         video_queue_budget: usize,
         interactive_reserve_bytes: usize,
         queue_delay_us: u64,
+        datagram_bytes_p95: u64,
+        datagram_bytes_p99: u64,
+        required_bytes_p95: u64,
+        required_bytes_p99: u64,
     },
 }
 
@@ -201,6 +342,7 @@ pub struct QuicDatagramSender {
     next_audio_sequence: u64,
     next_mouse_sequence: u64,
     started: Instant,
+    video_frame_sizes: VideoFrameSizeWindow,
     negotiated_max_datagram_size: usize,
 }
 
@@ -218,6 +360,7 @@ impl QuicDatagramSender {
             next_audio_sequence: 1,
             next_mouse_sequence: 1,
             started: Instant::now(),
+            video_frame_sizes: VideoFrameSizeWindow::new(Instant::now()),
             negotiated_max_datagram_size: usize::MAX,
         }
     }
@@ -299,6 +442,17 @@ impl QuicDatagramSender {
             .counters
             .video_queue_delay_us
             .store(queue_delay_us, Ordering::Relaxed);
+        let now = Instant::now();
+        if record_delta_frame_size(
+            &mut self.video_frame_sizes,
+            metadata,
+            now,
+            datagram_bytes,
+            queued_bytes.saturating_add(datagram_bytes),
+        ) {
+            self.video_frame_sizes
+                .publish_if_due(now, &self.coordinator.counters);
+        }
         if let Some(failure) = video_frame_admission_failure(
             datagram_bytes,
             available_bytes,
@@ -318,6 +472,26 @@ impl QuicDatagramSender {
                 video_queue_budget,
                 interactive_reserve_bytes: self.coordinator.interactive_reserve_bytes,
                 queue_delay_us,
+                datagram_bytes_p95: self
+                    .coordinator
+                    .counters
+                    .video_frame_datagram_bytes_p95
+                    .load(Ordering::Relaxed),
+                datagram_bytes_p99: self
+                    .coordinator
+                    .counters
+                    .video_frame_datagram_bytes_p99
+                    .load(Ordering::Relaxed),
+                required_bytes_p95: self
+                    .coordinator
+                    .counters
+                    .video_frame_required_bytes_p95
+                    .load(Ordering::Relaxed),
+                required_bytes_p99: self
+                    .coordinator
+                    .counters
+                    .video_frame_required_bytes_p99
+                    .load(Ordering::Relaxed),
             });
         }
 
@@ -639,10 +813,10 @@ fn video_frame_admission_failure(
         .checked_add(interactive_reserve_bytes)
         .map(|required| required <= available_bytes)
         .unwrap_or(false);
-    let stays_within_video_queue = queued_bytes
-        .checked_add(datagram_bytes)
-        .map(|queued| queued <= video_queue_budget)
-        .unwrap_or(false);
+    // Admit one complete frame while the existing queue is still within its
+    // latency budget. The physical reserve remains a hard limit, and the next
+    // frame is rejected if this bounded overshoot has not drained.
+    let stays_within_video_queue = queued_bytes <= video_queue_budget;
     match (preserves_interactive_reserve, stays_within_video_queue) {
         (true, true) => None,
         (false, true) => Some(VideoDatagramAdmissionFailure::InteractiveReserve),
@@ -691,12 +865,83 @@ fn video_datagram_queue_budget(
 #[cfg(test)]
 mod tests {
     use super::{
-        video_datagram_queue_budget, video_datagram_queue_delay_us, video_frame_admission_failure,
-        video_frame_fits_send_budget, QuicDatagramSendCoordinator, VideoDatagramAdmissionFailure,
-        DEFAULT_VIDEO_DATAGRAM_QUEUE_TARGET, MIN_VIDEO_DATAGRAM_QUEUE_BYTES,
+        record_delta_frame_size, video_datagram_queue_budget, video_datagram_queue_delay_us,
+        video_frame_admission_failure, video_frame_fits_send_budget, QuicDatagramSendCoordinator,
+        VideoDatagramAdmissionFailure, VideoFrameMetadata, VideoFrameSizeWindow,
+        DEFAULT_VIDEO_DATAGRAM_QUEUE_TARGET, FLAG_KEYFRAME, MIN_VIDEO_DATAGRAM_QUEUE_BYTES,
         MOVIE_MIN_VIDEO_DATAGRAM_QUEUE_BYTES, MOVIE_VIDEO_DATAGRAM_QUEUE_TARGET,
     };
-    use std::time::Duration;
+    use crate::transport::video_datagram::VideoCodec;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn video_frame_size_percentiles_use_filled_nearest_rank_samples() {
+        let mut window = VideoFrameSizeWindow::new(Instant::now());
+        assert_eq!(window.percentiles(), (0, 0, 0, 0));
+        let now = Instant::now();
+        for value in 1..=100 {
+            window.record(now, value, value + 100);
+        }
+        assert_eq!(window.percentiles(), (95, 99, 195, 199));
+    }
+
+    #[test]
+    fn video_frame_size_percentiles_keep_only_the_latest_ring_window() {
+        let mut window = VideoFrameSizeWindow::new(Instant::now());
+        let now = Instant::now();
+        for value in 0..600 {
+            window.record(now, value, value + 1_000);
+        }
+        assert_eq!(window.percentiles(), (574, 594, 1_574, 1_594));
+    }
+
+    #[test]
+    fn rejected_delta_is_measured_but_keyframe_is_excluded() {
+        let mut window = VideoFrameSizeWindow::new(Instant::now());
+        let now = Instant::now();
+        let delta = VideoFrameMetadata {
+            frame_id: 1,
+            codec: VideoCodec::H264,
+            flags: 0,
+            presentation_timestamp_us: 0,
+        };
+        assert!(record_delta_frame_size(
+            &mut window,
+            delta,
+            now,
+            56_000,
+            91_000
+        ));
+        assert!(video_frame_admission_failure(56_000, 512_000, 64_000, 65_537, 65_536).is_some());
+        assert_eq!(window.percentiles(), (56_000, 56_000, 91_000, 91_000));
+
+        assert!(!record_delta_frame_size(
+            &mut window,
+            VideoFrameMetadata {
+                frame_id: 2,
+                codec: VideoCodec::H264,
+                flags: FLAG_KEYFRAME,
+                presentation_timestamp_us: 0,
+            },
+            now,
+            80_000,
+            115_000,
+        ));
+        assert_eq!(window.percentiles(), (56_000, 56_000, 91_000, 91_000));
+    }
+
+    #[test]
+    fn video_frame_size_window_discards_samples_after_idle_gap() {
+        let start = Instant::now();
+        let mut window = VideoFrameSizeWindow::new(start);
+        window.record(start, 80_000, 120_000);
+        window.record(
+            start + super::VIDEO_FRAME_SIZE_WINDOW_IDLE_RESET,
+            10_000,
+            20_000,
+        );
+        assert_eq!(window.percentiles(), (10_000, 10_000, 20_000, 20_000));
+    }
 
     #[test]
     fn video_admission_preserves_the_complete_interactive_reserve() {
@@ -709,12 +954,12 @@ mod tests {
     }
 
     #[test]
-    fn video_admission_bounds_existing_queue_age() {
+    fn video_admission_allows_one_complete_frame_at_the_queue_age_boundary() {
         assert!(video_frame_fits_send_budget(
-            64_000, 512_000, 64_000, 128_000, 192_000,
+            64_000, 512_000, 64_000, 192_000, 192_000,
         ));
         assert!(!video_frame_fits_send_budget(
-            64_001, 512_000, 64_000, 128_000, 192_000,
+            1, 512_000, 64_000, 192_001, 192_000,
         ));
     }
 
@@ -810,7 +1055,7 @@ mod tests {
             Some(VideoDatagramAdmissionFailure::InteractiveReserve)
         );
         assert_eq!(
-            video_frame_admission_failure(64_001, 512_000, 64_000, 128_000, 192_000),
+            video_frame_admission_failure(1, 512_000, 64_000, 192_001, 192_000),
             Some(VideoDatagramAdmissionFailure::VideoQueueBudget)
         );
     }

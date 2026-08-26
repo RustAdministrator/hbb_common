@@ -922,6 +922,7 @@ message VideoReferenceRefresh {
   uint64 stream_id = 2;
   uint64 received_frame_id = 3;
   uint64 dropped_frames = 4;
+  bool strict_recovery = 5;
 }
 
 message Misc {
