@@ -324,6 +324,9 @@ message KeyEvent {
   }
   repeated ControlKey modifiers = 8;
   KeyboardMode mode = 9;
+  // Prefer physical scan-code text injection when the receiver supports it.
+  // Unknown to older peers, which safely retain their existing text path.
+  bool scan_code_text = 10;
 }
 
 message CursorData {
