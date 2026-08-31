@@ -808,12 +808,26 @@ fn store_path_atomic(path: PathBuf, bytes: &[u8], mode: Option<u32>) -> crate::R
         let _ = fs::remove_file(&path_tmp);
         return Err(err.into());
     }
+    sync_parent_directory(&path)?;
     Ok(())
 }
 
 #[cfg(not(windows))]
 fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
     fs::rename(source, destination)
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    match path.parent() {
+        Some(parent) => fs::File::open(parent)?.sync_all(),
+        None => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -2335,10 +2349,23 @@ impl PeerConfig {
 
     pub fn store(&self, id: &str) {
         let _lock = CONFIG.read().unwrap();
-        self.store_(id);
+        if let Err(err) = self.store_result_(id) {
+            log::error!("Failed to store config: {}", err);
+        }
+    }
+
+    pub fn store_result(&self, id: &str) -> crate::ResultType<()> {
+        let _lock = CONFIG.read().unwrap();
+        self.store_result_(id)
     }
 
     fn store_(&self, id: &str) {
+        if let Err(err) = self.store_result_(id) {
+            log::error!("Failed to store config: {}", err);
+        }
+    }
+
+    fn store_result_(&self, id: &str) -> crate::ResultType<()> {
         let mut config = self.clone();
         config.password =
             encrypt_vec_or_original(&config.password, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
@@ -2347,14 +2374,23 @@ impl PeerConfig {
                 *v = encrypt_str_or_original(v, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN)
             }
         }
-        if let Err(err) = store_path(Self::path(id), config) {
-            log::error!("Failed to store config: {}", err);
-        }
+        store_path(Self::path(id), config)?;
         NEW_STORED_PEER_CONFIG.lock().unwrap().insert(id.to_owned());
+        Ok(())
     }
 
     pub fn remove(id: &str) {
-        fs::remove_file(Self::path(id)).ok();
+        if let Err(err) = Self::remove_result(id) {
+            log::error!("Failed to remove peer config: {}", err);
+        }
+    }
+
+    pub fn remove_result(id: &str) -> crate::ResultType<bool> {
+        match fs::remove_file(Self::path(id)) {
+            Ok(()) => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err.into()),
+        }
     }
 
     fn path(id: &str) -> PathBuf {
