@@ -2921,7 +2921,9 @@ fn classify_message(message: &Message) -> Result<ApplicationClass, QuicTransport
             },
             _ => ApplicationClass::Input,
         },
-        Some(message::Union::KeyEvent(_)) | Some(message::Union::PointerDeviceEvent(_)) => {
+        Some(message::Union::KeyEvent(_))
+        | Some(message::Union::KeyboardInput(_))
+        | Some(message::Union::PointerDeviceEvent(_)) => {
             ApplicationClass::Input
         }
         Some(message::Union::Clipboard(_))
@@ -3074,8 +3076,8 @@ mod tests {
     use super::*;
     use crate::{
         message_proto::{
-            AudioFrame, Clipboard, EncodedVideoFrame, EncodedVideoFrames, KeyEvent, MouseEvent,
-            SwitchDisplay,
+            AudioFrame, Clipboard, EncodedVideoFrame, EncodedVideoFrames, KeyboardInput,
+            KeyEvent, MouseEvent, SwitchDisplay,
         },
         sodiumoxide::crypto::sign,
         transport::quic::{
@@ -3090,6 +3092,13 @@ mod tests {
     struct TestCertificate {
         certificate: CertificateDer<'static>,
         private_key: Vec<u8>,
+    }
+
+    #[test]
+    fn keyboard_v2_uses_the_reliable_input_class() {
+        let mut message = Message::new();
+        message.set_keyboard_input(KeyboardInput::new());
+        assert_eq!(classify_message(&message).unwrap(), ApplicationClass::Input);
     }
 
     impl TestCertificate {

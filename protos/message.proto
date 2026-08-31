@@ -111,9 +111,24 @@ message Auth2FA {
 
 message ChatMessage { string text = 1; }
 
+message KeyboardCapabilities {
+  // Highest supported KeyboardInput protocol version.
+  uint32 protocol_version = 1;
+  bool committed_text = 2;
+  bool physical_key = 3;
+  bool modifier_sync = 4;
+  bool clipboard_text_fallback = 5;
+  bool secure_desktop_text = 6;
+  uint32 max_committed_text_bytes = 7;
+  // Receiver can map committed fallback text through the controller's source
+  // layout without consulting or changing the receiver's active layout.
+  bool layout_aware_text = 8;
+}
+
 message Features {
   bool privacy_mode = 1;
   bool terminal = 2;
+  KeyboardCapabilities keyboard = 3;
 }
 
 message CodecAbility {
@@ -327,6 +342,46 @@ message KeyEvent {
   // Prefer physical scan-code text injection when the receiver supports it.
   // Unknown to older peers, which safely retain their existing text path.
   bool scan_code_text = 10;
+  // Controller layout metadata for best-effort physical text injection.
+  string source_language_tag = 11;
+  string source_layout_type = 12;
+  bool source_layout_text = 13;
+}
+
+message CommittedText {
+  string text = 1;
+  uint32 delete_before_graphemes = 2;
+  uint32 delete_after_graphemes = 3;
+  string source_language_tag = 4;
+  string source_layout_type = 5;
+  bool prefer_physical = 6;
+}
+
+message PhysicalKey {
+  // USB HID keyboard usage ID from usage page 0x07.
+  uint32 usb_hid_usage = 1;
+  bool down = 2;
+  bool repeat = 3;
+  // Bit 0 Shift, bit 1 Control, bit 2 Alt, bit 3 Meta.
+  uint32 modifier_mask = 4;
+  // Bit 0 Caps Lock, bit 1 Num Lock, bit 2 Scroll Lock.
+  uint32 lock_mask = 5;
+}
+
+message ModifierSync {
+  uint32 modifier_mask = 1;
+  uint32 lock_mask = 2;
+}
+
+message KeyboardInput {
+  uint32 protocol_version = 1;
+  uint64 input_epoch = 2;
+  uint64 sequence = 3;
+  oneof union {
+    CommittedText committed_text = 4;
+    PhysicalKey physical_key = 5;
+    ModifierSync modifier_sync = 6;
+  }
 }
 
 message CursorData {
@@ -1091,5 +1146,6 @@ message Message {
     ScreenshotResponse screenshot_response= 30;
     TerminalAction terminal_action = 31;
     TerminalResponse terminal_response = 32;
+    KeyboardInput keyboard_input = 33;
   }
 }
