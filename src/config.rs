@@ -755,20 +755,13 @@ pub fn load_path<T: serde::Serialize + serde::de::DeserializeOwned + Default + s
 #[inline]
 pub fn store_path<T: serde::Serialize>(path: PathBuf, cfg: T) -> crate::ResultType<()> {
     let cfg = toml05::to_string_pretty(&cfg)?;
-    #[cfg(not(windows))]
-    {
-        store_path_atomic(path, cfg.as_bytes(), Some(0o600))
-    }
-    #[cfg(windows)]
-    {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        Ok(fs::write(path, cfg)?)
-    }
+    #[cfg(unix)]
+    let mode = Some(0o600);
+    #[cfg(not(unix))]
+    let mode = None;
+    store_path_atomic(path, cfg.as_bytes(), mode)
 }
 
-#[cfg(not(windows))]
 fn store_path_atomic(path: PathBuf, bytes: &[u8], mode: Option<u32>) -> crate::ResultType<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -805,11 +798,83 @@ fn store_path_atomic(path: PathBuf, bytes: &[u8], mode: Option<u32>) -> crate::R
         }
     };
 
-    file.write_all(bytes)?;
-    file.flush()?;
+    if let Err(err) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(&path_tmp);
+        return Err(err.into());
+    }
     drop(file);
-    fs::rename(path_tmp, path)?;
+    if let Err(err) = atomic_replace(&path_tmp, &path) {
+        let _ = fs::remove_file(&path_tmp);
+        return Err(err.into());
+    }
+    sync_parent_directory(&path)?;
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    match path.parent() {
+        Some(parent) => fs::File::open(parent)?.sync_all(),
+        None => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn atomic_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use winapi::{
+        shared::winerror::{ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION},
+        um::winbase::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH},
+    };
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    const MAX_ATTEMPTS: u32 = 7;
+    let mut attempt = 0;
+    loop {
+        let moved = unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if moved != 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        let transient = matches!(
+            err.raw_os_error(),
+            Some(code)
+                if code == ERROR_ACCESS_DENIED as i32
+                    || code == ERROR_SHARING_VIOLATION as i32
+                    || code == ERROR_LOCK_VIOLATION as i32
+        );
+        attempt += 1;
+        if !transient || attempt == MAX_ATTEMPTS {
+            return Err(err);
+        }
+        std::thread::sleep(Duration::from_millis(5u64 << (attempt - 1)));
+    }
 }
 
 #[cfg(not(windows))]
@@ -2284,10 +2349,23 @@ impl PeerConfig {
 
     pub fn store(&self, id: &str) {
         let _lock = CONFIG.read().unwrap();
-        self.store_(id);
+        if let Err(err) = self.store_result_(id) {
+            log::error!("Failed to store config: {}", err);
+        }
+    }
+
+    pub fn store_result(&self, id: &str) -> crate::ResultType<()> {
+        let _lock = CONFIG.read().unwrap();
+        self.store_result_(id)
     }
 
     fn store_(&self, id: &str) {
+        if let Err(err) = self.store_result_(id) {
+            log::error!("Failed to store config: {}", err);
+        }
+    }
+
+    fn store_result_(&self, id: &str) -> crate::ResultType<()> {
         let mut config = self.clone();
         config.password =
             encrypt_vec_or_original(&config.password, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
@@ -2296,14 +2374,23 @@ impl PeerConfig {
                 *v = encrypt_str_or_original(v, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN)
             }
         }
-        if let Err(err) = store_path(Self::path(id), config) {
-            log::error!("Failed to store config: {}", err);
-        }
+        store_path(Self::path(id), config)?;
         NEW_STORED_PEER_CONFIG.lock().unwrap().insert(id.to_owned());
+        Ok(())
     }
 
     pub fn remove(id: &str) {
-        fs::remove_file(Self::path(id)).ok();
+        if let Err(err) = Self::remove_result(id) {
+            log::error!("Failed to remove peer config: {}", err);
+        }
+    }
+
+    pub fn remove_result(id: &str) -> crate::ResultType<bool> {
+        match fs::remove_file(Self::path(id)) {
+            Ok(()) => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err.into()),
+        }
     }
 
     fn path(id: &str) -> PathBuf {
@@ -3890,6 +3977,83 @@ impl Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn atomic_store_test_path(name: &str) -> PathBuf {
+        static NEXT_PATH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        std::env::temp_dir()
+            .join(format!(
+                "rustadmin-hbb-config-{}-{}-{}",
+                std::process::id(),
+                NEXT_PATH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                name
+            ))
+            .join("nested")
+            .join("config.toml")
+    }
+
+    #[test]
+    fn test_store_path_atomically_creates_and_replaces_config() {
+        let path = atomic_store_test_path("replace");
+        let root = path.parent().and_then(Path::parent).unwrap().to_path_buf();
+        let first = HashMap::from([("value".to_owned(), "first".to_owned())]);
+        let second = HashMap::from([("value".to_owned(), "second".to_owned())]);
+
+        store_path(path.clone(), &first).unwrap();
+        store_path(path.clone(), &second).unwrap();
+
+        assert_eq!(load_path::<HashMap<String, String>>(path.clone()), second);
+        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_store_path_retries_windows_sharing_violation() {
+        use std::os::windows::ffi::OsStrExt;
+        use winapi::um::{
+            fileapi::{CreateFileW, OPEN_EXISTING},
+            handleapi::{CloseHandle, INVALID_HANDLE_VALUE},
+            winnt::{FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, GENERIC_READ},
+        };
+
+        let path = atomic_store_test_path("sharing");
+        let root = path.parent().and_then(Path::parent).unwrap().to_path_buf();
+        let first = HashMap::from([("value".to_owned(), "first".to_owned())]);
+        let second = HashMap::from([("value".to_owned(), "second".to_owned())]);
+        store_path(path.clone(), &first).unwrap();
+        let path_wide = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let handle = unsafe {
+            CreateFileW(
+                path_wide.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(handle, INVALID_HANDLE_VALUE);
+        let write_path = path.clone();
+        let writer = std::thread::spawn(move || store_path(write_path, &second));
+        std::thread::sleep(Duration::from_millis(30));
+        unsafe {
+            CloseHandle(handle);
+        }
+
+        writer.join().unwrap().unwrap();
+        assert_eq!(
+            load_path::<HashMap<String, String>>(path.clone())
+                .get("value")
+                .map(String::as_str),
+            Some("second")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn test_serialize() {
