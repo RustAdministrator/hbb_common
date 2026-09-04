@@ -67,6 +67,7 @@ const VIDEO_EPOCH_HOLDBACK_MAX_FRAMES: usize = 120;
 const VIDEO_EPOCH_HOLDBACK_MAX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_VIDEO_EPOCH_STREAM_STATES: usize = 8;
 const MAX_VIDEO_STREAM_STATES: usize = 16;
+const MAX_PENDING_VIDEO_TRACKS: usize = MAX_VIDEO_STREAM_STATES;
 
 fn video_epoch_reorder_window(rtt: Duration) -> Duration {
     rtt.saturating_mul(2)
@@ -109,7 +110,21 @@ struct ReliableVideoReceiveContext {
     keyframe_barrier: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct VideoStreamKey {
+    display: i32,
+    stream_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum VideoOutboundTrackKey {
+    Latest(u64),
+    Source(VideoStreamKey),
+    Unscoped,
+}
+
 struct VideoOutbound {
+    track_key: VideoOutboundTrackKey,
     metadata: VideoFrameMetadata,
     source_info: Option<VideoSourceInfo>,
     payload: Bytes,
@@ -174,8 +189,14 @@ struct VideoSendRecovery {
 
 #[derive(Default)]
 struct VideoSendRecoveryState {
+    tracks: BTreeMap<VideoOutboundTrackKey, VideoSendTrackRecoveryState>,
+    activity_generation: u64,
+}
+
+struct VideoSendTrackRecoveryState {
     awaiting_keyframe: bool,
     minimum_keyframe_id: u64,
+    last_activity: u64,
 }
 
 impl VideoSendRecovery {
@@ -194,15 +215,39 @@ impl VideoSendRecovery {
 
     fn enter(
         &self,
+        track_key: VideoOutboundTrackKey,
         source_info: Option<VideoSourceInfo>,
         dropped_frame_id: u64,
         reason: &'static str,
     ) {
         let first_loss = {
             let mut state = self.state.lock().unwrap();
-            state.minimum_keyframe_id = state.minimum_keyframe_id.max(dropped_frame_id);
-            let first_loss = !state.awaiting_keyframe;
-            state.awaiting_keyframe = true;
+            state.activity_generation = state.activity_generation.saturating_add(1);
+            let activity_generation = state.activity_generation;
+            if !state.tracks.contains_key(&track_key)
+                && state.tracks.len() >= MAX_VIDEO_STREAM_STATES
+            {
+                let oldest = state
+                    .tracks
+                    .iter()
+                    .min_by_key(|(_, track)| track.last_activity)
+                    .map(|(key, _)| *key);
+                if let Some(oldest) = oldest {
+                    state.tracks.remove(&oldest);
+                }
+            }
+            let track = state
+                .tracks
+                .entry(track_key)
+                .or_insert(VideoSendTrackRecoveryState {
+                    awaiting_keyframe: false,
+                    minimum_keyframe_id: 0,
+                    last_activity: activity_generation,
+                });
+            track.minimum_keyframe_id = track.minimum_keyframe_id.max(dropped_frame_id);
+            track.last_activity = activity_generation;
+            let first_loss = !track.awaiting_keyframe;
+            track.awaiting_keyframe = true;
             first_loss
         };
         if first_loss {
@@ -224,20 +269,24 @@ impl VideoSendRecovery {
                 let _ = self.refresh.try_send(LocalVideoRefresh::Legacy);
             }
             log::warn!(
-                "QUIC video sender lost an encoded reference at frame {dropped_frame_id}: {reason}; requesting a fresh keyframe"
+                "QUIC video sender lost an encoded reference for {track_key:?} at frame {dropped_frame_id}: {reason}; requesting a fresh keyframe"
             );
         }
     }
 
-    fn suppress_delta(&self, frame_id: u64) -> bool {
+    fn suppress_delta(&self, track_key: VideoOutboundTrackKey, frame_id: u64) -> bool {
         let suppressed = {
             let mut state = self.state.lock().unwrap();
-            if !state.awaiting_keyframe {
-                false
-            } else {
-                state.minimum_keyframe_id = state.minimum_keyframe_id.max(frame_id);
+            state.activity_generation = state.activity_generation.saturating_add(1);
+            let activity_generation = state.activity_generation;
+            state.tracks.get_mut(&track_key).is_some_and(|track| {
+                track.last_activity = activity_generation;
+                if !track.awaiting_keyframe {
+                    return false;
+                }
+                track.minimum_keyframe_id = track.minimum_keyframe_id.max(frame_id);
                 true
-            }
+            })
         };
         if !suppressed {
             return false;
@@ -248,18 +297,16 @@ impl VideoSendRecovery {
         true
     }
 
-    fn keyframe_sent(&self, frame_id: u64) {
+    fn keyframe_sent(&self, track_key: VideoOutboundTrackKey, frame_id: u64) {
         let mut state = self.state.lock().unwrap();
-        if frame_id > state.minimum_keyframe_id {
-            state.awaiting_keyframe = false;
+        if state
+            .tracks
+            .get(&track_key)
+            .is_some_and(|track| frame_id > track.minimum_keyframe_id)
+        {
+            state.tracks.remove(&track_key);
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct VideoStreamKey {
-    display: i32,
-    stream_id: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -268,6 +315,18 @@ struct VideoSourceInfo {
     frame_id: u64,
     keyframe: bool,
     codec: VideoCodec,
+}
+
+impl VideoOutboundTrackKey {
+    fn resolve(latest_key: Option<u64>, source_info: Option<VideoSourceInfo>) -> Self {
+        if let Some(key) = latest_key {
+            Self::Latest(key)
+        } else if let Some(source) = source_info {
+            Self::Source(source.key)
+        } else {
+            Self::Unscoped
+        }
+    }
 }
 
 struct HeldVideoFrame {
@@ -577,18 +636,25 @@ enum VideoKeyframeRequest {
 struct VideoReceiveRecovery {
     streams: BTreeMap<VideoStreamKey, VideoReceiveState>,
     last_observed: Option<VideoSourceInfo>,
-    pending_request: Option<PendingVideoRecovery>,
-    last_keyframe_request_at: Option<Instant>,
+    pending_requests: BTreeMap<Option<VideoStreamKey>, PendingVideoRecovery>,
+    last_keyframe_request_at: BTreeMap<Option<VideoStreamKey>, Instant>,
 }
 
 impl VideoReceiveRecovery {
+    fn prepare_stream(&mut self, key: VideoStreamKey) {
+        if !self.streams.contains_key(&key) && self.streams.len() >= MAX_VIDEO_STREAM_STATES {
+            if let Some((evicted, _)) = self.streams.pop_first() {
+                self.pending_requests.remove(&Some(evicted));
+                self.last_keyframe_request_at.remove(&Some(evicted));
+            }
+        }
+    }
+
     fn note_source_context(&mut self, info: VideoSourceInfo) {
         if info.key.stream_id == 0 || info.frame_id == 0 {
             return;
         }
-        if !self.streams.contains_key(&info.key) && self.streams.len() >= MAX_VIDEO_STREAM_STATES {
-            self.streams.pop_first();
-        }
+        self.prepare_stream(info.key);
         self.last_observed = Some(info);
         self.streams.entry(info.key).or_default().codec = Some(info.codec);
     }
@@ -609,35 +675,36 @@ impl VideoReceiveRecovery {
             self.streams.retain(|key, _| {
                 key.display != info.key.display || key.stream_id == info.key.stream_id
             });
-            if self.pending_request.is_some_and(|pending| {
-                pending.source.is_some_and(|source| {
+            self.pending_requests.retain(|_, pending| {
+                !pending.source.is_some_and(|source| {
                     source.key.display == info.key.display && source.key != info.key
                 })
-            }) {
-                self.pending_request = None;
-            }
+            });
+            self.last_keyframe_request_at.retain(|request_key, _| {
+                request_key.map_or(true, |key| {
+                    key.display != info.key.display || key.stream_id == info.key.stream_id
+                })
+            });
             if replaced_stream {
-                self.last_keyframe_request_at = None;
+                self.last_keyframe_request_at.remove(&None);
             }
         }
-        if !self.streams.contains_key(&info.key) && self.streams.len() >= MAX_VIDEO_STREAM_STATES {
-            self.streams.pop_first();
-        }
+        self.prepare_stream(info.key);
         self.last_observed = Some(info);
-        let state = self.streams.entry(info.key).or_default();
-        state.codec = Some(info.codec);
         if info.keyframe {
-            if self.pending_request.is_some_and(|pending| {
-                pending
+            self.pending_requests.retain(|_, pending| {
+                !pending
                     .source
                     .is_some_and(|source| source.key == info.key && info.frame_id > source.frame_id)
-            }) {
-                self.pending_request = None;
-            }
+            });
+            let state = self.streams.entry(info.key).or_default();
+            state.codec = Some(info.codec);
             state.last_frame_id = info.frame_id;
             state.awaiting_keyframe = false;
             return VideoReceiveDecision::Accept;
         }
+        let state = self.streams.entry(info.key).or_default();
+        state.codec = Some(info.codec);
         if state.awaiting_keyframe || state.last_frame_id == 0 {
             state.awaiting_keyframe = true;
             return VideoReceiveDecision::Suppress;
@@ -659,6 +726,12 @@ impl VideoReceiveRecovery {
 
     fn mark_reference_loss(&mut self) {
         for state in self.streams.values_mut() {
+            state.awaiting_keyframe = true;
+        }
+    }
+
+    fn mark_stream_reference_loss(&mut self, key: VideoStreamKey) {
+        if let Some(state) = self.streams.get_mut(&key) {
             state.awaiting_keyframe = true;
         }
     }
@@ -710,7 +783,15 @@ impl VideoReceiveRecovery {
             return None;
         }
 
-        let is_new_stream = self.pending_request.is_some_and(|pending| {
+        let request_key = if scoped_reference_refresh {
+            Some(source?.key)
+        } else {
+            None
+        };
+        let pending_request = self.pending_requests.get(&request_key).copied();
+        let last_keyframe_request_at = self.last_keyframe_request_at.get(&request_key).copied();
+
+        let is_new_stream = pending_request.is_some_and(|pending| {
             pending
                 .source
                 .zip(source)
@@ -721,18 +802,16 @@ impl VideoReceiveRecovery {
         // otherwise the minimum interval can leave the decoder suppressed.
         let strict_escalation = scoped_reference_refresh
             && strict_recovery
-            && !self
-                .pending_request
-                .is_some_and(|pending| pending.strict_recovery);
+            && !pending_request.is_some_and(|pending| pending.strict_recovery);
         if !is_new_stream
             && !strict_escalation
-            && self.last_keyframe_request_at.is_some_and(|last| {
+            && last_keyframe_request_at.is_some_and(|last| {
                 now.saturating_duration_since(last) < VIDEO_KEYFRAME_REQUEST_MIN_INTERVAL
             })
         {
             return None;
         }
-        let due = match self.pending_request {
+        let due = match pending_request {
             None => true,
             Some(_) if is_new_stream => true,
             Some(pending) if pending.retries < VIDEO_KEYFRAME_RETRY_MAX_ATTEMPTS => {
@@ -750,9 +829,9 @@ impl VideoReceiveRecovery {
         }
 
         let retries = if strict_escalation {
-            self.pending_request.map_or(0, |pending| pending.retries)
+            pending_request.map_or(0, |pending| pending.retries)
         } else {
-            match self.pending_request {
+            match pending_request {
                 Some(pending)
                     if !is_new_stream && pending.retries < VIDEO_KEYFRAME_RETRY_MAX_ATTEMPTS =>
                 {
@@ -762,10 +841,7 @@ impl VideoReceiveRecovery {
             }
         };
         let strict_recovery = strict_recovery
-            || (!is_new_stream
-                && self
-                    .pending_request
-                    .is_some_and(|pending| pending.strict_recovery));
+            || (!is_new_stream && pending_request.is_some_and(|pending| pending.strict_recovery));
         if strict_escalation {
             if let Some(source) = source {
                 log::debug!(
@@ -773,17 +849,20 @@ impl VideoReceiveRecovery {
                     source.key.display,
                     source.key.stream_id,
                     source.frame_id,
-                    self.pending_request.map_or(0, |pending| pending.retries),
+                    pending_request.map_or(0, |pending| pending.retries),
                 );
             }
         }
-        self.pending_request = Some(PendingVideoRecovery {
-            source,
-            requested_at: now,
-            retries,
-            strict_recovery,
-        });
-        self.last_keyframe_request_at = Some(now);
+        self.pending_requests.insert(
+            request_key,
+            PendingVideoRecovery {
+                source,
+                requested_at: now,
+                retries,
+                strict_recovery,
+            },
+        );
+        self.last_keyframe_request_at.insert(request_key, now);
         match (scoped_reference_refresh, source) {
             (true, Some(source)) => {
                 video_reference_refresh(source, dropped_frames, strict_recovery)
@@ -846,6 +925,17 @@ struct LatestSlot<T> {
     value: Mutex<Option<T>>,
     notify: Notify,
     replacements: AtomicU64,
+}
+
+struct TrackLatestState<T> {
+    pending: BTreeMap<VideoOutboundTrackKey, T>,
+    last_taken: Option<VideoOutboundTrackKey>,
+}
+
+struct TrackLatestSlot<T> {
+    state: Mutex<TrackLatestState<T>>,
+    notify: Notify,
+    max_tracks: usize,
 }
 
 struct VideoOrderingGate {
@@ -950,6 +1040,81 @@ impl<T> LatestSlot<T> {
     }
 }
 
+impl<T> TrackLatestSlot<T> {
+    fn new(max_tracks: usize) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(TrackLatestState {
+                pending: BTreeMap::new(),
+                last_taken: None,
+            }),
+            notify: Notify::new(),
+            max_tracks: max_tracks.max(1),
+        })
+    }
+
+    fn replace_when_with(
+        &self,
+        key: VideoOutboundTrackKey,
+        value: T,
+        should_replace: impl FnOnce(&T, &T) -> bool,
+        on_replace: impl FnOnce(&T, &T),
+    ) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if let Some(pending) = state.pending.get_mut(&key) {
+            if !should_replace(pending, &value) {
+                return false;
+            }
+            on_replace(pending, &value);
+            *pending = value;
+        } else {
+            if state.pending.len() >= self.max_tracks {
+                return false;
+            }
+            state.pending.insert(key, value);
+        }
+        drop(state);
+        self.notify.notify_one();
+        true
+    }
+
+    async fn take(&self) -> T {
+        loop {
+            let notified = self.notify.notified();
+            let value = {
+                let mut state = self.state.lock().unwrap();
+                let next_key = state
+                    .last_taken
+                    .and_then(|last| {
+                        state
+                            .pending
+                            .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded))
+                            .next()
+                            .map(|(key, _)| *key)
+                    })
+                    .or_else(|| state.pending.first_key_value().map(|(key, _)| *key));
+                next_key.and_then(|key| {
+                    state.last_taken = Some(key);
+                    state.pending.remove(&key)
+                })
+            };
+            if let Some(value) = value {
+                return value;
+            }
+            notified.await;
+        }
+    }
+
+    async fn take_track(&self, key: VideoOutboundTrackKey) -> T {
+        loop {
+            let notified = self.notify.notified();
+            if let Some(value) = self.state.lock().unwrap().pending.remove(&key) {
+                return value;
+            }
+            notified.await;
+        }
+    }
+}
+
 pub struct QuicApplicationStream {
     connection: Connection,
     _authentication: AuthenticatedControlChannel,
@@ -961,7 +1126,7 @@ pub struct QuicApplicationStream {
     file: mpsc::Sender<ReliableOutbound>,
     diagnostics: mpsc::Sender<ReliableOutbound>,
     audio: mpsc::Sender<AudioOutbound>,
-    latest_video: Arc<LatestSlot<VideoOutbound>>,
+    latest_video: Arc<TrackLatestSlot<VideoOutbound>>,
     video_send_recovery: Arc<VideoSendRecovery>,
     latest_mouse: Arc<LatestSlot<MouseOutbound>>,
     datagram_send: Arc<QuicDatagramSendCoordinator>,
@@ -1007,7 +1172,7 @@ impl QuicApplicationStream {
         let video_ordering = VideoOrderingGate::new();
         let metrics = Arc::new(QuicApplicationMetrics::default());
         let closing = Arc::new(AtomicBool::new(false));
-        let (video_refresh_tx, video_refresh_rx) = mpsc::channel(1);
+        let (video_refresh_tx, video_refresh_rx) = mpsc::channel(MAX_VIDEO_STREAM_STATES);
         let video_send_recovery = VideoSendRecovery::new(
             video_refresh_tx,
             application_protocol.supports_scoped_video_reference_refresh(),
@@ -1096,7 +1261,7 @@ impl QuicApplicationStream {
         };
 
         let (audio, audio_rx) = mpsc::channel(AUDIO_OUTBOUND_CAPACITY);
-        let latest_video = LatestSlot::new();
+        let latest_video = TrackLatestSlot::new(MAX_PENDING_VIDEO_TRACKS);
         let latest_mouse = LatestSlot::new();
         let datagram_send = QuicDatagramSendCoordinator::new(
             DEFAULT_INTERACTIVE_DATAGRAM_RESERVE_BYTES,
@@ -1193,6 +1358,18 @@ impl QuicApplicationStream {
     }
 
     pub fn enqueue(&self, payload: Bytes) -> crate::ResultType<()> {
+        self.enqueue_with_latest_key(None, payload)
+    }
+
+    pub fn enqueue_latest(&self, key: u64, payload: Bytes) -> crate::ResultType<()> {
+        self.enqueue_with_latest_key(Some(key), payload)
+    }
+
+    fn enqueue_with_latest_key(
+        &self,
+        latest_key: Option<u64>,
+        payload: Bytes,
+    ) -> crate::ResultType<()> {
         if self.closing.load(Ordering::Acquire) {
             if !self.raw_mode.load(Ordering::Acquire)
                 && Message::parse_from_bytes(&payload)
@@ -1260,12 +1437,15 @@ impl QuicApplicationStream {
                     })?;
                 let frame_id = metadata.frame_id;
                 let keyframe = metadata.flags & FLAG_KEYFRAME != 0;
-                if !keyframe && self.video_send_recovery.suppress_delta(frame_id) {
+                let source_info = video_source_info(&payload).ok();
+                let track_key = VideoOutboundTrackKey::resolve(latest_key, source_info);
+                if !keyframe && self.video_send_recovery.suppress_delta(track_key, frame_id) {
                     return Ok(());
                 }
-                let source_info = video_source_info(&payload).ok();
                 let queued = self.latest_video.replace_when_with(
+                    track_key,
                     VideoOutbound {
+                        track_key,
                         metadata,
                         source_info,
                         payload,
@@ -1278,6 +1458,7 @@ impl QuicApplicationStream {
                             .fetch_add(1, Ordering::Relaxed);
                         if !incoming.is_keyframe() {
                             self.video_send_recovery.enter(
+                                incoming.track_key,
                                 incoming.source_info,
                                 incoming.metadata.frame_id,
                                 "a newer encoded delta replaced a pending frame",
@@ -1290,6 +1471,7 @@ impl QuicApplicationStream {
                         .video_sender_replacements
                         .fetch_add(1, Ordering::Relaxed);
                     self.video_send_recovery.enter(
+                        track_key,
                         source_info,
                         frame_id,
                         "an encoded frame could not enter the latest-frame slot",
@@ -2119,7 +2301,7 @@ async fn run_local_video_refresh(
 
 async fn run_video_writer(
     mut sender: QuicDatagramSender,
-    video: Arc<LatestSlot<VideoOutbound>>,
+    video: Arc<TrackLatestSlot<VideoOutbound>>,
     video_ordering: Arc<VideoOrderingGate>,
     inbound: mpsc::Sender<Result<BytesMut, Error>>,
     connection: Connection,
@@ -2146,7 +2328,7 @@ async fn run_video_writer(
                     return;
                 },
                 _ = video_ordering.wait(item.ordering_epoch) => {},
-                newer = video.take() => {
+                newer = video.take_track(item.track_key) => {
                     if should_replace_pending_video(&item, &newer) {
                         recovery
                             .metrics
@@ -2154,6 +2336,7 @@ async fn run_video_writer(
                             .fetch_add(1, Ordering::Relaxed);
                         if !newer.is_keyframe() {
                             recovery.enter(
+                                newer.track_key,
                                 newer.source_info,
                                 newer.metadata.frame_id,
                                 "a newer encoded delta replaced a frame waiting for display ordering",
@@ -2166,6 +2349,7 @@ async fn run_video_writer(
                             .video_sender_replacements
                             .fetch_add(1, Ordering::Relaxed);
                         recovery.enter(
+                            newer.track_key,
                             newer.source_info,
                             newer.metadata.frame_id,
                             "an encoded frame was discarded while waiting for display ordering",
@@ -2174,7 +2358,7 @@ async fn run_video_writer(
                 },
             }
         }
-        if !item.is_keyframe() && recovery.suppress_delta(item.metadata.frame_id) {
+        if !item.is_keyframe() && recovery.suppress_delta(item.track_key, item.metadata.frame_id) {
             continue;
         }
         let reference_epoch =
@@ -2221,7 +2405,7 @@ async fn run_video_writer(
                     path.lost_bytes,
                     path.sent_packets,
                 );
-                recovery.keyframe_sent(item.metadata.frame_id);
+                recovery.keyframe_sent(item.track_key, item.metadata.frame_id);
                 continue;
             }
         }
@@ -2271,6 +2455,7 @@ async fn run_video_writer(
                     required_bytes_p99,
                 );
                 recovery.enter(
+                    item.track_key,
                     item.source_info,
                     item.metadata.frame_id,
                     "the complete encoded frame did not fit the QUIC DATAGRAM send budget",
@@ -2283,7 +2468,7 @@ async fn run_video_writer(
             }
         }
         if item.is_keyframe() {
-            recovery.keyframe_sent(item.metadata.frame_id);
+            recovery.keyframe_sent(item.track_key, item.metadata.frame_id);
         }
     }
 }
@@ -2536,7 +2721,10 @@ fn deliver_video_payload(
                     }
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    recovery.lock().unwrap().mark_reference_loss();
+                    recovery
+                        .lock()
+                        .unwrap()
+                        .mark_stream_reference_loss(info.key);
                     metrics
                         .video_recovery_suppressed_frames
                         .fetch_add(1, Ordering::Relaxed);
@@ -2923,9 +3111,7 @@ fn classify_message(message: &Message) -> Result<ApplicationClass, QuicTransport
         },
         Some(message::Union::KeyEvent(_))
         | Some(message::Union::KeyboardInput(_))
-        | Some(message::Union::PointerDeviceEvent(_)) => {
-            ApplicationClass::Input
-        }
+        | Some(message::Union::PointerDeviceEvent(_)) => ApplicationClass::Input,
         Some(message::Union::Clipboard(_))
         | Some(message::Union::MultiClipboards(_))
         | Some(message::Union::Cliprdr(_)) => ApplicationClass::Clipboard,
@@ -3076,8 +3262,8 @@ mod tests {
     use super::*;
     use crate::{
         message_proto::{
-            AudioFrame, Clipboard, EncodedVideoFrame, EncodedVideoFrames, KeyboardInput,
-            KeyEvent, MouseEvent, SwitchDisplay,
+            AudioFrame, Clipboard, EncodedVideoFrame, EncodedVideoFrames, KeyEvent, KeyboardInput,
+            MouseEvent, SwitchDisplay,
         },
         sodiumoxide::crypto::sign,
         transport::quic::{
@@ -3190,7 +3376,17 @@ mod tests {
     }
 
     fn outbound_video(frame_id: u64, keyframe: bool, ordering_epoch: u64) -> VideoOutbound {
+        outbound_video_for_track(7, frame_id, keyframe, ordering_epoch)
+    }
+
+    fn outbound_video_for_track(
+        track_key: u64,
+        frame_id: u64,
+        keyframe: bool,
+        ordering_epoch: u64,
+    ) -> VideoOutbound {
         VideoOutbound {
+            track_key: VideoOutboundTrackKey::Latest(track_key),
             metadata: VideoFrameMetadata {
                 frame_id,
                 codec: VideoCodec::H264,
@@ -3237,13 +3433,63 @@ mod tests {
 
     #[tokio::test]
     async fn latest_video_slot_preserves_pending_keyframe_from_same_epoch_delta() {
-        let slot = LatestSlot::new();
-        assert!(slot.replace_when(outbound_video(1, true, 4), should_replace_pending_video));
-        assert!(!slot.replace_when(outbound_video(2, false, 4), should_replace_pending_video));
+        let slot = TrackLatestSlot::new(2);
+        let track = VideoOutboundTrackKey::Latest(7);
+        assert!(slot.replace_when_with(
+            track,
+            outbound_video(1, true, 4),
+            should_replace_pending_video,
+            |_, _| {},
+        ));
+        assert!(!slot.replace_when_with(
+            track,
+            outbound_video(2, false, 4),
+            should_replace_pending_video,
+            |_, _| {},
+        ));
 
         let pending = slot.take().await;
         assert_eq!(pending.metadata.frame_id, 1);
         assert!(pending.is_keyframe());
+    }
+
+    #[tokio::test]
+    async fn latest_video_slot_isolates_tracks_and_rotates_service() {
+        let slot = TrackLatestSlot::new(2);
+        let track_a = VideoOutboundTrackKey::Latest(7);
+        let track_b = VideoOutboundTrackKey::Latest(8);
+        assert!(slot.replace_when_with(
+            track_a,
+            outbound_video_for_track(7, 1, false, 4),
+            should_replace_pending_video,
+            |_, _| {},
+        ));
+        assert!(slot.replace_when_with(
+            track_b,
+            outbound_video_for_track(8, 1, true, 4),
+            should_replace_pending_video,
+            |_, _| {},
+        ));
+        assert!(slot.replace_when_with(
+            track_a,
+            outbound_video_for_track(7, 2, false, 4),
+            should_replace_pending_video,
+            |_, _| {},
+        ));
+
+        let first = slot.take().await;
+        assert_eq!(first.track_key, track_a);
+        assert_eq!(first.metadata.frame_id, 2);
+
+        assert!(slot.replace_when_with(
+            track_a,
+            outbound_video_for_track(7, 3, false, 4),
+            should_replace_pending_video,
+            |_, _| {},
+        ));
+        let second = slot.take().await;
+        assert_eq!(second.track_key, track_b);
+        assert!(second.is_keyframe());
     }
 
     #[test]
@@ -3506,6 +3752,42 @@ mod tests {
     }
 
     #[test]
+    fn full_decode_queue_marks_only_the_affected_video_stream() {
+        let (inbound, _inbound_rx) = mpsc::channel(1);
+        let metrics = QuicApplicationMetrics::default();
+        let recovery = Mutex::new(VideoReceiveRecovery::default());
+        let track_a = source_video_for_display(0, 7, 1, true);
+        let track_b = source_video_for_display(1, 8, 1, true);
+        {
+            let mut recovery = recovery.lock().unwrap();
+            assert_eq!(
+                recovery.observe(track_a, true),
+                VideoReceiveDecision::Accept
+            );
+            assert_eq!(
+                recovery.observe(track_b, true),
+                VideoReceiveDecision::Accept
+            );
+        }
+        inbound
+            .try_send(Ok(BytesMut::from(&b"occupied"[..])))
+            .unwrap();
+
+        let delivery = deliver_video_payload(
+            source_video_for_display(1, 8, 2, true),
+            Bytes::from_static(b"track-b-keyframe"),
+            &inbound,
+            &metrics,
+            &recovery,
+            false,
+        );
+        assert!(delivery.strict_recovery);
+        let recovery = recovery.lock().unwrap();
+        assert!(!recovery.stream_awaiting_keyframe(track_a.key));
+        assert!(recovery.stream_awaiting_keyframe(track_b.key));
+    }
+
+    #[test]
     fn receiver_recovery_isolated_per_video_stream() {
         let mut recovery = VideoReceiveRecovery::default();
         assert_eq!(
@@ -3524,6 +3806,53 @@ mod tests {
             recovery.observe(source_video_for_display(1, 2, 2, false), true),
             VideoReceiveDecision::Accept
         );
+    }
+
+    #[test]
+    fn receiver_scoped_request_cycles_are_isolated_per_video_stream() {
+        let now = Instant::now();
+        let mut recovery = VideoReceiveRecovery::default();
+        let track_a = source_video_for_display(0, 7, 1, true);
+        let track_b = source_video_for_display(1, 8, 1, true);
+        assert_eq!(
+            recovery.observe(track_a, true),
+            VideoReceiveDecision::Accept
+        );
+        assert_eq!(
+            recovery.observe(track_b, true),
+            VideoReceiveDecision::Accept
+        );
+
+        assert_eq!(
+            recovery.observe(source_video_for_display(0, 7, 3, false), true),
+            VideoReceiveDecision::SuppressAfterGap
+        );
+        let Some(VideoKeyframeRequest::Scoped(request_a)) =
+            recovery.next_keyframe_request(now, true, 1)
+        else {
+            panic!("expected scoped request for track A");
+        };
+        assert_eq!((request_a.display, request_a.stream_id), (0, 7));
+
+        assert_eq!(
+            recovery.observe(source_video_for_display(1, 8, 3, false), true),
+            VideoReceiveDecision::SuppressAfterGap
+        );
+        let Some(VideoKeyframeRequest::Scoped(request_b)) =
+            recovery.next_keyframe_request(now, true, 1)
+        else {
+            panic!("expected independent scoped request for track B");
+        };
+        assert_eq!((request_b.display, request_b.stream_id), (1, 8));
+        assert_eq!(recovery.pending_requests.len(), 2);
+
+        assert_eq!(
+            recovery.observe(source_video_for_display(0, 7, 4, true), true),
+            VideoReceiveDecision::Accept
+        );
+        assert!(!recovery.pending_requests.contains_key(&Some(track_a.key)));
+        assert!(recovery.pending_requests.contains_key(&Some(track_b.key)));
+        assert!(recovery.stream_awaiting_keyframe(track_b.key));
     }
 
     #[test]
@@ -3670,7 +3999,7 @@ mod tests {
             recovery.observe(source_video(7, 5, true), true),
             VideoReceiveDecision::Accept
         );
-        assert!(recovery.pending_request.is_none());
+        assert!(recovery.pending_requests.is_empty());
         assert_eq!(
             recovery.observe(source_video(7, 7, false), true),
             VideoReceiveDecision::SuppressAfterGap
@@ -3725,7 +4054,7 @@ mod tests {
             recovery.observe(source_video(7, 7, true), true),
             VideoReceiveDecision::Accept
         );
-        assert!(recovery.pending_request.is_none());
+        assert!(recovery.pending_requests.is_empty());
         assert_eq!(
             recovery.observe(source_video(7, 9, false), true),
             VideoReceiveDecision::SuppressAfterGap
@@ -4148,8 +4477,14 @@ mod tests {
         let (refresh, mut refresh_rx) = mpsc::channel(1);
         let metrics = Arc::new(QuicApplicationMetrics::default());
         let recovery = VideoSendRecovery::new(refresh, true, metrics.clone());
-        recovery.enter(Some(source_video(7, 2, false)), 2, "test loss");
-        recovery.enter(Some(source_video(7, 3, false)), 3, "same recovery window");
+        let track = VideoOutboundTrackKey::Latest(7);
+        recovery.enter(track, Some(source_video(7, 2, false)), 2, "test loss");
+        recovery.enter(
+            track,
+            Some(source_video(7, 3, false)),
+            3,
+            "same recovery window",
+        );
         match refresh_rx.try_recv() {
             Ok(LocalVideoRefresh::Reference(refresh)) => {
                 assert_eq!(refresh.display, 0);
@@ -4160,11 +4495,11 @@ mod tests {
         }
         assert!(refresh_rx.try_recv().is_err());
 
-        assert!(recovery.suppress_delta(4));
-        recovery.keyframe_sent(3);
-        assert!(recovery.suppress_delta(5));
-        recovery.keyframe_sent(6);
-        assert!(!recovery.suppress_delta(7));
+        assert!(recovery.suppress_delta(track, 4));
+        recovery.keyframe_sent(track, 3);
+        assert!(recovery.suppress_delta(track, 5));
+        recovery.keyframe_sent(track, 6);
+        assert!(!recovery.suppress_delta(track, 7));
         assert_eq!(
             metrics
                 .video_sender_reference_resets
@@ -4180,11 +4515,48 @@ mod tests {
     }
 
     #[test]
+    fn sender_reference_recovery_is_isolated_per_track() {
+        let (refresh, mut refresh_rx) = mpsc::channel(2);
+        let metrics = Arc::new(QuicApplicationMetrics::default());
+        let recovery = VideoSendRecovery::new(refresh, true, metrics);
+        let track_a = VideoOutboundTrackKey::Latest(7);
+        let track_b = VideoOutboundTrackKey::Latest(8);
+
+        recovery.enter(
+            track_b,
+            Some(source_video_for_display(1, 8, 2, false)),
+            2,
+            "test loss",
+        );
+        assert!(recovery.suppress_delta(track_b, 3));
+        assert!(!recovery.suppress_delta(track_a, 3));
+
+        recovery.keyframe_sent(track_a, 4);
+        assert!(recovery.suppress_delta(track_b, 5));
+        recovery.keyframe_sent(track_b, 6);
+        assert!(!recovery.suppress_delta(track_b, 7));
+
+        match refresh_rx.try_recv() {
+            Ok(LocalVideoRefresh::Reference(refresh)) => {
+                assert_eq!(refresh.display, 1);
+                assert_eq!(refresh.stream_id, 8);
+            }
+            _ => panic!("expected a scoped refresh for track B"),
+        }
+        assert!(refresh_rx.try_recv().is_err());
+    }
+
+    #[test]
     fn sender_reference_recovery_keeps_legacy_fallback_for_old_quic_protocols() {
         let (refresh, mut refresh_rx) = mpsc::channel(1);
         let metrics = Arc::new(QuicApplicationMetrics::default());
         let recovery = VideoSendRecovery::new(refresh, false, metrics);
-        recovery.enter(Some(source_video(7, 2, false)), 2, "test loss");
+        recovery.enter(
+            VideoOutboundTrackKey::Latest(7),
+            Some(source_video(7, 2, false)),
+            2,
+            "test loss",
+        );
         assert!(matches!(
             refresh_rx.try_recv(),
             Ok(LocalVideoRefresh::Legacy)
@@ -4196,7 +4568,7 @@ mod tests {
         let (refresh, mut refresh_rx) = mpsc::channel(1);
         let metrics = Arc::new(QuicApplicationMetrics::default());
         let recovery = VideoSendRecovery::new(refresh, true, metrics);
-        recovery.enter(None, 2, "test loss");
+        recovery.enter(VideoOutboundTrackKey::Latest(7), None, 2, "test loss");
         assert!(refresh_rx.try_recv().is_err());
     }
 

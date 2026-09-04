@@ -841,7 +841,7 @@ impl Stream {
                 stream.enqueue_latest(key, Bytes::from(msg.write_to_bytes()?), kind)
             }
             #[cfg(feature = "quic-transport")]
-            Self::Quic(stream) => stream.enqueue(Bytes::from(msg.write_to_bytes()?)),
+            Self::Quic(stream) => stream.enqueue_latest(key, Bytes::from(msg.write_to_bytes()?)),
             _ => self.send(msg).await,
         }
     }
