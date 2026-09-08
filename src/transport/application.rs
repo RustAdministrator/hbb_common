@@ -190,13 +190,12 @@ struct VideoSendRecovery {
 #[derive(Default)]
 struct VideoSendRecoveryState {
     tracks: BTreeMap<VideoOutboundTrackKey, VideoSendTrackRecoveryState>,
-    activity_generation: u64,
 }
 
 struct VideoSendTrackRecoveryState {
     awaiting_keyframe: bool,
     minimum_keyframe_id: u64,
-    last_activity: u64,
+    source: Option<VideoStreamKey>,
 }
 
 impl VideoSendRecovery {
@@ -222,30 +221,41 @@ impl VideoSendRecovery {
     ) {
         let first_loss = {
             let mut state = self.state.lock().unwrap();
-            state.activity_generation = state.activity_generation.saturating_add(1);
-            let activity_generation = state.activity_generation;
-            if !state.tracks.contains_key(&track_key)
-                && state.tracks.len() >= MAX_VIDEO_STREAM_STATES
-            {
-                let oldest = state
-                    .tracks
-                    .iter()
-                    .min_by_key(|(_, track)| track.last_activity)
-                    .map(|(key, _)| *key);
-                if let Some(oldest) = oldest {
-                    state.tracks.remove(&oldest);
+            let source = source_info.map(|info| info.key);
+            if let Some(source) = source {
+                if source.display < 0 || source.display as usize >= MAX_VIDEO_DISPLAYS {
+                    return;
+                }
+                if state.tracks.values().any(|track| {
+                    track.source.is_some_and(|old| {
+                        old.display == source.display && old.stream_id > source.stream_id
+                    })
+                }) {
+                    return;
                 }
             }
+            // Recovery is not a pending-payload slot. Evicting it at 16 tracks
+            // would allow a forgotten delta chain to resume after slot overflow.
+            // Keep one state per bounded display plus one unscoped legacy state;
+            // retire only that display's obsolete incarnation/key.
+            state.tracks.retain(|key, track| {
+                *key == track_key
+                    || match (track.source, source) {
+                        (Some(old), Some(new)) => old.display != new.display,
+                        (None, None) => false,
+                        _ => true,
+                    }
+            });
             let track = state
                 .tracks
                 .entry(track_key)
                 .or_insert(VideoSendTrackRecoveryState {
                     awaiting_keyframe: false,
                     minimum_keyframe_id: 0,
-                    last_activity: activity_generation,
+                    source,
                 });
             track.minimum_keyframe_id = track.minimum_keyframe_id.max(dropped_frame_id);
-            track.last_activity = activity_generation;
+            track.source = source;
             let first_loss = !track.awaiting_keyframe;
             track.awaiting_keyframe = true;
             first_loss
@@ -277,10 +287,7 @@ impl VideoSendRecovery {
     fn suppress_delta(&self, track_key: VideoOutboundTrackKey, frame_id: u64) -> bool {
         let suppressed = {
             let mut state = self.state.lock().unwrap();
-            state.activity_generation = state.activity_generation.saturating_add(1);
-            let activity_generation = state.activity_generation;
             state.tracks.get_mut(&track_key).is_some_and(|track| {
-                track.last_activity = activity_generation;
                 if !track.awaiting_keyframe {
                     return false;
                 }
@@ -897,6 +904,9 @@ fn apply_video_reference_epoch(
     }
     let info = item.source_info?;
     if item.is_keyframe() {
+        // Display ids are bounded by admission; retain one reference epoch per
+        // display, not one allocation per codec restart over the session lifetime.
+        reference_epochs.retain(|key, _| key.display != info.key.display || *key == info.key);
         reference_epochs.insert(info.key, info.frame_id);
         Some(info.frame_id)
     } else {
@@ -927,13 +937,25 @@ struct LatestSlot<T> {
     replacements: AtomicU64,
 }
 
-struct TrackLatestState<T> {
-    pending: BTreeMap<VideoOutboundTrackKey, T>,
-    last_taken: Option<VideoOutboundTrackKey>,
+const MAX_PENDING_VIDEO_BYTES: usize = 64 * 1024 * 1024;
+const MAX_VIDEO_FRAME_BYTES: usize = 16 * 1024 * 1024;
+const MAX_VIDEO_DISPLAYS: usize = 64;
+
+struct PendingVideo {
+    value: VideoOutbound,
+    finish: u128,
 }
 
-struct TrackLatestSlot<T> {
-    state: Mutex<TrackLatestState<T>>,
+struct TrackLatestState {
+    pending: BTreeMap<VideoOutboundTrackKey, PendingVideo>,
+    last_taken: Option<VideoOutboundTrackKey>,
+    virtual_time: u128,
+    bytes: usize,
+    newest_stream: [Option<u64>; MAX_VIDEO_DISPLAYS],
+}
+
+struct TrackLatestSlot {
+    state: Mutex<TrackLatestState>,
     notify: Notify,
     max_tracks: usize,
 }
@@ -1040,12 +1062,15 @@ impl<T> LatestSlot<T> {
     }
 }
 
-impl<T> TrackLatestSlot<T> {
+impl TrackLatestSlot {
     fn new(max_tracks: usize) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(TrackLatestState {
                 pending: BTreeMap::new(),
                 last_taken: None,
+                virtual_time: 0,
+                bytes: 0,
+                newest_stream: [None; MAX_VIDEO_DISPLAYS],
             }),
             notify: Notify::new(),
             max_tracks: max_tracks.max(1),
@@ -1055,46 +1080,92 @@ impl<T> TrackLatestSlot<T> {
     fn replace_when_with(
         &self,
         key: VideoOutboundTrackKey,
-        value: T,
-        should_replace: impl FnOnce(&T, &T) -> bool,
-        on_replace: impl FnOnce(&T, &T),
+        value: VideoOutbound,
+        should_replace: impl FnOnce(&VideoOutbound, &VideoOutbound) -> bool,
+        on_replace: impl FnOnce(&VideoOutbound, &VideoOutbound),
     ) -> bool {
         let mut state = self.state.lock().unwrap();
-        if let Some(pending) = state.pending.get_mut(&key) {
-            if !should_replace(pending, &value) {
+        if let Some(source) = value.source_info {
+            let Ok(display) = usize::try_from(source.key.display) else {
+                return false;
+            };
+            if display >= MAX_VIDEO_DISPLAYS {
                 return false;
             }
-            on_replace(pending, &value);
-            *pending = value;
+            if state.newest_stream[display].is_some_and(|stream| stream > source.key.stream_id) {
+                return false;
+            }
+            if state.newest_stream[display] != Some(source.key.stream_id) {
+                // Incarnations are monotonic for a display. Retire only this
+                // display's pending old stream, even when its latest key changed.
+                let mut removed_bytes = 0;
+                state.pending.retain(|_, pending| {
+                    let obsolete = pending.value.source_info.is_some_and(|old| {
+                        old.key.display == source.key.display
+                            && old.key.stream_id != source.key.stream_id
+                    });
+                    if obsolete {
+                        removed_bytes += pending.value.payload.len();
+                    }
+                    !obsolete
+                });
+                state.bytes -= removed_bytes;
+                state.newest_stream[display] = Some(source.key.stream_id);
+            }
+        }
+        let old_bytes = state.pending.get(&key).map_or(0, |p| p.value.payload.len());
+        let bytes = value.payload.len();
+        if bytes > MAX_VIDEO_FRAME_BYTES
+            || state.bytes - old_bytes + bytes > MAX_PENDING_VIDEO_BYTES
+        {
+            return false;
+        }
+        if let Some(pending) = state.pending.get_mut(&key) {
+            if !should_replace(&pending.value, &value) {
+                return false;
+            }
+            on_replace(&pending.value, &value);
+            // Keep the original waiting credit when replacing a snapshot.
+            pending.finish = pending.finish - old_bytes as u128 + bytes as u128;
+            pending.value = value;
         } else {
             if state.pending.len() >= self.max_tracks {
                 return false;
             }
-            state.pending.insert(key, value);
+            let finish = state.virtual_time + bytes as u128;
+            state.pending.insert(key, PendingVideo { value, finish });
         }
+        state.bytes = state.bytes - old_bytes + bytes;
         drop(state);
         self.notify.notify_one();
         true
     }
 
-    async fn take(&self) -> T {
+    async fn take(&self) -> VideoOutbound {
         loop {
             let notified = self.notify.notified();
             let value = {
                 let mut state = self.state.lock().unwrap();
+                // Virtual-finish scheduling charges bytes, not frames. A large
+                // waiting frame accumulates service credit while smaller tracks
+                // run; replacements do not reset that credit. Rotate ties.
                 let next_key = state
-                    .last_taken
-                    .and_then(|last| {
-                        state
-                            .pending
-                            .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded))
-                            .next()
-                            .map(|(key, _)| *key)
+                    .pending
+                    .iter()
+                    .min_by_key(|(key, pending)| {
+                        (
+                            pending.finish,
+                            state.last_taken.is_some_and(|last| **key <= last),
+                            **key,
+                        )
                     })
-                    .or_else(|| state.pending.first_key_value().map(|(key, _)| *key));
+                    .map(|(key, _)| *key);
                 next_key.and_then(|key| {
                     state.last_taken = Some(key);
-                    state.pending.remove(&key)
+                    let pending = state.pending.remove(&key)?;
+                    state.bytes -= pending.value.payload.len();
+                    state.virtual_time = state.virtual_time.max(pending.finish);
+                    Some(pending.value)
                 })
             };
             if let Some(value) = value {
@@ -1104,10 +1175,17 @@ impl<T> TrackLatestSlot<T> {
         }
     }
 
-    async fn take_track(&self, key: VideoOutboundTrackKey) -> T {
+    async fn take_track(&self, key: VideoOutboundTrackKey) -> VideoOutbound {
         loop {
             let notified = self.notify.notified();
-            if let Some(value) = self.state.lock().unwrap().pending.remove(&key) {
+            let value = {
+                let mut state = self.state.lock().unwrap();
+                state.pending.remove(&key).map(|pending| {
+                    state.bytes -= pending.value.payload.len();
+                    pending.value
+                })
+            };
+            if let Some(value) = value {
                 return value;
             }
             notified.await;
@@ -1126,7 +1204,7 @@ pub struct QuicApplicationStream {
     file: mpsc::Sender<ReliableOutbound>,
     diagnostics: mpsc::Sender<ReliableOutbound>,
     audio: mpsc::Sender<AudioOutbound>,
-    latest_video: Arc<TrackLatestSlot<VideoOutbound>>,
+    latest_video: Arc<TrackLatestSlot>,
     video_send_recovery: Arc<VideoSendRecovery>,
     latest_mouse: Arc<LatestSlot<MouseOutbound>>,
     datagram_send: Arc<QuicDatagramSendCoordinator>,
@@ -1172,7 +1250,7 @@ impl QuicApplicationStream {
         let video_ordering = VideoOrderingGate::new();
         let metrics = Arc::new(QuicApplicationMetrics::default());
         let closing = Arc::new(AtomicBool::new(false));
-        let (video_refresh_tx, video_refresh_rx) = mpsc::channel(MAX_VIDEO_STREAM_STATES);
+        let (video_refresh_tx, video_refresh_rx) = mpsc::channel(MAX_VIDEO_DISPLAYS + 1);
         let video_send_recovery = VideoSendRecovery::new(
             video_refresh_tx,
             application_protocol.supports_scoped_video_reference_refresh(),
@@ -2301,7 +2379,7 @@ async fn run_local_video_refresh(
 
 async fn run_video_writer(
     mut sender: QuicDatagramSender,
-    video: Arc<TrackLatestSlot<VideoOutbound>>,
+    video: Arc<TrackLatestSlot>,
     video_ordering: Arc<VideoOrderingGate>,
     inbound: mpsc::Sender<Result<BytesMut, Error>>,
     connection: Connection,
@@ -3130,6 +3208,10 @@ fn classify_message(message: &Message) -> Result<ApplicationClass, QuicTransport
 }
 
 fn is_video_ordering_message(message: &Message) -> bool {
+    // This barrier orders media in the SAME sending direction. CaptureDisplays
+    // is an opposite-direction subscription request, applied by the host before
+    // admitting its new capture set; it is not a video acknowledgement. Keep it
+    // ordinary control for compatibility with peers accepting SwitchDisplay only.
     matches!(
         message.union.as_ref(),
         Some(message::Union::Misc(Misc {
@@ -3490,6 +3572,142 @@ mod tests {
         let second = slot.take().await;
         assert_eq!(second.track_key, track_b);
         assert!(second.is_keyframe());
+    }
+
+    fn sized_video(display: i32, stream: u64, size: usize) -> VideoOutbound {
+        let mut value = outbound_video_for_track(stream, 1, true, 0);
+        value.source_info.as_mut().unwrap().key = VideoStreamKey {
+            display,
+            stream_id: stream,
+        };
+        value.payload = Bytes::from(vec![1; size]);
+        value
+    }
+
+    fn admit_video(slot: &TrackLatestSlot, value: VideoOutbound) -> bool {
+        slot.replace_when_with(
+            value.track_key,
+            value,
+            should_replace_pending_video,
+            |_, _| {},
+        )
+    }
+
+    #[tokio::test]
+    async fn latest_video_sixteen_pending_tracks_overflow_and_readd() {
+        let slot = TrackLatestSlot::new(MAX_PENDING_VIDEO_TRACKS);
+        for display in 0..16 {
+            assert!(admit_video(
+                &slot,
+                sized_video(display, display as u64 + 1, 10)
+            ));
+        }
+        assert!(!admit_video(&slot, sized_video(16, 17, 10)));
+        assert_eq!(slot.state.lock().unwrap().pending.len(), 16);
+        assert_eq!(slot.take().await.source_info.unwrap().key.display, 0);
+        assert!(admit_video(&slot, sized_video(16, 17, 10)));
+        let mut seen = [false; 17];
+        for _ in 0..16 {
+            seen[slot.take().await.source_info.unwrap().key.display as usize] = true;
+        }
+        assert!(seen[1..].iter().all(|seen| *seen));
+        assert_eq!(slot.state.lock().unwrap().bytes, 0);
+        assert!(admit_video(&slot, sized_video(0, 1, 10)));
+    }
+
+    #[tokio::test]
+    async fn latest_video_retires_old_streams_even_after_the_slot_is_drained() {
+        let slot = TrackLatestSlot::new(2);
+        assert!(admit_video(&slot, sized_video(0, 1, 10)));
+        assert!(admit_video(&slot, sized_video(1, 2, 10)));
+        assert!(admit_video(&slot, sized_video(0, 3, 20)));
+        assert!(!admit_video(&slot, sized_video(0, 1, 10)));
+        assert_eq!(slot.state.lock().unwrap().bytes, 30);
+        assert_eq!(slot.take().await.source_info.unwrap().key.display, 1);
+        assert_eq!(slot.take().await.source_info.unwrap().key.stream_id, 3);
+        assert!(!admit_video(&slot, sized_video(0, 1, 10)));
+        assert_eq!(slot.state.lock().unwrap().bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn latest_video_byte_fair_service_preserves_large_frame_progress() {
+        let slot = TrackLatestSlot::new(2);
+        assert!(admit_video(&slot, sized_video(0, 1, 1000)));
+        assert!(admit_video(&slot, sized_video(1, 2, 100)));
+        let mut small = 0;
+        for _ in 0..12 {
+            let item = slot.take().await;
+            if item.source_info.unwrap().key.display == 0 {
+                break;
+            }
+            small += 1;
+            assert!(admit_video(&slot, sized_video(1, 2, 100)));
+            // A replacement must keep the large frame's accrued waiting credit.
+            assert!(admit_video(&slot, sized_video(0, 1, 1000)));
+        }
+        assert!(
+            (9..=10).contains(&small),
+            "small frames before large: {}",
+            small
+        );
+        assert!(!slot
+            .state
+            .lock()
+            .unwrap()
+            .pending
+            .contains_key(&VideoOutboundTrackKey::Latest(1)));
+    }
+
+    #[tokio::test]
+    async fn latest_video_all_keyframe_byte_exhaustion_and_same_track_take() {
+        let slot = TrackLatestSlot::new(16);
+        assert!(!admit_video(
+            &slot,
+            sized_video(0, 1, MAX_VIDEO_FRAME_BYTES + 1)
+        ));
+        for display in 0..4 {
+            assert!(admit_video(
+                &slot,
+                sized_video(display, display as u64 + 1, MAX_VIDEO_FRAME_BYTES)
+            ));
+        }
+        assert!(!admit_video(&slot, sized_video(4, 5, 1)));
+        assert_eq!(slot.state.lock().unwrap().bytes, MAX_PENDING_VIDEO_BYTES);
+        let item = slot.take_track(VideoOutboundTrackKey::Latest(2)).await;
+        assert_eq!(item.source_info.unwrap().key.display, 1);
+        assert_eq!(
+            slot.state.lock().unwrap().bytes,
+            MAX_PENDING_VIDEO_BYTES - MAX_VIDEO_FRAME_BYTES
+        );
+        assert!(admit_video(&slot, sized_video(4, 5, 1)));
+    }
+
+    #[test]
+    fn reference_epoch_state_retires_repeated_codec_incarnations() {
+        let mut epochs = BTreeMap::new();
+        for stream in 1..=100 {
+            let mut item = sized_video(0, stream, 1);
+            apply_video_reference_epoch(&mut item, &mut epochs, true);
+        }
+        assert_eq!(epochs.len(), 1);
+        assert_eq!(epochs.first_key_value().unwrap().0.stream_id, 100);
+    }
+
+    #[test]
+    fn capture_subscription_is_control_not_a_same_direction_video_barrier() {
+        let mut message = Message::new();
+        let mut misc = Misc::new();
+        misc.set_capture_displays(Default::default());
+        message.set_misc(misc);
+        assert!(!is_video_ordering_message(&message));
+        assert_eq!(
+            classify_message(&message).unwrap(),
+            ApplicationClass::Control
+        );
+        let mut misc = Misc::new();
+        misc.set_switch_display(Default::default());
+        message.set_misc(misc);
+        assert!(is_video_ordering_message(&message));
     }
 
     #[test]
@@ -4547,6 +4765,42 @@ mod tests {
     }
 
     #[test]
+    fn sender_recovery_overflow_never_forgets_another_displays_reference_loss() {
+        let (refresh, mut refresh_rx) = mpsc::channel(MAX_VIDEO_DISPLAYS + 1);
+        let recovery =
+            VideoSendRecovery::new(refresh, true, Arc::new(QuicApplicationMetrics::default()));
+        for display in 0..MAX_VIDEO_DISPLAYS as i32 {
+            let stream = display as u64 + 1;
+            recovery.enter(
+                VideoOutboundTrackKey::Latest(stream),
+                Some(source_video_for_display(display, stream, 2, false)),
+                2,
+                "overflow test",
+            );
+        }
+        for stream in 1..=MAX_VIDEO_DISPLAYS as u64 {
+            assert!(recovery.suppress_delta(VideoOutboundTrackKey::Latest(stream), 3));
+            assert!(refresh_rx.try_recv().is_ok());
+        }
+        assert!(refresh_rx.try_recv().is_err());
+        for stream in 100..200 {
+            recovery.enter(
+                VideoOutboundTrackKey::Latest(stream),
+                Some(source_video_for_display(0, stream, 2, false)),
+                2,
+                "replacement test",
+            );
+        }
+        assert_eq!(
+            recovery.state.lock().unwrap().tracks.len(),
+            MAX_VIDEO_DISPLAYS
+        );
+        for stream in 2..=MAX_VIDEO_DISPLAYS as u64 {
+            assert!(recovery.suppress_delta(VideoOutboundTrackKey::Latest(stream), 4));
+        }
+    }
+
+    #[test]
     fn sender_reference_recovery_keeps_legacy_fallback_for_old_quic_protocols() {
         let (refresh, mut refresh_rx) = mpsc::channel(1);
         let metrics = Arc::new(QuicApplicationMetrics::default());
@@ -4855,6 +5109,86 @@ mod tests {
         })
         .await
         .expect("DATAGRAM delta must follow a reliable startup keyframe");
+
+        // No await during admission: hold all 16 tracks pending, then overflow
+        // a seventeenth. Real reliable keyframes must still reach every admitted
+        // display and the overflowed track must be able to rejoin after draining.
+        let pressure_frame = |display: i32, frame_id: u64| {
+            let mut frame = VideoFrame {
+                display,
+                stream_id: 100 + display as u64,
+                frame_id,
+                ..Default::default()
+            };
+            frame.set_h264s(EncodedVideoFrames {
+                frames: vec![EncodedVideoFrame {
+                    data: Bytes::from(vec![1; if display == 0 { 32_000 } else { 1000 }]),
+                    key: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            let mut message = Message::new();
+            message.set_video_frame(frame);
+            Bytes::from(message.write_to_bytes().unwrap())
+        };
+        for display in 0..17 {
+            client_stream.enqueue(pressure_frame(display, 1)).unwrap();
+        }
+        assert_eq!(
+            client_stream
+                .latest_video
+                .state
+                .lock()
+                .unwrap()
+                .pending
+                .len(),
+            16
+        );
+        let overflow_key = VideoOutboundTrackKey::Source(VideoStreamKey {
+            display: 16,
+            stream_id: 116,
+        });
+        assert!(client_stream
+            .video_send_recovery
+            .suppress_delta(overflow_key, 0));
+        assert!(!client_stream.video_send_recovery.suppress_delta(
+            VideoOutboundTrackKey::Source(VideoStreamKey {
+                display: 0,
+                stream_id: 100
+            }),
+            0
+        ));
+        let mut seen = [false; 16];
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !seen.iter().all(|seen| *seen) {
+                let message =
+                    Message::parse_from_bytes(&server_stream.next().await.unwrap().unwrap())
+                        .unwrap();
+                if let Some(message::Union::VideoFrame(frame)) = message.union {
+                    if frame.stream_id >= 100 && (0..16).contains(&frame.display) {
+                        seen[frame.display as usize] = true;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("every admitted track must progress under QUIC pressure");
+        client_stream.enqueue(pressure_frame(16, 2)).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let message =
+                    Message::parse_from_bytes(&server_stream.next().await.unwrap().unwrap())
+                        .unwrap();
+                if matches!(message.union, Some(message::Union::VideoFrame(frame))
+                    if frame.display == 16 && frame.stream_id == 116 && frame.frame_id == 2)
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("overflowed track must rejoin after pending slots drain");
 
         let mut close_misc = Misc::new();
         close_misc.set_close_reason(String::new());

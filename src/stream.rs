@@ -72,7 +72,12 @@ struct OutboundMessage {
 enum OutboundEntry {
     Reliable(OutboundMessage),
     Latest((u64, u64)),
+    Video((i32, u64), OutboundMessage),
 }
+
+const MAX_PENDING_VIDEO_TRACKS: usize = 16;
+const MAX_VIDEO_FRAME_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PENDING_VIDEO_BYTES: usize = 64 * 1024 * 1024;
 
 struct OutboundState {
     entries: VecDeque<OutboundEntry>,
@@ -164,6 +169,58 @@ impl OutboundQueue {
         Ok(())
     }
 
+    // Encoded video is not a replaceable snapshot: losing a delta invalidates
+    // its successors. Reject admission explicitly so the owner can recover
+    // that track. One pending frame per key also prevents a busy display from
+    // occupying all writer slots. The active write is outside this budget.
+    fn enqueue_video(&self, display: i32, key: u64, message: OutboundMessage) -> ResultType<()> {
+        let mut state = self.state.lock().unwrap();
+        if state.closed {
+            state.rejected_messages = state.rejected_messages.saturating_add(1);
+            return Err(Error::new(ErrorKind::BrokenPipe, "async stream writer is closed").into());
+        }
+        if state.entries.iter().any(|entry| {
+            matches!(entry,
+            OutboundEntry::Video((d, stream), _) if *d == display && *stream > key)
+        }) {
+            state.rejected_messages = state.rejected_messages.saturating_add(1);
+            return Err(Error::new(ErrorKind::WouldBlock, "obsolete encoded video stream").into());
+        }
+        state.entries.retain(|entry| {
+            !matches!(entry,
+            OutboundEntry::Video((d, stream), _) if *d == display && *stream < key)
+        });
+        let mut bytes = message.bytes.len();
+        let mut tracks = 0;
+        let mut occupied = false;
+        for entry in &state.entries {
+            if let OutboundEntry::Video(pending_key, pending) = entry {
+                occupied |= *pending_key == (display, key);
+                tracks += 1;
+                bytes = bytes.saturating_add(pending.bytes.len());
+            }
+        }
+        if occupied
+            || tracks >= MAX_PENDING_VIDEO_TRACKS
+            || message.bytes.len() > MAX_VIDEO_FRAME_BYTES
+            || bytes > MAX_PENDING_VIDEO_BYTES
+            || state.entries.len() >= state.capacity.saturating_sub(1)
+        {
+            state.rejected_messages = state.rejected_messages.saturating_add(1);
+            return Err(Error::new(
+                ErrorKind::WouldBlock,
+                "encoded video outbox budget exceeded",
+            )
+            .into());
+        }
+        state
+            .entries
+            .push_back(OutboundEntry::Video((display, key), message));
+        drop(state);
+        self.notify.notify_one();
+        Ok(())
+    }
+
     async fn dequeue(&self) -> Option<OutboundMessage> {
         loop {
             let notified = self.notify.notified();
@@ -171,7 +228,9 @@ impl OutboundQueue {
                 let mut state = self.state.lock().unwrap();
                 while let Some(entry) = state.entries.pop_front() {
                     match entry {
-                        OutboundEntry::Reliable(message) => return Some(message),
+                        OutboundEntry::Reliable(message) | OutboundEntry::Video(_, message) => {
+                            return Some(message)
+                        }
                         OutboundEntry::Latest(key) => {
                             if let Some(message) = state.latest.remove(&key) {
                                 return Some(message);
@@ -210,7 +269,9 @@ impl OutboundQueue {
             .entries
             .drain(..)
             .filter_map(|entry| match entry {
-                OutboundEntry::Reliable(message) => Some(message),
+                OutboundEntry::Reliable(message) | OutboundEntry::Video(_, message) => {
+                    Some(message)
+                }
                 OutboundEntry::Latest(_) => None,
             })
             .collect();
@@ -830,6 +891,32 @@ impl Stream {
         }
     }
 
+    /// Bounded video admission. Unlike `send_latest`, TCP never silently
+    /// replaces encoded reference frames. QUIC owns its scoped loss recovery.
+    pub async fn send_video(
+        &mut self,
+        display: i32,
+        key: u64,
+        kind: &'static str,
+        msg: &impl protobuf::Message,
+    ) -> ResultType<()> {
+        match self {
+            Self::Duplex(stream) => stream.outbox.enqueue_video(
+                display,
+                key,
+                OutboundMessage {
+                    bytes: Bytes::from(msg.write_to_bytes()?),
+                    kind,
+                    encrypt: true,
+                    completion: None,
+                },
+            ),
+            #[cfg(feature = "quic-transport")]
+            Self::Quic(stream) => stream.enqueue_latest(key, Bytes::from(msg.write_to_bytes()?)),
+            _ => self.send(msg).await,
+        }
+    }
+
     pub async fn send_latest(
         &mut self,
         key: u64,
@@ -981,6 +1068,106 @@ mod tests {
             encrypt: true,
             completion: None,
         }
+    }
+
+    #[tokio::test]
+    async fn encoded_video_never_replaces_a_reference_or_crosses_a_barrier() {
+        let queue = OutboundQueue::new(8);
+        queue
+            .enqueue_video(0, 1, message(b"key-a", "video"))
+            .unwrap();
+        assert!(queue
+            .enqueue_video(0, 1, message(b"delta-a", "video"))
+            .is_err());
+        queue
+            .enqueue_barrier(message(b"switch", "ordering"))
+            .unwrap();
+        queue
+            .enqueue_video(1, 2, message(b"key-b", "video"))
+            .unwrap();
+        assert_eq!(queue.dequeue().await.unwrap().bytes, &b"key-a"[..]);
+        assert_eq!(queue.dequeue().await.unwrap().bytes, &b"switch"[..]);
+        assert_eq!(queue.dequeue().await.unwrap().bytes, &b"key-b"[..]);
+        assert_eq!(queue.counters(), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn encoded_video_sixteen_pending_tracks_overflow_then_readd() {
+        let queue = OutboundQueue::new(64);
+        for display in 0..16 {
+            queue
+                .enqueue_video(display, display as u64, message(b"key", "video"))
+                .unwrap();
+        }
+        assert!(queue
+            .enqueue_video(16, 16, message(b"overflow", "video"))
+            .is_err());
+        queue
+            .enqueue_barrier(message(b"control", "ordering"))
+            .unwrap();
+        assert_eq!(queue.dequeue().await.unwrap().bytes, &b"key"[..]);
+        queue
+            .enqueue_video(16, 16, message(b"readd", "video"))
+            .unwrap();
+        for _ in 1..16 {
+            assert_eq!(queue.dequeue().await.unwrap().bytes, &b"key"[..]);
+        }
+        assert_eq!(queue.dequeue().await.unwrap().bytes, &b"control"[..]);
+        assert_eq!(queue.dequeue().await.unwrap().bytes, &b"readd"[..]);
+        assert_eq!(queue.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn encoded_video_retirement_frees_only_the_obsolete_display() {
+        let queue = OutboundQueue::new(8);
+        queue.enqueue_video(0, 1, message(b"old", "video")).unwrap();
+        queue
+            .enqueue_video(1, 2, message(b"other", "video"))
+            .unwrap();
+        queue
+            .enqueue_barrier(message(b"switch", "ordering"))
+            .unwrap();
+        queue.enqueue_video(0, 3, message(b"new", "video")).unwrap();
+        assert!(queue
+            .enqueue_video(0, 1, message(b"late", "video"))
+            .is_err());
+        assert_eq!(queue.len(), 3);
+        assert_eq!(queue.dequeue().await.unwrap().bytes, &b"other"[..]);
+        assert_eq!(queue.dequeue().await.unwrap().bytes, &b"switch"[..]);
+        assert_eq!(queue.dequeue().await.unwrap().bytes, &b"new"[..]);
+    }
+
+    #[test]
+    fn encoded_video_byte_budget_and_reserved_control_slot_are_bounded() {
+        let queue = OutboundQueue::new(8);
+        let mut large = message(b"", "video");
+        large.bytes = Bytes::from(vec![1; MAX_VIDEO_FRAME_BYTES + 1]);
+        assert!(queue.enqueue_video(0, 0, large).is_err());
+        for display in 0..4 {
+            let mut large = message(b"", "video");
+            large.bytes = Bytes::from(vec![1; MAX_VIDEO_FRAME_BYTES]);
+            queue.enqueue_video(display, display as u64, large).unwrap();
+        }
+        assert!(queue
+            .enqueue_video(4, 4, message(b"one-byte-too-many", "video"))
+            .is_err());
+        queue
+            .enqueue_barrier(message(b"switch", "ordering"))
+            .unwrap();
+        let queue = OutboundQueue::new(2);
+        queue.enqueue_video(0, 0, message(b"key", "video")).unwrap();
+        assert!(queue.enqueue_video(1, 1, message(b"key", "video")).is_err());
+        queue
+            .enqueue_barrier(message(b"switch", "ordering"))
+            .unwrap();
+        assert!(queue
+            .enqueue_barrier(message(b"overflow", "ordering"))
+            .is_err());
+        queue.fail_pending("closed");
+        assert_eq!(queue.len(), 0);
+        assert!(queue
+            .enqueue_video(0, 0, message(b"closed", "video"))
+            .is_err());
     }
 
     #[tokio::test]
@@ -1153,6 +1340,47 @@ mod tests {
             progress.active_write_kind == Some("Bytes") || progress.queued_messages == 1,
             "the blocked write must remain active or queued"
         );
+    }
+
+    #[tokio::test]
+    async fn duplex_video_pressure_keeps_reference_and_inbound_control() {
+        let mut stream = blocked_writer_stream(Some(b"inbound-control"));
+        stream
+            .send_bytes(Bytes::from_static(b"active-write"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while stream
+                .async_writer_progress()
+                .unwrap()
+                .active_write_kind
+                .is_none()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let frame = crate::message_proto::Message::new();
+        stream.send_video(0, 1, "VideoFrame", &frame).await.unwrap();
+        assert!(stream.send_video(0, 1, "VideoFrame", &frame).await.is_err());
+        stream.send_video(1, 2, "VideoFrame", &frame).await.unwrap();
+        stream.send_video(2, 3, "VideoFrame", &frame).await.unwrap();
+        assert!(stream.send_video(3, 4, "VideoFrame", &frame).await.is_err());
+        stream
+            .send_ordering_tagged("SwitchDisplay", &frame)
+            .await
+            .unwrap();
+        let received = tokio::time::timeout(Duration::from_millis(100), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(&received[..], b"inbound-control");
+        let progress = stream.async_writer_progress().unwrap();
+        assert_eq!(progress.queued_messages, 4);
+        assert_eq!(progress.latest_replacements, 0);
+        assert_eq!(progress.rejected_messages, 2);
     }
 
     #[tokio::test]
