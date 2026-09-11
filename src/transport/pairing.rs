@@ -208,6 +208,29 @@ impl TrustedPeerStore for FileTrustedPeerStore {
         if path.exists() {
             return Err(PairingError::AlreadyPaired);
         }
+        self.write_record(record)
+    }
+
+    fn remove(&mut self, peer_id: &str) -> Result<bool, PairingError> {
+        let path = self.record_path(peer_id)?;
+        match fs::remove_file(path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(PairingError::Io(error)),
+        }
+    }
+}
+
+impl FileTrustedPeerStore {
+    /// Replace only after the application has independently authenticated the
+    /// new identity. Atomic rename preserves the old record on write failure.
+    pub fn replace_authenticated(&mut self, record: TrustedPeerRecord) -> Result<(), PairingError> {
+        self.write_record(record)
+    }
+
+    fn write_record(&mut self, record: TrustedPeerRecord) -> Result<(), PairingError> {
+        record.validate()?;
+        let path = self.record_path(&record.peer_id)?;
         let persisted = PersistedTrustedPeer::from_record(&record);
         let encoded =
             serde_json::to_vec_pretty(&persisted).map_err(|_| PairingError::InvalidRecord)?;
@@ -227,15 +250,6 @@ impl TrustedPeerStore for FileTrustedPeerStore {
             return Err(PairingError::Io(error));
         }
         Ok(())
-    }
-
-    fn remove(&mut self, peer_id: &str) -> Result<bool, PairingError> {
-        let path = self.record_path(peer_id)?;
-        match fs::remove_file(path) {
-            Ok(()) => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(PairingError::Io(error)),
-        }
     }
 }
 
@@ -454,6 +468,32 @@ mod tests {
         let records = store.load_all().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].peer_id, "peer-1");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn authenticated_replacement_preserves_old_record_on_invalid_input() {
+        let directory = std::env::temp_dir().join(format!(
+            "rustadmin-trust-replace-{}-{}",
+            std::process::id(),
+            crate::rand::random::<u64>()
+        ));
+        let mut store = FileTrustedPeerStore::new(&directory).unwrap();
+        let old = candidate();
+        let old = old.clone().confirm(&old.fingerprint(), 1).unwrap();
+        store.insert(old.clone()).unwrap();
+        let new = PairingCandidate::new("peer-1".to_owned(), [8; 32], vec![5, 6, 7]).unwrap();
+        let new = new.clone().confirm(&new.fingerprint(), 2).unwrap();
+        assert!(matches!(
+            store.insert(new.clone()),
+            Err(PairingError::AlreadyPaired)
+        ));
+        let mut invalid = new.clone();
+        invalid.certificate_pin[0] ^= 1;
+        assert!(store.replace_authenticated(invalid).is_err());
+        assert_eq!(store.load("peer-1").unwrap(), Some(old));
+        store.replace_authenticated(new.clone()).unwrap();
+        assert_eq!(store.load("peer-1").unwrap(), Some(new));
         fs::remove_dir_all(directory).unwrap();
     }
 
