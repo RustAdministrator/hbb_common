@@ -3008,7 +3008,8 @@ impl UserDefaultConfig {
                 key,
                 "auto",
                 vec![
-                    "vp8", "vp9", "av1", "av1-hw", "h264", "h265", "h264-hq", "h265-hq",
+                    "vp8", "vp9", "av1", "av1-hw", "av1-sw", "h264", "h265", "h264-hw", "h264-sw",
+                    "h265-hw", "h265-sw", "h264-hq", "h265-hq",
                 ],
             ),
             keys::OPTION_CUSTOM_IMAGE_QUALITY => self.get_num_string(key, 50.0, 10.0, 0xFFF as f64),
@@ -3551,6 +3552,7 @@ pub mod keys {
     pub const OPTION_CUSTOM_FPS_MODE: &str = "custom-fps-mode";
     pub const OPTION_VIDEO_PROFILE: &str = "video-profile";
     pub const OPTION_CODEC_PREFERENCE: &str = "codec-preference";
+    pub const OPTION_ENCODER_CODEC_PREFERENCE: &str = "encoder-codec-preference";
     pub const OPTION_CAPTURE_BACKEND: &str = "capture-backend";
     pub const OPTION_SYNC_INIT_CLIPBOARD: &str = "sync-init-clipboard";
     pub const OPTION_THEME: &str = "theme";
@@ -3850,6 +3852,7 @@ pub mod keys {
         OPTION_ALLOW_ALWAYS_SOFTWARE_RENDER,
         OPTION_ALLOW_LINUX_HEADLESS,
         OPTION_ENABLE_HWCODEC,
+        OPTION_ENCODER_CODEC_PREFERENCE,
         OPTION_APPROVE_MODE,
         OPTION_VERIFICATION_METHOD,
         OPTION_TEMPORARY_PASSWORD_LENGTH,
@@ -4077,8 +4080,10 @@ mod tests {
     }
 
     #[test]
-    fn test_codec_preference_accepts_high_quality_hardware() {
-        for codec in ["h264-hq", "h265-hq"] {
+    fn test_codec_preference_accepts_decoder_backends_and_legacy_hq() {
+        for codec in [
+            "av1-sw", "h264-hw", "h264-sw", "h265-hw", "h265-sw", "h264-hq", "h265-hq",
+        ] {
             let mut cfg = UserDefaultConfig::default();
             cfg.options
                 .insert(keys::OPTION_CODEC_PREFERENCE.to_owned(), codec.to_owned());
