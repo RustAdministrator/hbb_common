@@ -3009,7 +3009,7 @@ impl UserDefaultConfig {
                 "auto",
                 vec![
                     "vp8", "vp9", "av1", "av1-hw", "av1-sw", "h264", "h265", "h264-hw", "h264-sw",
-                    "h265-hw", "h265-sw", "h264-hq", "h265-hq",
+                    "h265-hw", "h265-sw", "h264-hq", "h265-hq", "h264-hq-sw", "h265-hq-sw",
                 ],
             ),
             keys::OPTION_CUSTOM_IMAGE_QUALITY => self.get_num_string(key, 50.0, 10.0, 0xFFF as f64),
@@ -4082,7 +4082,15 @@ mod tests {
     #[test]
     fn test_codec_preference_accepts_decoder_backends_and_legacy_hq() {
         for codec in [
-            "av1-sw", "h264-hw", "h264-sw", "h265-hw", "h265-sw", "h264-hq", "h265-hq",
+            "av1-sw",
+            "h264-hw",
+            "h264-sw",
+            "h265-hw",
+            "h265-sw",
+            "h264-hq",
+            "h265-hq",
+            "h264-hq-sw",
+            "h265-hq-sw",
         ] {
             let mut cfg = UserDefaultConfig::default();
             cfg.options
