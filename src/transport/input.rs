@@ -13,6 +13,7 @@ pub const MAX_APPLICATION_MOUSE_BYTES: usize = 4 * 1024;
 pub const RELIABLE_INPUT_PAYLOAD_LEN: usize = 24;
 pub const MAX_DISPLAY_ID: u32 = 255;
 pub const KNOWN_BUTTON_MASK: u16 = 0x001f;
+const MAX_ABSOLUTE_COORDINATE: i32 = 1_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -515,7 +516,9 @@ fn validate_display_id(display_id: u32) -> Result<(), InputProtocolError> {
 }
 
 fn validate_absolute_coordinates(x: i32, y: i32) -> Result<(), InputProtocolError> {
-    if x < 0 || y < 0 || x > 1_000_000 || y > 1_000_000 {
+    if !(-MAX_ABSOLUTE_COORDINATE..=MAX_ABSOLUTE_COORDINATE).contains(&x)
+        || !(-MAX_ABSOLUTE_COORDINATE..=MAX_ABSOLUTE_COORDINATE).contains(&y)
+    {
         return Err(InputProtocolError::InvalidCoordinates);
     }
     Ok(())
@@ -677,8 +680,22 @@ mod tests {
                 sequence_number: 1,
                 monotonic_timestamp_us: 1,
                 mode: MouseMovementMode::Absolute,
-                x: -1,
+                x: -1_000_001,
                 y: 0,
+                display_id: 0,
+                button_state_mask: 0,
+            },
+            1200,
+        )
+        .is_err());
+        assert!(encode_mouse_movement(
+            [1; 16],
+            MouseMovement {
+                sequence_number: 1,
+                monotonic_timestamp_us: 1,
+                mode: MouseMovementMode::Absolute,
+                x: 0,
+                y: 1_000_001,
                 display_id: 0,
                 button_state_mask: 0,
             },
@@ -699,5 +716,38 @@ mod tests {
             1200,
         )
         .is_err());
+    }
+
+    #[test]
+    fn absolute_coordinates_support_left_hand_displays() {
+        let movement = MouseMovement {
+            sequence_number: 1,
+            monotonic_timestamp_us: 1,
+            mode: MouseMovementMode::Absolute,
+            x: -2560,
+            y: 120,
+            display_id: 0,
+            button_state_mask: 0,
+        };
+        let encoded = encode_mouse_movement([1; 16], movement, 1200).unwrap();
+        assert_eq!(decode_mouse_movement(&encoded).unwrap(), movement);
+
+        let reliable = encode_reliable_input(ReliableInputEvent::MouseButton {
+            button: MouseButton::Left,
+            pressed: true,
+            x: -2560,
+            y: 120,
+            display_id: 0,
+        });
+        assert_eq!(
+            decode_reliable_input(&reliable).unwrap(),
+            ReliableInputEvent::MouseButton {
+                button: MouseButton::Left,
+                pressed: true,
+                x: -2560,
+                y: 120,
+                display_id: 0,
+            }
+        );
     }
 }
