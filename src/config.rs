@@ -3521,6 +3521,12 @@ pub fn allow_insecure_tls_fallback() -> bool {
     option2bool(option, &Config::get_option(option))
 }
 
+/// Whether peer sessions may use directional secretbox nonces; the local
+/// `disable-directional-secretbox` option turns them off without a rebuild.
+pub fn directional_secretbox_enabled() -> bool {
+    Config::get_option(keys::OPTION_DISABLE_DIRECTIONAL_SECRETBOX) != "Y"
+}
+
 pub mod keys {
     pub const OPTION_VIEW_ONLY: &str = "view_only";
     pub const OPTION_SHOW_MONITORS_TOOLBAR: &str = "show_monitors_toolbar";
@@ -3655,6 +3661,8 @@ pub mod keys {
     /// closes it; 0 or unset disables the limit (default).
     pub const OPTION_QUIC_PRELOGIN_TIMEOUT_SECS: &str = "quic-prelogin-timeout-secs";
     pub const OPTION_ALLOW_INSECURE_TLS_FALLBACK: &str = "allow-insecure-tls-fallback";
+    /// "Y" stops advertising and selecting directional secretbox nonces.
+    pub const OPTION_DISABLE_DIRECTIONAL_SECRETBOX: &str = "disable-directional-secretbox";
     pub const OPTION_SHOW_VIRTUAL_MOUSE: &str = "show-virtual-mouse";
     // joystick is the virtual mouse.
     // So `OPTION_SHOW_VIRTUAL_MOUSE` should also be set if `OPTION_SHOW_VIRTUAL_JOYSTICK` is set.
@@ -3892,6 +3900,7 @@ pub mod keys {
         OPTION_QUIC_FILE_BANDWIDTH_MBPS,
         OPTION_QUIC_PRELOGIN_TIMEOUT_SECS,
         OPTION_ALLOW_INSECURE_TLS_FALLBACK,
+        OPTION_DISABLE_DIRECTIONAL_SECRETBOX,
         OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS,
         OPTION_ALLOW_AUTO_UPDATE,
     ];

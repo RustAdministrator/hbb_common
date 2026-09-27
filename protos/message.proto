@@ -48,6 +48,9 @@ message VideoFrame {
 message IdPk {
   string id = 1;
   bytes pk = 2;
+  // RustAdmin: set by hosts to tcp::SECURE_CHANNEL_DIRECTIONAL when they accept
+  // directional secretbox nonces; 0 (absent) means the legacy layout only.
+  uint32 secure_channel = 3;
 }
 
 message DisplayInfo {

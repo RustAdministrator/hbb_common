@@ -5,7 +5,7 @@ use crate::{
     protobuf::Message,
     socket_client::split_host_port,
     sodiumoxide::crypto::secretbox::Key,
-    tcp::Encrypt,
+    tcp::{Encrypt, NonceMode},
     tls::{get_cached_tls_accept_invalid_cert, get_cached_tls_type, upsert_tls_cache, TlsType},
     ResultType,
 };
@@ -267,7 +267,12 @@ impl WsFramedStream {
 
     #[inline]
     pub fn set_key(&mut self, key: Key) {
-        self.encrypt = Some(Encrypt::new(key));
+        self.set_key_with_mode(key, NonceMode::Legacy);
+    }
+
+    #[inline]
+    pub fn set_key_with_mode(&mut self, key: Key, mode: NonceMode) {
+        self.encrypt = Some(Encrypt::with_mode(key, mode));
     }
 
     #[inline]
@@ -498,6 +503,49 @@ pub fn check_ws(endpoint: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::{keys, lock_test_config, Config};
+
+    #[tokio::test]
+    async fn websocket_streams_exchange_frames_in_both_nonce_modes() {
+        use crate::tcp::SessionRole;
+        let key = Key([21; crate::sodiumoxide::crypto::secretbox::KEYBYTES]);
+        for (viewer_mode, host_mode) in [
+            (NonceMode::Legacy, NonceMode::Legacy),
+            (
+                NonceMode::Directional(SessionRole::Viewer),
+                NonceMode::Directional(SessionRole::Host),
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (client, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+            let mut viewer = WsFramedStream::from_tcp_stream(client.unwrap(), addr)
+                .await
+                .unwrap();
+            let mut host = WsFramedStream {
+                stream: WebSocketStream::from_raw_socket(
+                    MaybeTlsStream::Plain(accepted.unwrap().0),
+                    Role::Server,
+                    None,
+                )
+                .await,
+                addr,
+                encrypt: None,
+                send_timeout: 0,
+            };
+            viewer.set_key_with_mode(key.clone(), viewer_mode);
+            host.set_key_with_mode(key.clone(), host_mode);
+            viewer.send_raw(b"viewer-1".to_vec()).await.unwrap();
+            assert_eq!(&host.next().await.unwrap().unwrap()[..], b"viewer-1");
+            host.send_raw(b"host-1".to_vec()).await.unwrap();
+            assert_eq!(&viewer.next().await.unwrap().unwrap()[..], b"host-1");
+
+            let (mut reader, mut writer) = viewer.into_split();
+            writer.send_raw(b"viewer-2".to_vec()).await.unwrap();
+            assert_eq!(&host.next().await.unwrap().unwrap()[..], b"viewer-2");
+            host.send_raw(b"host-2".to_vec()).await.unwrap();
+            assert_eq!(&reader.next().await.unwrap().unwrap()[..], b"host-2");
+        }
+    }
 
     #[test]
     fn test_check_ws() {
