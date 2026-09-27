@@ -17,9 +17,11 @@ use quinn::{
         server::danger::{ClientCertVerified, ClientCertVerifier},
         DigitallySignedStruct, DistinguishedName, Error as TlsError, SignatureScheme,
     },
-    ClientConfig, Connection, ConnectionError, Endpoint, MtuDiscoveryConfig, RecvStream,
-    SendStream, ServerConfig, TransportConfig, VarInt,
+    ClientConfig, ConnectionError, Endpoint, MtuDiscoveryConfig, RecvStream, SendStream,
+    ServerConfig, TransportConfig, VarInt,
 };
+// Part of the public API; lets dependents name them without depending on quinn.
+pub use quinn::{Connection, Incoming};
 use std::{
     convert::{TryFrom, TryInto},
     net::SocketAddr,
@@ -102,10 +104,26 @@ fn validate_provisional_certificate(
     Ok(())
 }
 
+fn tls12_not_supported() -> TlsError {
+    TlsError::General("TLS 1.2 is not supported for RustAdmin QUIC".to_owned())
+}
+
 // Provisional TLS grants no application trust. The exporter-bound device proof and
 // the existing pairing handshake must bind this exact certificate before use.
+// The CertificateVerify signature is still checked, so a peer must hold the
+// private key of the certificate it presents.
 #[derive(Debug)]
-struct ProvisionalServerCertificateVerifier;
+struct ProvisionalServerCertificateVerifier {
+    supported: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl ProvisionalServerCertificateVerifier {
+    fn new(provider: &rustls::crypto::CryptoProvider) -> Self {
+        Self {
+            supported: provider.signature_verification_algorithms,
+        }
+    }
+}
 
 impl ServerCertVerifier for ProvisionalServerCertificateVerifier {
     fn verify_server_cert(
@@ -126,16 +144,16 @@ impl ServerCertVerifier for ProvisionalServerCertificateVerifier {
         _cert: &CertificateDer<'_>,
         _dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
-        Ok(HandshakeSignatureValid::assertion())
+        Err(tls12_not_supported())
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -143,9 +161,19 @@ impl ServerCertVerifier for ProvisionalServerCertificateVerifier {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ProvisionalClientCertificateVerifier {
     root_hints: Vec<DistinguishedName>,
+    supported: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl ProvisionalClientCertificateVerifier {
+    fn new(provider: &rustls::crypto::CryptoProvider) -> Self {
+        Self {
+            root_hints: Vec::new(),
+            supported: provider.signature_verification_algorithms,
+        }
+    }
 }
 
 impl ClientCertVerifier for ProvisionalClientCertificateVerifier {
@@ -169,16 +197,16 @@ impl ClientCertVerifier for ProvisionalClientCertificateVerifier {
         _cert: &CertificateDer<'_>,
         _dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
-        Ok(HandshakeSignatureValid::assertion())
+        Err(tls12_not_supported())
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -553,11 +581,49 @@ impl QuicServerEndpoint {
             .map_err(|error| QuicTransportError::UdpBind(error.to_string()))
     }
 
+    /// Accepts and handshakes one connection. Listeners serving many peers
+    /// should use `accept_incoming` and run handshakes concurrently instead.
     pub async fn accept(&self) -> Result<Connection, QuicTransportError> {
-        let incoming = tokio::time::timeout(self.connect_timeout, self.endpoint.accept())
+        let incoming = self.accept_incoming().await?;
+        self.incoming_handshake().complete(incoming).await
+    }
+
+    /// Waits for the next incoming connection without performing its TLS
+    /// handshake, so one slow or stalled peer cannot delay others.
+    pub async fn accept_incoming(&self) -> Result<Incoming, QuicTransportError> {
+        tokio::time::timeout(self.connect_timeout, self.endpoint.accept())
             .await
             .map_err(|_| QuicTransportError::Timeout("accept"))?
-            .ok_or(QuicTransportError::EndpointClosed)?;
+            .ok_or(QuicTransportError::EndpointClosed)
+    }
+
+    /// Parameters for completing an `Incoming` handshake in another task.
+    pub fn incoming_handshake(&self) -> IncomingHandshake {
+        IncomingHandshake {
+            expected_client_certificates: self.expected_client_certificates.clone(),
+            connect_timeout: self.connect_timeout,
+        }
+    }
+
+    pub fn close(&self) {
+        self.endpoint.close(VarInt::from_u32(0), b"endpoint closed");
+    }
+
+    pub async fn close_and_wait(&self) {
+        self.close();
+        let _ = tokio::time::timeout(Duration::from_secs(2), self.endpoint.wait_idle()).await;
+    }
+}
+
+/// Completes the TLS handshake of an accepted `Incoming` and checks the client
+/// certificate pin when the endpoint trusts fixed certificates.
+pub struct IncomingHandshake {
+    expected_client_certificates: Option<Vec<CertificatePin>>,
+    connect_timeout: Duration,
+}
+
+impl IncomingHandshake {
+    pub async fn complete(self, incoming: Incoming) -> Result<Connection, QuicTransportError> {
         let connection = tokio::time::timeout(self.connect_timeout, incoming)
             .await
             .map_err(|_| QuicTransportError::Timeout("handshake"))?
@@ -572,15 +638,6 @@ impl QuicServerEndpoint {
         }
         log_connection("accepted", &connection);
         Ok(connection)
-    }
-
-    pub fn close(&self) {
-        self.endpoint.close(VarInt::from_u32(0), b"endpoint closed");
-    }
-
-    pub async fn close_and_wait(&self) {
-        self.close();
-        let _ = tokio::time::timeout(Duration::from_secs(2), self.endpoint.wait_idle()).await;
     }
 }
 
@@ -1048,10 +1105,12 @@ fn build_provisional_server_config(
     options: &QuicTransportOptions,
 ) -> Result<ServerConfig, QuicTransportError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut crypto = rustls::ServerConfig::builder_with_provider(provider)
+    let mut crypto = rustls::ServerConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|error| QuicTransportError::Configuration(error.to_string()))?
-        .with_client_cert_verifier(Arc::new(ProvisionalClientCertificateVerifier::default()))
+        .with_client_cert_verifier(Arc::new(ProvisionalClientCertificateVerifier::new(
+            &provider,
+        )))
         .with_single_cert(credentials.certificate_chain, credentials.private_key)
         .map_err(|error| QuicTransportError::Configuration(error.to_string()))?;
     crypto.alpn_protocols = supported_alpn_protocols(options);
@@ -1091,11 +1150,13 @@ fn build_provisional_client_config(
     options: &QuicTransportOptions,
 ) -> Result<ClientConfig, QuicTransportError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut crypto = rustls::ClientConfig::builder_with_provider(provider)
+    let mut crypto = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|error| QuicTransportError::Configuration(error.to_string()))?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(ProvisionalServerCertificateVerifier))
+        .with_custom_certificate_verifier(Arc::new(ProvisionalServerCertificateVerifier::new(
+            &provider,
+        )))
         .with_client_auth_cert(credentials.certificate_chain, credentials.private_key)
         .map_err(|error| QuicTransportError::Configuration(error.to_string()))?;
     crypto.alpn_protocols = supported_alpn_protocols(options);
@@ -1224,7 +1285,7 @@ async fn authenticate_client_inner(
     )?;
     write_message(&mut send, &header, &client_payload).await?;
 
-    let response = read_message(&mut receive).await?;
+    let response = read_handshake_message(&mut receive, MessageType::ServerHello).await?;
     if response.header.message_type != MessageType::ServerHello
         || response.header.session_id != session_id
         || response.header.sequence_number != 1
@@ -1274,7 +1335,7 @@ async fn authenticate_server_inner(
         .map_err(|error| QuicTransportError::Stream(error.to_string()))?;
     send.set_priority(i32::MAX)
         .map_err(|error| QuicTransportError::Stream(error.to_string()))?;
-    let request = read_message(&mut receive).await?;
+    let request = read_handshake_message(&mut receive, MessageType::ClientHello).await?;
     if request.header.message_type != MessageType::ClientHello
         || request.header.session_id != session_id
         || request.header.sequence_number != 1
@@ -1335,7 +1396,7 @@ async fn authenticate_server_discover_session_inner(
         .map_err(|error| QuicTransportError::Stream(error.to_string()))?;
     send.set_priority(i32::MAX)
         .map_err(|error| QuicTransportError::Stream(error.to_string()))?;
-    let request = read_message(&mut receive).await?;
+    let request = read_handshake_message(&mut receive, MessageType::ClientHello).await?;
     if request.header.message_type != MessageType::ClientHello
         || request.header.sequence_number != 1
         || request.header.flags & FLAG_ACK_REQUIRED == 0
@@ -1560,12 +1621,44 @@ async fn write_message(
 }
 
 async fn read_message(stream: &mut RecvStream) -> Result<ControlMessage, QuicTransportError> {
+    let (encoded_header, header) = read_header(stream).await?;
+    read_payload(stream, encoded_header, header).await
+}
+
+/// Reads an unauthenticated peer's first message. The declared type is checked
+/// before the payload is allocated, so the peer cannot reserve a large buffer
+/// by announcing another message type; the handshake types allow 512 bytes.
+async fn read_handshake_message(
+    stream: &mut RecvStream,
+    expected: MessageType,
+) -> Result<ControlMessage, QuicTransportError> {
+    let (encoded_header, header) = read_header(stream).await?;
+    if header.message_type != expected {
+        return Err(QuicTransportError::Authentication(format!(
+            "expected {expected:?}, received {:?}",
+            header.message_type
+        )));
+    }
+    read_payload(stream, encoded_header, header).await
+}
+
+async fn read_header(
+    stream: &mut RecvStream,
+) -> Result<([u8; HEADER_LEN], MessageHeader), QuicTransportError> {
     let mut encoded_header = [0u8; HEADER_LEN];
     stream
         .read_exact(&mut encoded_header)
         .await
         .map_err(|error| QuicTransportError::Stream(error.to_string()))?;
     let header = decode_header(&encoded_header)?;
+    Ok((encoded_header, header))
+}
+
+async fn read_payload(
+    stream: &mut RecvStream,
+    encoded_header: [u8; HEADER_LEN],
+    header: MessageHeader,
+) -> Result<ControlMessage, QuicTransportError> {
     let mut payload = vec![0u8; header.payload_length as usize];
     stream
         .read_exact(&mut payload)
@@ -2048,6 +2141,303 @@ mod tests {
         channel.ping().await.unwrap();
         let _ = done_tx.send(());
         server_task.await.unwrap();
+        client.close();
+    }
+
+    fn raw_header(
+        message_type: MessageType,
+        session_id: SessionId,
+        payload_length: u32,
+    ) -> [u8; HEADER_LEN] {
+        use crate::transport::protocol::{MAGIC, PROTOCOL_VERSION};
+        let mut header = [0u8; HEADER_LEN];
+        header[0..4].copy_from_slice(&MAGIC.to_be_bytes());
+        header[4..6].copy_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+        header[6..8].copy_from_slice(&(message_type as u16).to_be_bytes());
+        header[10] = message_type.channel() as u8;
+        header[12..28].copy_from_slice(&session_id);
+        header[28..36].copy_from_slice(&1u64.to_be_bytes());
+        header[36..40].copy_from_slice(&payload_length.to_be_bytes());
+        header
+    }
+
+    fn provisional_server(options: &QuicTransportOptions) -> Option<QuicServerEndpoint> {
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        match QuicServerEndpoint::bind_provisional(bind, certificate().credentials(), options) {
+            Ok(server) => Some(server),
+            Err(QuicTransportError::UdpBind(error))
+                if error.contains("Operation not permitted") =>
+            {
+                None
+            }
+            Err(error) => panic!("server endpoint failed: {}", error),
+        }
+    }
+
+    fn custom_client(
+        options: &QuicTransportOptions,
+        verifier: Arc<dyn ServerCertVerifier>,
+        client_key: Arc<rustls::sign::CertifiedKey>,
+    ) -> Endpoint {
+        #[derive(Debug)]
+        struct FixedClientCert(Arc<rustls::sign::CertifiedKey>);
+        impl rustls::client::ResolvesClientCert for FixedClientCert {
+            fn resolve(
+                &self,
+                _root_hint_subjects: &[&[u8]],
+                _sigschemes: &[SignatureScheme],
+            ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+                Some(self.0.clone())
+            }
+
+            fn has_certs(&self) -> bool {
+                true
+            }
+        }
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut crypto = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_client_cert_resolver(Arc::new(FixedClientCert(client_key)));
+        crypto.alpn_protocols = supported_alpn_protocols(options);
+        let mut config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto).unwrap()));
+        config.transport_config(build_transport_config(options).unwrap());
+        let mut endpoint =
+            Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+        endpoint.set_default_client_config(config);
+        endpoint
+    }
+
+    fn certified_key(
+        certificate: &TestCertificate,
+        key_owner: &TestCertificate,
+    ) -> Arc<rustls::sign::CertifiedKey> {
+        let provider = rustls::crypto::ring::default_provider();
+        let key = provider
+            .key_provider
+            .load_private_key(
+                rustls::pki_types::PrivatePkcs8KeyDer::from(key_owner.private_key.clone()).into(),
+            )
+            .unwrap();
+        Arc::new(rustls::sign::CertifiedKey::new(
+            vec![certificate.certificate.clone()],
+            key,
+        ))
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_other_message_types_before_allocating_their_payload() {
+        let options = QuicTransportOptions {
+            connect_timeout: Duration::from_secs(2),
+            ..Default::default()
+        };
+        let Some(server) = provisional_server(&options) else {
+            return;
+        };
+        let client = QuicClientEndpoint::bind_provisional(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            certificate().credentials(),
+            &options,
+        )
+        .unwrap();
+        let server_address = server.local_addr().unwrap();
+        let server_identity = device_identity();
+        let server_task = tokio::spawn(async move {
+            let connection = server.accept().await.unwrap();
+            let started = Instant::now();
+            let result = AuthenticatedControlChannel::authenticate_server_discover_peer(
+                connection,
+                &server_identity,
+                Duration::from_secs(10),
+            )
+            .await;
+            (
+                result.err().map(|error| error.to_string()),
+                started.elapsed(),
+            )
+        });
+        let connection = client.connect(server_address).await.unwrap();
+        let (mut send, _receive) = connection.open_bi().await.unwrap();
+        // Announce a 32 MiB control message instead of the ClientHello and
+        // never send its payload.
+        send.write_all(&raw_header(
+            MessageType::ApplicationControl,
+            [9; 16],
+            32 * 1024 * 1024,
+        ))
+        .await
+        .unwrap();
+        let (error, elapsed) = server_task.await.unwrap();
+        let error = error.expect("authentication must fail");
+        assert!(error.contains("expected ClientHello"), "{}", error);
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "rejected without waiting for the payload: {:?}",
+            elapsed
+        );
+        client.close();
+    }
+
+    #[tokio::test]
+    async fn provisional_tls_requires_proof_of_the_presented_certificate_key() {
+        let options = QuicTransportOptions {
+            connect_timeout: Duration::from_secs(2),
+            ..Default::default()
+        };
+        let Some(server) = provisional_server(&options) else {
+            return;
+        };
+        let server_address = server.local_addr().unwrap();
+        let provider = rustls::crypto::ring::default_provider();
+        let verifier: Arc<dyn ServerCertVerifier> =
+            Arc::new(ProvisionalServerCertificateVerifier::new(&provider));
+        let presented = certificate();
+        let other = certificate();
+
+        // A client presenting a certificate without its private key is refused.
+        let impostor = custom_client(
+            &options,
+            verifier.clone(),
+            certified_key(&presented, &other),
+        );
+        let attempt = impostor.connect(server_address, PEER_SERVER_NAME).unwrap();
+        let (server_result, _) = tokio::join!(server.accept(), attempt);
+        assert!(
+            matches!(server_result, Err(QuicTransportError::Handshake(_))),
+            "{:?}",
+            server_result.map(|_| ())
+        );
+
+        // The owner of the key is accepted.
+        let owner = custom_client(&options, verifier, certified_key(&presented, &presented));
+        let attempt = owner.connect(server_address, PEER_SERVER_NAME).unwrap();
+        let (server_result, client_result) = tokio::join!(server.accept(), attempt);
+        assert!(server_result.is_ok(), "{:?}", server_result.map(|_| ()));
+        assert!(client_result.is_ok());
+        impostor.close(0u32.into(), b"done");
+        owner.close(0u32.into(), b"done");
+    }
+
+    #[tokio::test]
+    async fn a_stalled_handshake_does_not_delay_other_clients() {
+        #[derive(Debug)]
+        struct StallingVerifier {
+            inner: ProvisionalServerCertificateVerifier,
+            stall: Duration,
+        }
+        impl ServerCertVerifier for StallingVerifier {
+            fn verify_server_cert(
+                &self,
+                end_entity: &CertificateDer<'_>,
+                intermediates: &[CertificateDer<'_>],
+                server_name: &ServerName<'_>,
+                ocsp_response: &[u8],
+                now: UnixTime,
+            ) -> Result<ServerCertVerified, TlsError> {
+                // Blocks this client's endpoint thread mid-handshake.
+                std::thread::sleep(self.stall);
+                self.inner.verify_server_cert(
+                    end_entity,
+                    intermediates,
+                    server_name,
+                    ocsp_response,
+                    now,
+                )
+            }
+
+            fn verify_tls12_signature(
+                &self,
+                message: &[u8],
+                cert: &CertificateDer<'_>,
+                dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, TlsError> {
+                self.inner.verify_tls12_signature(message, cert, dss)
+            }
+
+            fn verify_tls13_signature(
+                &self,
+                message: &[u8],
+                cert: &CertificateDer<'_>,
+                dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, TlsError> {
+                self.inner.verify_tls13_signature(message, cert, dss)
+            }
+
+            fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+                self.inner.supported_verify_schemes()
+            }
+        }
+
+        let options = QuicTransportOptions {
+            connect_timeout: Duration::from_secs(5),
+            ..Default::default()
+        };
+        let Some(server) = provisional_server(&options) else {
+            return;
+        };
+        let server_address = server.local_addr().unwrap();
+        let server = Arc::new(server);
+        let accept_loop = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                let mut handshakes = Vec::new();
+                for _ in 0..2 {
+                    let incoming = server.accept_incoming().await.unwrap();
+                    let handshake = server.incoming_handshake();
+                    handshakes.push(tokio::spawn(async move {
+                        handshake.complete(incoming).await.is_ok()
+                    }));
+                }
+                handshakes
+            })
+        };
+
+        let stalled_options = options.clone();
+        let stalled = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let provider = rustls::crypto::ring::default_provider();
+                let owner = certificate();
+                let verifier = Arc::new(StallingVerifier {
+                    inner: ProvisionalServerCertificateVerifier::new(&provider),
+                    stall: Duration::from_millis(2500),
+                });
+                let endpoint =
+                    custom_client(&stalled_options, verifier, certified_key(&owner, &owner));
+                let _ = endpoint
+                    .connect(server_address, PEER_SERVER_NAME)
+                    .unwrap()
+                    .await;
+                endpoint.close(0u32.into(), b"done");
+            });
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let client = QuicClientEndpoint::bind_provisional(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            certificate().credentials(),
+            &options,
+        )
+        .unwrap();
+        let started = Instant::now();
+        let connection =
+            tokio::time::timeout(Duration::from_secs(2), client.connect(server_address))
+                .await
+                .expect("the second client must not wait for the stalled handshake")
+                .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(connection);
+
+        let handshakes = accept_loop.await.unwrap();
+        for handshake in handshakes {
+            assert!(handshake.await.unwrap());
+        }
+        stalled.join().unwrap();
         client.close();
     }
 

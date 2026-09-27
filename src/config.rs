@@ -3650,6 +3650,10 @@ pub mod keys {
     pub const OPTION_QUIC_KEEPALIVE_INTERVAL_MS: &str = "quic-keepalive-interval-ms";
     pub const OPTION_QUIC_ENABLE_IPV6: &str = "quic-enable-ipv6";
     pub const OPTION_QUIC_FILE_BANDWIDTH_MBPS: &str = "quic-file-bandwidth-mbps";
+    /// Seconds a QUIC session may stay unauthorized, including time spent
+    /// waiting for a password or for the user to accept it, before the host
+    /// closes it; 0 or unset disables the limit (default).
+    pub const OPTION_QUIC_PRELOGIN_TIMEOUT_SECS: &str = "quic-prelogin-timeout-secs";
     pub const OPTION_ALLOW_INSECURE_TLS_FALLBACK: &str = "allow-insecure-tls-fallback";
     pub const OPTION_SHOW_VIRTUAL_MOUSE: &str = "show-virtual-mouse";
     // joystick is the virtual mouse.
@@ -3886,6 +3890,7 @@ pub mod keys {
         OPTION_QUIC_KEEPALIVE_INTERVAL_MS,
         OPTION_QUIC_ENABLE_IPV6,
         OPTION_QUIC_FILE_BANDWIDTH_MBPS,
+        OPTION_QUIC_PRELOGIN_TIMEOUT_SECS,
         OPTION_ALLOW_INSECURE_TLS_FALLBACK,
         OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS,
         OPTION_ALLOW_AUTO_UPDATE,
