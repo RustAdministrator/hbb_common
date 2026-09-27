@@ -656,6 +656,24 @@ fn read_u64(input: &[u8], offset: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::robustness::exercise_decoder;
+
+    #[test]
+    fn random_and_mutated_fragments_never_panic_or_exceed_limits() {
+        let frame: Vec<u8> = (0..3000).map(|index| index as u8).collect();
+        let mut samples = datagrams(1, &frame, 800);
+        samples.extend(datagrams_with_flags(2, 0, &frame[..500], 1200));
+        let config = VideoReassemblyConfig::default();
+        let mut reassembler = VideoReassembler::new(config).unwrap();
+        let start = Instant::now();
+        let mut step = 0u64;
+        exercise_decoder(0x7669_6465, &samples, 1500, |input| {
+            step += 1;
+            let _ = reassembler.push(input, start + Duration::from_millis(step % 5_000));
+            assert!(reassembler.pending.len() <= config.max_pending_frames);
+            assert!(reassembler.pending_bytes <= config.max_memory_bytes);
+        });
+    }
 
     fn metadata(frame_id: u64) -> VideoFrameMetadata {
         VideoFrameMetadata {

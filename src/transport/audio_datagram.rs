@@ -432,6 +432,28 @@ fn read_u64(input: &[u8], offset: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::robustness::exercise_decoder;
+
+    #[test]
+    fn random_and_mutated_audio_datagrams_never_panic() {
+        let samples: Vec<Vec<u8>> = (1..=3)
+            .map(|sequence| {
+                encode_audio_datagram([3; 16], 7, metadata(sequence), &[sequence as u8; 40], 1200)
+                    .unwrap()
+            })
+            .collect();
+        let mut buffer = AudioJitterBuffer::new(AudioJitterConfig::default()).unwrap();
+        let start = Instant::now();
+        let mut step = 0u64;
+        exercise_decoder(0x6175_6469, &samples, 1500, |input| {
+            step += 1;
+            let now = start + Duration::from_millis(step);
+            if let Ok(packet) = decode_audio_datagram(input) {
+                let _ = buffer.push(packet, now);
+            }
+            let _ = buffer.pop_ready(now);
+        });
+    }
 
     fn metadata(sequence_number: u64) -> AudioPacketMetadata {
         AudioPacketMetadata {

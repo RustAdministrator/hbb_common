@@ -581,6 +581,29 @@ fn read_u32(input: &[u8], offset: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::robustness::exercise_decoder;
+
+    #[test]
+    fn random_and_mutated_negotiation_payloads_never_panic() {
+        let local = offer();
+        let agreement = negotiate_session(&local, &local).unwrap();
+        let samples = vec![
+            encode_session_offer(&local).unwrap(),
+            encode_session_agreement(&agreement).unwrap().to_vec(),
+            encode_session_acceptance(&local, &agreement).unwrap(),
+        ];
+        exercise_decoder(0x7365_7373, &samples, 512, |input| {
+            if let Ok(remote) = decode_session_offer(input) {
+                let _ = negotiate_session(&local, &remote);
+            }
+            if let Ok(agreement) = decode_session_agreement(input) {
+                let _ = validate_agreement_for_offer(&agreement, &local);
+            }
+            if let Ok((server_offer, agreement)) = decode_session_acceptance(input) {
+                let _ = validate_session_acceptance(&local, &server_offer, &agreement);
+            }
+        });
+    }
 
     fn offer() -> SessionOffer {
         SessionOffer {

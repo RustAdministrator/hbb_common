@@ -7,6 +7,8 @@ pub mod input;
 pub mod pairing;
 pub mod protocol;
 pub mod recovery;
+#[cfg(test)]
+mod robustness;
 pub mod session;
 pub mod statistics;
 pub mod video_datagram;
