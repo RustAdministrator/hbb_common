@@ -293,8 +293,50 @@ impl TcpSocketDiagnostics {
     }
 }
 
+/// `IdPk.secure_channel` value with which a host advertises that it accepts
+/// directional secretbox nonces. The flag sits inside the host's signed id.
+pub const SECURE_CHANNEL_DIRECTIONAL: u32 = 1;
+/// Byte a viewer appends to the boxed session key to select directional
+/// nonces; only sent to hosts that advertised `SECURE_CHANNEL_DIRECTIONAL`.
+pub const SESSION_KEY_MODE_DIRECTIONAL: u8 = 0x01;
+const NONCE_TAG_VIEWER_TO_HOST: u8 = 0x01;
+const NONCE_TAG_HOST_TO_VIEWER: u8 = 0x02;
+
+/// Side of a peer session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionRole {
+    Viewer,
+    Host,
+}
+
+/// Nonce layout of a secretbox channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NonceMode {
+    /// RustDesk layout: the nonce is the frame counter alone, so both
+    /// directions use the same nonces under the shared key.
+    Legacy,
+    /// The frame counter plus a direction tag in the last nonce byte, so the
+    /// two directions never share a nonce. Holds our own role.
+    Directional(SessionRole),
+}
+
+impl NonceMode {
+    fn nonce(self, seqnum: u64, sending: bool) -> Nonce {
+        let mut nonce = FramedStream::get_nonce(seqnum);
+        if let Self::Directional(role) = self {
+            let viewer_to_host = (role == SessionRole::Viewer) == sending;
+            nonce.0[secretbox::NONCEBYTES - 1] = if viewer_to_host {
+                NONCE_TAG_VIEWER_TO_HOST
+            } else {
+                NONCE_TAG_HOST_TO_VIEWER
+            };
+        }
+        nonce
+    }
+}
+
 #[derive(Clone)]
-pub struct Encrypt(pub Key, pub u64, pub u64);
+pub struct Encrypt(pub Key, pub u64, pub u64, pub NonceMode);
 
 pub struct FramedStream(
     pub Framed<DynTcpStream, BytesCodec>,
@@ -586,7 +628,11 @@ impl FramedStream {
     }
 
     pub fn set_key(&mut self, key: Key) {
-        self.2 = Some(Encrypt::new(key));
+        self.set_key_with_mode(key, NonceMode::Legacy);
+    }
+
+    pub fn set_key_with_mode(&mut self, key: Key, mode: NonceMode) {
+        self.2 = Some(Encrypt::with_mode(key, mode));
     }
 
     fn get_nonce(seqnum: u64) -> Nonce {
@@ -1079,6 +1125,169 @@ mod tests {
         write_task.abort();
     }
 
+    fn directional(role: SessionRole) -> NonceMode {
+        NonceMode::Directional(role)
+    }
+
+    fn open(encrypt: &mut Encrypt, frame: &[u8]) -> Result<Vec<u8>, Error> {
+        let mut bytes = BytesMut::from(frame);
+        encrypt.dec(&mut bytes)?;
+        Ok(bytes.to_vec())
+    }
+
+    #[test]
+    fn legacy_encryption_is_byte_identical_to_the_rustdesk_layout() {
+        let key = Key([3; secretbox::KEYBYTES]);
+        let mut sender = Encrypt::new(key.clone());
+        let mut receiver = Encrypt::new(key.clone());
+        for seqnum in 1..=3u64 {
+            let mut nonce = [0u8; secretbox::NONCEBYTES];
+            nonce[..8].copy_from_slice(&seqnum.to_le_bytes());
+            let frame = sender.enc(b"frame");
+            assert_eq!(frame, secretbox::seal(b"frame", &Nonce(nonce), &key));
+            assert_eq!(open(&mut receiver, &frame).unwrap(), b"frame");
+        }
+        // Legacy peers keep passing 0- and 1-byte frames through.
+        assert_eq!(open(&mut receiver, b"x").unwrap(), b"x");
+        assert_eq!(open(&mut receiver, b"").unwrap(), b"");
+    }
+
+    #[test]
+    fn directional_nonces_separate_the_two_directions() {
+        let key = Key([5; secretbox::KEYBYTES]);
+        let mut viewer_tx = Encrypt::with_mode(key.clone(), directional(SessionRole::Viewer));
+        let mut viewer_rx = viewer_tx.clone();
+        let mut host_tx = Encrypt::with_mode(key.clone(), directional(SessionRole::Host));
+        let mut host_rx = host_tx.clone();
+        for _ in 0..3 {
+            let to_host = viewer_tx.enc(b"to host");
+            assert_eq!(open(&mut host_rx, &to_host).unwrap(), b"to host");
+            let to_viewer = host_tx.enc(b"to viewer");
+            assert_eq!(open(&mut viewer_rx, &to_viewer).unwrap(), b"to viewer");
+        }
+
+        // With the legacy layout a frame reflected back to its sender opens,
+        // because both directions share (key, nonce); directional nonces
+        // reject it.
+        let mut legacy_tx = Encrypt::new(key.clone());
+        let mut legacy_rx = Encrypt::new(key.clone());
+        assert!(open(&mut legacy_rx, &legacy_tx.enc(b"reflected")).is_ok());
+        let mut viewer_tx = Encrypt::with_mode(key.clone(), directional(SessionRole::Viewer));
+        let mut viewer_rx = viewer_tx.clone();
+        assert!(open(&mut viewer_rx, &viewer_tx.enc(b"reflected")).is_err());
+
+        let viewer = directional(SessionRole::Viewer);
+        let host = directional(SessionRole::Host);
+        let mut nonces = std::collections::HashSet::new();
+        for seqnum in 1..=1000 {
+            assert!(nonces.insert(viewer.nonce(seqnum, true).0));
+            assert!(nonces.insert(host.nonce(seqnum, true).0));
+            assert!(!nonces.contains(&NonceMode::Legacy.nonce(seqnum, true).0));
+        }
+        assert_eq!(viewer.nonce(7, true).0, host.nonce(7, false).0);
+        assert_eq!(viewer.nonce(7, false).0, host.nonce(7, true).0);
+    }
+
+    #[test]
+    fn directional_mode_rejects_frames_shorter_than_the_authenticator() {
+        let key = Key([9; secretbox::KEYBYTES]);
+        let mut host = Encrypt::with_mode(key, directional(SessionRole::Host));
+        for length in [0, 1, secretbox::MACBYTES - 1] {
+            assert!(open(&mut host, &vec![0u8; length]).is_err(), "{}", length);
+        }
+    }
+
+    #[test]
+    fn directional_session_key_is_accepted_only_when_offered() {
+        let (host_pk, host_sk) = box_::gen_keypair();
+        let (viewer_pk, viewer_sk) = box_::gen_keypair();
+        let key = secretbox::gen_key();
+        let seal = |payload: &[u8]| {
+            box_::seal(
+                payload,
+                &box_::Nonce([0u8; box_::NONCEBYTES]),
+                &host_pk,
+                &viewer_sk,
+            )
+        };
+        let decode = |sealed: &[u8], offered: bool| {
+            Encrypt::decode_session(sealed, &viewer_pk.0, &host_sk, offered)
+                .map(|(key, directional)| (key.0, directional))
+        };
+
+        let legacy = seal(&key.0);
+        assert_eq!(decode(&legacy, false).unwrap(), (key.0, false));
+        assert_eq!(decode(&legacy, true).unwrap(), (key.0, false));
+        assert_eq!(
+            Encrypt::decode(&legacy, &viewer_pk.0, &host_sk).unwrap().0,
+            key.0
+        );
+
+        let mut selector = key.0.to_vec();
+        selector.push(SESSION_KEY_MODE_DIRECTIONAL);
+        let selected = seal(&selector);
+        assert_eq!(decode(&selected, true).unwrap(), (key.0, true));
+        // A host that did not advertise the mode (including old hosts, which
+        // use `decode`) rejects the selector.
+        assert!(decode(&selected, false).is_err());
+        assert!(Encrypt::decode(&selected, &viewer_pk.0, &host_sk).is_err());
+
+        let mut unknown_mode = selector.clone();
+        unknown_mode[secretbox::KEYBYTES] = 0x02;
+        let mut too_long = selector.clone();
+        too_long.push(SESSION_KEY_MODE_DIRECTIONAL);
+        for invalid in [unknown_mode, too_long, key.0[..31].to_vec()] {
+            assert!(decode(&seal(&invalid), true).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn framed_streams_exchange_frames_in_both_nonce_modes() {
+        let addr = "127.0.0.1:0".parse().unwrap();
+        let key = Key([13; secretbox::KEYBYTES]);
+        for (viewer_mode, host_mode) in [
+            (NonceMode::Legacy, NonceMode::Legacy),
+            (
+                directional(SessionRole::Viewer),
+                directional(SessionRole::Host),
+            ),
+        ] {
+            let (left, right) = tokio::io::duplex(4096);
+            let mut viewer = FramedStream::from(left, addr);
+            let mut host = FramedStream::from(right, addr);
+            viewer.set_key_with_mode(key.clone(), viewer_mode);
+            host.set_key_with_mode(key.clone(), host_mode);
+            viewer.send_raw(b"viewer-1".to_vec()).await.unwrap();
+            assert_eq!(&host.next().await.unwrap().unwrap()[..], b"viewer-1");
+            host.send_raw(b"host-1".to_vec()).await.unwrap();
+            assert_eq!(&viewer.next().await.unwrap().unwrap()[..], b"host-1");
+
+            let (mut reader, mut writer) = viewer.into_split();
+            writer.send_raw(b"viewer-2".to_vec()).await.unwrap();
+            assert_eq!(&host.next().await.unwrap().unwrap()[..], b"viewer-2");
+            host.send_raw(Vec::new()).await.unwrap();
+            assert!(reader.next().await.unwrap().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn mismatched_nonce_modes_fail_closed() {
+        let addr = "127.0.0.1:0".parse().unwrap();
+        let key = Key([17; secretbox::KEYBYTES]);
+        for (viewer_mode, host_mode) in [
+            (NonceMode::Legacy, directional(SessionRole::Host)),
+            (directional(SessionRole::Viewer), NonceMode::Legacy),
+        ] {
+            let (left, right) = tokio::io::duplex(4096);
+            let mut viewer = FramedStream::from(left, addr);
+            let mut host = FramedStream::from(right, addr);
+            viewer.set_key_with_mode(key.clone(), viewer_mode);
+            host.set_key_with_mode(key.clone(), host_mode);
+            viewer.send_raw(b"viewer".to_vec()).await.unwrap();
+            assert!(host.next().await.unwrap().is_err());
+        }
+    }
+
     #[tokio::test]
     async fn split_preserves_independent_encryption_counters() {
         let (left, right) = tokio::io::duplex(4096);
@@ -1134,15 +1343,27 @@ mod tests {
 
 impl Encrypt {
     pub fn new(key: Key) -> Self {
-        Self(key, 0, 0)
+        Self::with_mode(key, NonceMode::Legacy)
+    }
+
+    pub fn with_mode(key: Key, mode: NonceMode) -> Self {
+        Self(key, 0, 0, mode)
     }
 
     pub fn dec(&mut self, bytes: &mut BytesMut) -> Result<(), Error> {
+        // Legacy peers pass 0- and 1-byte frames through unencrypted; peers
+        // using directional nonces encrypt every frame.
+        if self.3 != NonceMode::Legacy && bytes.len() < secretbox::MACBYTES {
+            return Err(Error::new(
+                ErrorKind::Other,
+                "decryption error: frame shorter than the authenticator",
+            ));
+        }
         if bytes.len() <= 1 {
             return Ok(());
         }
         self.2 += 1;
-        let nonce = FramedStream::get_nonce(self.2);
+        let nonce = self.3.nonce(self.2, false);
         match secretbox::open(bytes, &nonce, &self.0) {
             Ok(res) => {
                 bytes.clear();
@@ -1155,7 +1376,7 @@ impl Encrypt {
 
     pub fn enc(&mut self, data: &[u8]) -> Vec<u8> {
         self.1 += 1;
-        let nonce = FramedStream::get_nonce(self.1);
+        let nonce = self.3.nonce(self.1, true);
         secretbox::seal(&data, &nonce, &self.0)
     }
 
@@ -1164,6 +1385,19 @@ impl Encrypt {
         their_pk_b: &[u8],
         our_sk_b: &box_::SecretKey,
     ) -> ResultType<Key> {
+        Self::decode_session(symmetric_data, their_pk_b, our_sk_b, false).map(|(key, _)| key)
+    }
+
+    /// Opens the boxed session key. Accepts the legacy 32-byte key and, only
+    /// when `directional_offered` (we advertised `SECURE_CHANNEL_DIRECTIONAL`),
+    /// the key followed by `SESSION_KEY_MODE_DIRECTIONAL`. Returns the key and
+    /// whether the peer selected directional nonces.
+    pub fn decode_session(
+        symmetric_data: &[u8],
+        their_pk_b: &[u8],
+        our_sk_b: &box_::SecretKey,
+        directional_offered: bool,
+    ) -> ResultType<(Key, bool)> {
         if their_pk_b.len() != box_::PUBLICKEYBYTES {
             anyhow::bail!("Handshake failed: pk length {}", their_pk_b.len());
         }
@@ -1173,11 +1407,18 @@ impl Encrypt {
         let their_pk_b = box_::PublicKey(pk_);
         let symmetric_key = box_::open(symmetric_data, &nonce, &their_pk_b, &our_sk_b)
             .map_err(|_| anyhow::anyhow!("Handshake failed: box decryption failure"))?;
-        if symmetric_key.len() != secretbox::KEYBYTES {
+        let directional = if symmetric_key.len() == secretbox::KEYBYTES {
+            false
+        } else if directional_offered
+            && symmetric_key.len() == secretbox::KEYBYTES + 1
+            && symmetric_key[secretbox::KEYBYTES] == SESSION_KEY_MODE_DIRECTIONAL
+        {
+            true
+        } else {
             anyhow::bail!("Handshake failed: invalid secret key length from peer");
-        }
+        };
         let mut key = [0u8; secretbox::KEYBYTES];
-        key[..].copy_from_slice(&symmetric_key);
-        Ok(Key(key))
+        key[..].copy_from_slice(&symmetric_key[..secretbox::KEYBYTES]);
+        Ok((Key(key), directional))
     }
 }

@@ -762,11 +762,18 @@ impl Stream {
 
     #[inline]
     pub fn set_key(&mut self, key: Key) {
+        self.set_key_with_mode(key, tcp::NonceMode::Legacy);
+    }
+
+    /// Sets the session key; `mode` applies to the secretbox channel of TCP,
+    /// KCP and WebSocket streams (WebRTC and QUIC use their own encryption).
+    #[inline]
+    pub fn set_key_with_mode(&mut self, key: Key, mode: tcp::NonceMode) {
         match self {
             #[cfg(feature = "webrtc")]
             Stream::WebRTC(s) => s.set_key(key),
-            Stream::WebSocket(s) => s.set_key(key),
-            Stream::Tcp(s) => s.set_key(key),
+            Stream::WebSocket(s) => s.set_key_with_mode(key, mode),
+            Stream::Tcp(s) => s.set_key_with_mode(key, mode),
             Stream::Duplex(_) => log::warn!("set_key ignored after stream split"),
             #[cfg(feature = "quic-transport")]
             Stream::Quic(_) => log::debug!("application secretbox key is redundant over QUIC TLS"),
@@ -1260,6 +1267,24 @@ mod tests {
         remote.set_key(key);
         stream.send_raw(b"encrypted".to_vec()).await.unwrap();
         assert_eq!(&remote.next().await.unwrap().unwrap()[..], b"encrypted");
+    }
+
+    #[tokio::test]
+    async fn duplex_keeps_the_directional_nonce_mode() {
+        use tcp::{NonceMode, SessionRole};
+        let (left, right) = tokio::io::duplex(4096);
+        let addr = "127.0.0.1:0".parse().unwrap();
+        let key = Key([23; sodiumoxide::crypto::secretbox::KEYBYTES]);
+        let mut host = Stream::Tcp(tcp::FramedStream::from(left, addr));
+        host.set_key_with_mode(key.clone(), NonceMode::Directional(SessionRole::Host));
+        let mut host = host.into_duplex(4);
+        let mut viewer = tcp::FramedStream::from(right, addr);
+        viewer.set_key_with_mode(key, NonceMode::Directional(SessionRole::Viewer));
+
+        host.send_raw(b"to viewer".to_vec()).await.unwrap();
+        assert_eq!(&viewer.next().await.unwrap().unwrap()[..], b"to viewer");
+        viewer.send_raw(b"to host".to_vec()).await.unwrap();
+        assert_eq!(&host.next().await.unwrap().unwrap()[..], b"to host");
     }
 
     struct ReadableBlockedWrite {
