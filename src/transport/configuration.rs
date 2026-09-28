@@ -19,6 +19,9 @@ pub struct NetworkTransportConfig {
     pub keepalive_interval: Duration,
     pub enable_ipv6: bool,
     pub file_bandwidth_limit_mbps: u32,
+    /// How long an unauthorized QUIC session may stay open; `None` disables
+    /// the limit (default), because legitimate logins can wait for users.
+    pub prelogin_timeout: Option<Duration>,
     pub trusted_peer_store: PathBuf,
 }
 
@@ -36,6 +39,8 @@ pub enum NetworkConfigError {
     InvalidKeepalive(String),
     #[error("invalid QUIC file-transfer bandwidth limit {0}")]
     InvalidFileBandwidth(String),
+    #[error("invalid QUIC pre-login timeout {0}")]
+    InvalidPreloginTimeout(String),
 }
 
 impl NetworkTransportConfig {
@@ -50,6 +55,7 @@ impl NetworkTransportConfig {
             keys::OPTION_QUIC_KEEPALIVE_INTERVAL_MS,
             keys::OPTION_QUIC_ENABLE_IPV6,
             keys::OPTION_QUIC_FILE_BANDWIDTH_MBPS,
+            keys::OPTION_QUIC_PRELOGIN_TIMEOUT_SECS,
         ] {
             values.insert(key.to_owned(), Config::get_option(key));
         }
@@ -123,6 +129,17 @@ impl NetworkTransportConfig {
                 file_bandwidth_limit_mbps.to_string(),
             ));
         }
+        let prelogin_timeout_secs = parse_or_default::<u64>(
+            value(keys::OPTION_QUIC_PRELOGIN_TIMEOUT_SECS),
+            0,
+            NetworkConfigError::InvalidPreloginTimeout,
+        )?;
+        // Shorter limits would cut off users still typing a password.
+        if prelogin_timeout_secs != 0 && !(30..=86_400).contains(&prelogin_timeout_secs) {
+            return Err(NetworkConfigError::InvalidPreloginTimeout(
+                prelogin_timeout_secs.to_string(),
+            ));
+        }
         let enable_ipv6 = value(keys::OPTION_QUIC_ENABLE_IPV6) != "N";
         if !enable_ipv6 && listen_address.is_ipv6() {
             return Err(NetworkConfigError::InvalidListenAddress(
@@ -137,6 +154,8 @@ impl NetworkTransportConfig {
             keepalive_interval: Duration::from_millis(keepalive_interval_ms),
             enable_ipv6,
             file_bandwidth_limit_mbps,
+            prelogin_timeout: (prelogin_timeout_secs != 0)
+                .then(|| Duration::from_secs(prelogin_timeout_secs)),
             trusted_peer_store,
         })
     }
@@ -198,6 +217,35 @@ mod tests {
         assert_eq!(config.mode, RemoteTransportMode::QuicPreferred);
         assert_eq!(config.listen_address, IpAddr::from([10, 20, 30, 2]));
         assert_eq!(config.listen_port, 48101);
+    }
+
+    #[test]
+    fn prelogin_timeout_is_disabled_by_default_and_bounded() {
+        let config =
+            NetworkTransportConfig::from_values(&HashMap::new(), PathBuf::from("trusted")).unwrap();
+        assert_eq!(config.prelogin_timeout, None);
+        let with = |value: &str| {
+            let values = HashMap::from([(
+                keys::OPTION_QUIC_PRELOGIN_TIMEOUT_SECS.to_owned(),
+                value.to_owned(),
+            )]);
+            NetworkTransportConfig::from_values(&values, PathBuf::from("trusted"))
+        };
+        assert_eq!(with("0").unwrap().prelogin_timeout, None);
+        assert_eq!(
+            with("600").unwrap().prelogin_timeout,
+            Some(Duration::from_secs(600))
+        );
+        for invalid in ["5", "29", "86401", "-1", "ten"] {
+            assert!(
+                matches!(
+                    with(invalid),
+                    Err(NetworkConfigError::InvalidPreloginTimeout(_))
+                ),
+                "{}",
+                invalid
+            );
+        }
     }
 
     #[test]
