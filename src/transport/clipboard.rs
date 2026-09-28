@@ -202,6 +202,21 @@ fn read_u64(input: &[u8], offset: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::robustness::exercise_decoder;
+
+    #[test]
+    fn random_and_mutated_clipboard_payloads_never_panic() {
+        let samples = vec![
+            encode_clipboard_text([2; 16], 7, "hello", 1024).unwrap(),
+            encode_clipboard_text([2; 16], 8, "h\u{e9}llo \u{2713}", 1024).unwrap(),
+        ];
+        let mut state =
+            ClipboardState::new(ClipboardPermission::Bidirectional, [1; 16], 1024).unwrap();
+        exercise_decoder(0x636c_6970, &samples, 1500, |input| {
+            let _ = decode_clipboard_text(input, 1024);
+            let _ = state.receive(input);
+        });
+    }
 
     #[test]
     fn utf8_clipboard_round_trip() {

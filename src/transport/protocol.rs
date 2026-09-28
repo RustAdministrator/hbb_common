@@ -382,6 +382,22 @@ fn read_u64(input: &[u8], offset: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::robustness::exercise_decoder;
+
+    #[test]
+    fn random_and_mutated_packets_never_panic() {
+        let samples: Vec<Vec<u8>> = [0, 8, 64]
+            .iter()
+            .map(|len| {
+                let (header, payload) = ping(*len);
+                encode_message(&header, &payload).unwrap()
+            })
+            .collect();
+        exercise_decoder(0x7072_6f74, &samples, 256, |input| {
+            let _ = decode_message(input);
+            let _ = decode_header(input);
+        });
+    }
 
     fn session_id() -> SessionId {
         [7; 16]

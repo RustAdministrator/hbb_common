@@ -411,6 +411,34 @@ fn read_u64(input: &[u8], offset: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::robustness::exercise_decoder;
+
+    #[test]
+    fn random_and_mutated_file_payloads_never_panic() {
+        let data = b"hello";
+        let samples = vec![
+            encode_file_metadata(&metadata(data), 1024).unwrap(),
+            encode_file_chunk(&FileChunk {
+                transfer_id: [1; 16],
+                offset: 0,
+                data: data.to_vec(),
+            })
+            .unwrap(),
+            encode_file_cancel([1; 16], FileCancelReason::User)
+                .unwrap()
+                .to_vec(),
+        ];
+        let mut receiver = FileTransferReceiver::start(metadata(data), 1024, true, None).unwrap();
+        exercise_decoder(0x6669_6c65, &samples, 512, |input| {
+            if let Ok(metadata) = decode_file_metadata(input, 1024) {
+                let _ = FileTransferReceiver::start(metadata, 1024, true, None);
+            }
+            if let Ok(chunk) = decode_file_chunk(input) {
+                let _ = receiver.accept_chunk(&chunk);
+            }
+            let _ = decode_file_cancel(input);
+        });
+    }
 
     fn metadata(data: &[u8]) -> FileTransferMetadata {
         let digest = Sha256::digest(data);

@@ -546,6 +546,57 @@ fn read_i32(input: &[u8], offset: usize) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::robustness::exercise_decoder;
+
+    #[test]
+    fn random_and_mutated_input_payloads_never_panic() {
+        let session = [6; 16];
+        let movement = MouseMovement {
+            sequence_number: 3,
+            monotonic_timestamp_us: 55,
+            mode: MouseMovementMode::Relative,
+            x: -4,
+            y: 9,
+            display_id: 2,
+            button_state_mask: 3,
+        };
+        let samples = vec![
+            encode_mouse_movement(session, movement, 1200).unwrap(),
+            encode_application_mouse_movement(session, movement, b"protobuf-mouse", 1200).unwrap(),
+            encode_reliable_input(ReliableInputEvent::Key {
+                key_code: 42,
+                pressed: true,
+                modifiers: 3,
+            }),
+            encode_reliable_input(ReliableInputEvent::MouseButton {
+                button: MouseButton::Right,
+                pressed: true,
+                x: 100,
+                y: 200,
+                display_id: 1,
+            }),
+            encode_reliable_input(ReliableInputEvent::Wheel {
+                delta_x: -120,
+                delta_y: 240,
+                display_id: 1,
+            }),
+        ];
+        let mut mouse = MouseMovementReceiver::new(session);
+        let mut reliable = ReliableInputReceiver::new();
+        let mut sequence = 0u64;
+        exercise_decoder(0x696e_7075, &samples, 256, |input| {
+            let _ = decode_mouse_movement(input);
+            let _ = decode_application_mouse_movement(input);
+            let _ = decode_reliable_input(input);
+            let _ = mouse.apply(input);
+            let _ = mouse.apply_application(input);
+            sequence += 1;
+            if reliable.apply(sequence, input).is_err() {
+                reliable = ReliableInputReceiver::new();
+                sequence = 0;
+            }
+        });
+    }
 
     #[test]
     fn newest_mouse_movement_wins() {
