@@ -3724,7 +3724,7 @@ pub mod keys {
     pub const OPTION_PRELOGIN_MAX_PER_SOURCE: &str = "prelogin-max-per-source";
     pub const OPTION_PRELOGIN_MAX_TOTAL: &str = "prelogin-max-total";
     /// "Y" checks the Windows account of a terminal login before the access
-    /// password (the old order). Deliberately not in `KEYS_SETTINGS`.
+    /// password or the local approval (the old order). Off by default.
     pub const OPTION_ALLOW_TERMINAL_OS_LOGIN_BEFORE_AUTHORIZATION: &str =
         "allow-terminal-os-login-before-authorization";
     /// `local` accepts direct connections only from local-network and VPN
@@ -3987,6 +3987,7 @@ pub mod keys {
         OPTION_PRELOGIN_LIMIT_MODE,
         OPTION_PRELOGIN_MAX_PER_SOURCE,
         OPTION_PRELOGIN_MAX_TOTAL,
+        OPTION_ALLOW_TERMINAL_OS_LOGIN_BEFORE_AUTHORIZATION,
         OPTION_DIRECT_ACCESS_SCOPE,
         OPTION_DIRECT_ACCESS_EXTRA_NETWORKS,
         OPTION_QUIC_FOLLOW_DIRECT_SERVER,
@@ -4095,7 +4096,7 @@ mod tests {
     }
 
     #[test]
-    fn round_two_keys_are_settings_except_the_rollback_key() {
+    fn round_two_keys_are_settings() {
         for key in [
             keys::OPTION_PERMISSION_PROMPT_GLOBAL_INPUT_BLOCK,
             keys::OPTION_PERMISSION_REGRANT_WITHOUT_PROMPT,
@@ -4105,6 +4106,7 @@ mod tests {
             keys::OPTION_PRELOGIN_LIMIT_MODE,
             keys::OPTION_PRELOGIN_MAX_PER_SOURCE,
             keys::OPTION_PRELOGIN_MAX_TOTAL,
+            keys::OPTION_ALLOW_TERMINAL_OS_LOGIN_BEFORE_AUTHORIZATION,
             keys::OPTION_DIRECT_ACCESS_SCOPE,
             keys::OPTION_DIRECT_ACCESS_EXTRA_NETWORKS,
             keys::OPTION_QUIC_FOLLOW_DIRECT_SERVER,
@@ -4113,8 +4115,6 @@ mod tests {
         ] {
             assert!(keys::KEYS_SETTINGS.contains(&key), "{key}");
         }
-        assert!(!keys::KEYS_SETTINGS
-            .contains(&keys::OPTION_ALLOW_TERMINAL_OS_LOGIN_BEFORE_AUTHORIZATION));
         // The "allow-" options are off unless set to Y.
         for key in [
             keys::OPTION_ALLOW_TERMINAL_OS_LOGIN_BEFORE_AUTHORIZATION,
