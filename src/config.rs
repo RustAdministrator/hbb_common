@@ -3723,6 +3723,9 @@ pub mod keys {
     pub const OPTION_PRELOGIN_LIMIT_MODE: &str = "prelogin-limit-mode";
     pub const OPTION_PRELOGIN_MAX_PER_SOURCE: &str = "prelogin-max-per-source";
     pub const OPTION_PRELOGIN_MAX_TOTAL: &str = "prelogin-max-total";
+    /// "Y" lets a click-approved or one-time-password session make this device
+    /// connect back to it ("switch sides") without a local approval. Off by default.
+    pub const OPTION_ALLOW_UNAPPROVED_SWITCH_SIDES: &str = "allow-unapproved-switch-sides";
     /// "Y" checks the Windows account of a terminal login before the access
     /// password or the local approval (the old order). Off by default.
     pub const OPTION_ALLOW_TERMINAL_OS_LOGIN_BEFORE_AUTHORIZATION: &str =
@@ -3988,6 +3991,7 @@ pub mod keys {
         OPTION_PRELOGIN_MAX_PER_SOURCE,
         OPTION_PRELOGIN_MAX_TOTAL,
         OPTION_ALLOW_TERMINAL_OS_LOGIN_BEFORE_AUTHORIZATION,
+        OPTION_ALLOW_UNAPPROVED_SWITCH_SIDES,
         OPTION_DIRECT_ACCESS_SCOPE,
         OPTION_DIRECT_ACCESS_EXTRA_NETWORKS,
         OPTION_QUIC_FOLLOW_DIRECT_SERVER,
@@ -4107,6 +4111,7 @@ mod tests {
             keys::OPTION_PRELOGIN_MAX_PER_SOURCE,
             keys::OPTION_PRELOGIN_MAX_TOTAL,
             keys::OPTION_ALLOW_TERMINAL_OS_LOGIN_BEFORE_AUTHORIZATION,
+            keys::OPTION_ALLOW_UNAPPROVED_SWITCH_SIDES,
             keys::OPTION_DIRECT_ACCESS_SCOPE,
             keys::OPTION_DIRECT_ACCESS_EXTRA_NETWORKS,
             keys::OPTION_QUIC_FOLLOW_DIRECT_SERVER,
@@ -4118,6 +4123,7 @@ mod tests {
         // The "allow-" options are off unless set to Y.
         for key in [
             keys::OPTION_ALLOW_TERMINAL_OS_LOGIN_BEFORE_AUTHORIZATION,
+            keys::OPTION_ALLOW_UNAPPROVED_SWITCH_SIDES,
             keys::OPTION_ALLOW_INSECURE_RELAY_SESSION,
             keys::OPTION_ALLOW_SERVER_PERMISSION_GRANTS,
         ] {
