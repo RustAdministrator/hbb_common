@@ -3581,8 +3581,8 @@ impl PairingHostAuth {
     pub fn parse(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
             "off" => Self::Off,
-            "enforce" => Self::Enforce,
-            _ => Self::Warn,
+            "warn" => Self::Warn,
+            _ => Self::Enforce,
         }
     }
 }
@@ -3615,10 +3615,10 @@ impl RolloutMode {
 
 /// Default of `relay-secure-policy`: what to do with a relay session that
 /// the server asked to be unencrypted while no pairing passphrase protects it.
-pub const RELAY_SECURE_POLICY_DEFAULT: RolloutMode = RolloutMode::Warn;
+pub const RELAY_SECURE_POLICY_DEFAULT: RolloutMode = RolloutMode::Enforce;
 /// Default of `udp-source-check`: what to do with a rendezvous datagram that
 /// does not come from the rendezvous server's address.
-pub const UDP_SOURCE_CHECK_DEFAULT: RolloutMode = RolloutMode::Warn;
+pub const UDP_SOURCE_CHECK_DEFAULT: RolloutMode = RolloutMode::Enforce;
 
 pub fn relay_secure_policy_mode() -> RolloutMode {
     RolloutMode::parse(
@@ -3780,7 +3780,7 @@ pub mod keys {
         "permission-regrant-without-prompt";
     /// Host: "Y" stops sending the pairing acknowledgement MAC.
     pub const OPTION_DISABLE_PAIRING_HOST_PROOF: &str = "disable-pairing-host-proof";
-    /// Viewer: `off`, `warn` (default) or `enforce` for the host acknowledgement MAC.
+    /// Viewer: `off`, `warn` or `enforce` (default) for the host acknowledgement MAC.
     pub const OPTION_PAIRING_HOST_AUTH: &str = "pairing-host-auth";
     /// Seconds a TCP/relay session may stay unauthorized; same rules as
     /// `quic-prelogin-timeout-secs` (0 disables, default 600).
@@ -3811,10 +3811,10 @@ pub mod keys {
     /// "Y" lets a rendezvous/relay server raise permissions above the local
     /// policy; default off.
     pub const OPTION_ALLOW_SERVER_PERMISSION_GRANTS: &str = "allow-server-permission-grants";
-    /// `off`, `warn` (default) or `enforce` for relay sessions the server asks
+    /// `off`, `warn` or `enforce` (default) for relay sessions the server asks
     /// to be unencrypted while no pairing passphrase is set.
     pub const OPTION_RELAY_SECURE_POLICY: &str = "relay-secure-policy";
-    /// `off`, `warn` (default) or `enforce` for rendezvous datagrams that do
+    /// `off`, `warn` or `enforce` (default) for rendezvous datagrams that do
     /// not come from the rendezvous server's address.
     pub const OPTION_UDP_SOURCE_CHECK: &str = "udp-source-check";
     pub const OPTION_SHOW_VIRTUAL_MOUSE: &str = "show-virtual-mouse";
@@ -4193,11 +4193,11 @@ mod tests {
 
     #[test]
     fn pairing_host_auth_parses_known_values_and_defaults_to_warn() {
-        assert_eq!(PairingHostAuth::parse(""), PairingHostAuth::Warn);
+        assert_eq!(PairingHostAuth::parse(""), PairingHostAuth::Enforce);
         assert_eq!(PairingHostAuth::parse("warn"), PairingHostAuth::Warn);
         assert_eq!(PairingHostAuth::parse(" OFF "), PairingHostAuth::Off);
         assert_eq!(PairingHostAuth::parse("Enforce"), PairingHostAuth::Enforce);
-        assert_eq!(PairingHostAuth::parse("strict"), PairingHostAuth::Warn);
+        assert_eq!(PairingHostAuth::parse("strict"), PairingHostAuth::Enforce);
     }
 
     #[test]
@@ -4209,8 +4209,8 @@ mod tests {
             assert_eq!(RolloutMode::parse("Warn", default), RolloutMode::Warn);
             assert_eq!(RolloutMode::parse("enforce", default), RolloutMode::Enforce);
         }
-        assert_eq!(RELAY_SECURE_POLICY_DEFAULT, RolloutMode::Warn);
-        assert_eq!(UDP_SOURCE_CHECK_DEFAULT, RolloutMode::Warn);
+        assert_eq!(RELAY_SECURE_POLICY_DEFAULT, RolloutMode::Enforce);
+        assert_eq!(UDP_SOURCE_CHECK_DEFAULT, RolloutMode::Enforce);
     }
 
     #[test]
