@@ -3591,6 +3591,49 @@ pub fn pairing_host_auth() -> PairingHostAuth {
     PairingHostAuth::parse(&Config::get_option(keys::OPTION_PAIRING_HOST_AUTH))
 }
 
+/// How a new check is rolled out: `off` (kill switch), `warn` (log and count,
+/// let the traffic through) or `enforce` (refuse).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RolloutMode {
+    Off,
+    Warn,
+    Enforce,
+}
+
+impl RolloutMode {
+    /// Unknown or empty values give `default`, so a typo cannot silently
+    /// switch a check off.
+    pub fn parse(value: &str, default: Self) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Self::Off,
+            "warn" => Self::Warn,
+            "enforce" => Self::Enforce,
+            _ => default,
+        }
+    }
+}
+
+/// Default of `relay-secure-policy`: what to do with a relay session that
+/// the server asked to be unencrypted while no pairing passphrase protects it.
+pub const RELAY_SECURE_POLICY_DEFAULT: RolloutMode = RolloutMode::Warn;
+/// Default of `udp-source-check`: what to do with a rendezvous datagram that
+/// does not come from the rendezvous server's address.
+pub const UDP_SOURCE_CHECK_DEFAULT: RolloutMode = RolloutMode::Warn;
+
+pub fn relay_secure_policy_mode() -> RolloutMode {
+    RolloutMode::parse(
+        &Config::get_option(keys::OPTION_RELAY_SECURE_POLICY),
+        RELAY_SECURE_POLICY_DEFAULT,
+    )
+}
+
+pub fn udp_source_check_mode() -> RolloutMode {
+    RolloutMode::parse(
+        &Config::get_option(keys::OPTION_UDP_SOURCE_CHECK),
+        UDP_SOURCE_CHECK_DEFAULT,
+    )
+}
+
 pub mod keys {
     pub const OPTION_VIEW_ONLY: &str = "view_only";
     pub const OPTION_SHOW_MONITORS_TOOLBAR: &str = "show_monitors_toolbar";
@@ -3768,6 +3811,12 @@ pub mod keys {
     /// "Y" lets a rendezvous/relay server raise permissions above the local
     /// policy; default off.
     pub const OPTION_ALLOW_SERVER_PERMISSION_GRANTS: &str = "allow-server-permission-grants";
+    /// `off`, `warn` (default) or `enforce` for relay sessions the server asks
+    /// to be unencrypted while no pairing passphrase is set.
+    pub const OPTION_RELAY_SECURE_POLICY: &str = "relay-secure-policy";
+    /// `off`, `warn` (default) or `enforce` for rendezvous datagrams that do
+    /// not come from the rendezvous server's address.
+    pub const OPTION_UDP_SOURCE_CHECK: &str = "udp-source-check";
     pub const OPTION_SHOW_VIRTUAL_MOUSE: &str = "show-virtual-mouse";
     // joystick is the virtual mouse.
     // So `OPTION_SHOW_VIRTUAL_MOUSE` should also be set if `OPTION_SHOW_VIRTUAL_JOYSTICK` is set.
@@ -4021,6 +4070,8 @@ pub mod keys {
         OPTION_QUIC_FOLLOW_DIRECT_SERVER,
         OPTION_ALLOW_INSECURE_RELAY_SESSION,
         OPTION_ALLOW_SERVER_PERMISSION_GRANTS,
+        OPTION_RELAY_SECURE_POLICY,
+        OPTION_UDP_SOURCE_CHECK,
         OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS,
         OPTION_ALLOW_AUTO_UPDATE,
     ];
@@ -4150,6 +4201,19 @@ mod tests {
     }
 
     #[test]
+    fn rollout_mode_parses_known_values_and_falls_back_to_the_default() {
+        for default in [RolloutMode::Off, RolloutMode::Warn, RolloutMode::Enforce] {
+            assert_eq!(RolloutMode::parse("", default), default);
+            assert_eq!(RolloutMode::parse("typo", default), default);
+            assert_eq!(RolloutMode::parse(" OFF ", default), RolloutMode::Off);
+            assert_eq!(RolloutMode::parse("Warn", default), RolloutMode::Warn);
+            assert_eq!(RolloutMode::parse("enforce", default), RolloutMode::Enforce);
+        }
+        assert_eq!(RELAY_SECURE_POLICY_DEFAULT, RolloutMode::Warn);
+        assert_eq!(UDP_SOURCE_CHECK_DEFAULT, RolloutMode::Warn);
+    }
+
+    #[test]
     fn round_two_keys_are_settings() {
         for key in [
             keys::OPTION_PERMISSION_PROMPT_GLOBAL_INPUT_BLOCK,
@@ -4167,6 +4231,8 @@ mod tests {
             keys::OPTION_QUIC_FOLLOW_DIRECT_SERVER,
             keys::OPTION_ALLOW_INSECURE_RELAY_SESSION,
             keys::OPTION_ALLOW_SERVER_PERMISSION_GRANTS,
+            keys::OPTION_RELAY_SECURE_POLICY,
+            keys::OPTION_UDP_SOURCE_CHECK,
         ] {
             assert!(keys::KEYS_SETTINGS.contains(&key), "{key}");
         }
