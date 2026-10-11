@@ -458,9 +458,42 @@ fn is_compressed_file(name: &str) -> bool {
     compressed_exts.contains(&ext)
 }
 
+/// Whether one path component names something Windows would not treat as a
+/// plain file: an NTFS stream (`name:stream`), a device (`CON`, `NUL.txt`, ...)
+/// or a name that ends in a dot or a space (which the API silently trims).
+/// Not gated by platform so it can be tested everywhere; the validator below
+/// applies it on Windows.
+pub fn windows_component_unsafe(component: &str) -> bool {
+    if component.is_empty() || component == "." {
+        return false;
+    }
+    if component.contains(':') {
+        return true;
+    }
+    if component.ends_with('.') || component.ends_with(' ') {
+        return true;
+    }
+    let base = component.split('.').next().unwrap_or("").trim_end();
+    let upper = base.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || ((upper.starts_with("COM") || upper.starts_with("LPT"))
+        && upper.len() == 4
+        && matches!(upper.as_bytes()[3], b'1'..=b'9'))
+}
+
 pub fn validate_file_name_no_traversal(name: &str) -> ResultType<()> {
     if name.bytes().any(|b| b == 0) {
         bail!("file name contains null bytes");
+    }
+    if cfg!(windows) {
+        if let Some(component) = name
+            .split(|c: char| c == '/' || c == '\\')
+            .find(|s| windows_component_unsafe(s))
+        {
+            bail!("file name component is not a plain Windows file name: {component}");
+        }
     }
     let has_traversal = name
         .split(|c: char| c == '/' || (cfg!(windows) && c == '\\'))
@@ -1601,6 +1634,51 @@ mod tests {
             expected,
             err
         );
+    }
+
+    #[test]
+    fn windows_component_rules() {
+        for unsafe_name in [
+            "a.txt:stream",
+            "x:y",
+            "CON",
+            "con",
+            "NUL.txt",
+            "Aux.tar.gz",
+            "COM1",
+            "lpt9.log",
+            "PRN ",
+            "name.",
+            "name ",
+            "CONIN$",
+        ] {
+            assert!(windows_component_unsafe(unsafe_name), "{unsafe_name}");
+        }
+        for fine in [
+            "a.txt",
+            "readme",
+            ".hidden",
+            "console.txt",
+            "COM0",
+            "COM10",
+            "LPT",
+            "com.example.app",
+            "my file.txt",
+            "",
+            ".",
+        ] {
+            assert!(!windows_component_unsafe(fine), "{fine}");
+        }
+    }
+
+    #[test]
+    fn validator_applies_the_windows_rules_only_on_windows() {
+        let res = validate_file_name_no_traversal("dir/CON.txt");
+        assert_eq!(res.is_err(), cfg!(windows));
+        let res = validate_file_name_no_traversal("dir/a.txt:s");
+        assert_eq!(res.is_err(), cfg!(windows));
+        assert!(validate_file_name_no_traversal("dir/ok.txt").is_ok());
+        assert!(validate_file_name_no_traversal("../x").is_err());
     }
 
     #[test]
