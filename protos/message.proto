@@ -835,12 +835,18 @@ message PublicKey {
   bytes symmetric_value = 2;
   // Optional signed QUIC identity. Older peers ignore this field.
   bytes quic_identity = 3;
+  // Capabilities of the sender. bit 0: the viewer verifies `host_ack_mac`;
+  // bit 1 is reserved. Absent (0) on older peers.
+  uint32 handshake_caps = 4;
 }
 
 message SignedId {
   bytes id = 1;
   // Optional signed QUIC identity. The legacy id field remains unchanged.
   bytes quic_identity = 2;
+  // Optional host acknowledgement that the host knew the pairing secret,
+  // bound to this handshake. Older peers ignore this field.
+  bytes host_ack_mac = 3;
 }
 
 message AudioFormat {
