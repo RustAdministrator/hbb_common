@@ -3527,6 +3527,46 @@ pub fn directional_secretbox_enabled() -> bool {
     Config::get_option(keys::OPTION_DISABLE_DIRECTIONAL_SECRETBOX) != "Y"
 }
 
+/// Whether other low-permission sessions are paused while a permission request
+/// is shown to the local user (`permission-prompt-global-input-block`, default on).
+pub fn permission_prompt_global_input_block_enabled() -> bool {
+    Config::get_option(keys::OPTION_PERMISSION_PROMPT_GLOBAL_INPUT_BLOCK) != "N"
+}
+
+/// Whether a peer may get back a permission the local user switched off without
+/// being asked again (`permission-regrant-without-prompt`, default off).
+pub fn permission_regrant_without_prompt_enabled() -> bool {
+    Config::get_option(keys::OPTION_PERMISSION_REGRANT_WITHOUT_PROMPT) == "Y"
+}
+
+/// Whether the host adds the pairing acknowledgement MAC
+/// (`disable-pairing-host-proof` turns it off without a rebuild).
+pub fn pairing_host_proof_enabled() -> bool {
+    Config::get_option(keys::OPTION_DISABLE_PAIRING_HOST_PROOF) != "Y"
+}
+
+/// How the viewer treats the host acknowledgement MAC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairingHostAuth {
+    Off,
+    Warn,
+    Enforce,
+}
+
+impl PairingHostAuth {
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Self::Off,
+            "enforce" => Self::Enforce,
+            _ => Self::Warn,
+        }
+    }
+}
+
+pub fn pairing_host_auth() -> PairingHostAuth {
+    PairingHostAuth::parse(&Config::get_option(keys::OPTION_PAIRING_HOST_AUTH))
+}
+
 pub mod keys {
     pub const OPTION_VIEW_ONLY: &str = "view_only";
     pub const OPTION_SHOW_MONITORS_TOOLBAR: &str = "show_monitors_toolbar";
@@ -3658,11 +3698,52 @@ pub mod keys {
     pub const OPTION_QUIC_FILE_BANDWIDTH_MBPS: &str = "quic-file-bandwidth-mbps";
     /// Seconds a QUIC session may stay unauthorized, including time spent
     /// waiting for a password or for the user to accept it, before the host
-    /// closes it; 0 or unset disables the limit (default).
+    /// closes it; unset means 600, 0 disables the limit.
     pub const OPTION_QUIC_PRELOGIN_TIMEOUT_SECS: &str = "quic-prelogin-timeout-secs";
     pub const OPTION_ALLOW_INSECURE_TLS_FALLBACK: &str = "allow-insecure-tls-fallback";
     /// "Y" stops advertising and selecting directional secretbox nonces.
     pub const OPTION_DISABLE_DIRECTIONAL_SECRETBOX: &str = "disable-directional-secretbox";
+    /// "N" lets low-permission sessions keep sending input while a permission
+    /// request is on screen; any other value (default) pauses it.
+    pub const OPTION_PERMISSION_PROMPT_GLOBAL_INPUT_BLOCK: &str =
+        "permission-prompt-global-input-block";
+    /// "Y" restores silent re-grant of a permission that the local user switched
+    /// off during the session; default off.
+    pub const OPTION_PERMISSION_REGRANT_WITHOUT_PROMPT: &str =
+        "permission-regrant-without-prompt";
+    /// Host: "Y" stops sending the pairing acknowledgement MAC.
+    pub const OPTION_DISABLE_PAIRING_HOST_PROOF: &str = "disable-pairing-host-proof";
+    /// Viewer: `off`, `warn` (default) or `enforce` for the host acknowledgement MAC.
+    pub const OPTION_PAIRING_HOST_AUTH: &str = "pairing-host-auth";
+    /// Seconds a TCP/relay session may stay unauthorized; same rules as
+    /// `quic-prelogin-timeout-secs` (0 disables, default 600).
+    pub const OPTION_TCP_PRELOGIN_TIMEOUT_SECS: &str = "tcp-prelogin-timeout-secs";
+    /// Ceilings for sessions that have not logged in: `warn` (default, log
+    /// only), `enforce` or `off`.
+    pub const OPTION_PRELOGIN_LIMIT_MODE: &str = "prelogin-limit-mode";
+    pub const OPTION_PRELOGIN_MAX_PER_SOURCE: &str = "prelogin-max-per-source";
+    pub const OPTION_PRELOGIN_MAX_TOTAL: &str = "prelogin-max-total";
+    /// "Y" lets a click-approved or one-time-password session make this device
+    /// connect back to it ("switch sides") without a local approval. Off by default.
+    pub const OPTION_ALLOW_UNAPPROVED_SWITCH_SIDES: &str = "allow-unapproved-switch-sides";
+    /// "Y" checks the Windows account of a terminal login before the access
+    /// password or the local approval (the old order). Off by default.
+    pub const OPTION_ALLOW_TERMINAL_OS_LOGIN_BEFORE_AUTHORIZATION: &str =
+        "allow-terminal-os-login-before-authorization";
+    /// `local` accepts direct connections only from local-network and VPN
+    /// sources; empty or `any` keeps accepting every source.
+    pub const OPTION_DIRECT_ACCESS_SCOPE: &str = "direct-access-scope";
+    /// Extra CIDR networks (separated by comma, semicolon or whitespace) that
+    /// count as local for `direct-access-scope=local`.
+    pub const OPTION_DIRECT_ACCESS_EXTRA_NETWORKS: &str = "direct-access-extra-networks";
+    /// "Y" starts the QUIC direct listener only while `direct-server` is on.
+    pub const OPTION_QUIC_FOLLOW_DIRECT_SERVER: &str = "quic-follow-direct-server";
+    /// "Y" lets a relay session without encryption in when no pairing
+    /// passphrase is set; default off.
+    pub const OPTION_ALLOW_INSECURE_RELAY_SESSION: &str = "allow-insecure-relay-session";
+    /// "Y" lets a rendezvous/relay server raise permissions above the local
+    /// policy; default off.
+    pub const OPTION_ALLOW_SERVER_PERMISSION_GRANTS: &str = "allow-server-permission-grants";
     pub const OPTION_SHOW_VIRTUAL_MOUSE: &str = "show-virtual-mouse";
     // joystick is the virtual mouse.
     // So `OPTION_SHOW_VIRTUAL_MOUSE` should also be set if `OPTION_SHOW_VIRTUAL_JOYSTICK` is set.
@@ -3901,6 +3982,21 @@ pub mod keys {
         OPTION_QUIC_PRELOGIN_TIMEOUT_SECS,
         OPTION_ALLOW_INSECURE_TLS_FALLBACK,
         OPTION_DISABLE_DIRECTIONAL_SECRETBOX,
+        OPTION_PERMISSION_PROMPT_GLOBAL_INPUT_BLOCK,
+        OPTION_PERMISSION_REGRANT_WITHOUT_PROMPT,
+        OPTION_DISABLE_PAIRING_HOST_PROOF,
+        OPTION_PAIRING_HOST_AUTH,
+        OPTION_TCP_PRELOGIN_TIMEOUT_SECS,
+        OPTION_PRELOGIN_LIMIT_MODE,
+        OPTION_PRELOGIN_MAX_PER_SOURCE,
+        OPTION_PRELOGIN_MAX_TOTAL,
+        OPTION_ALLOW_TERMINAL_OS_LOGIN_BEFORE_AUTHORIZATION,
+        OPTION_ALLOW_UNAPPROVED_SWITCH_SIDES,
+        OPTION_DIRECT_ACCESS_SCOPE,
+        OPTION_DIRECT_ACCESS_EXTRA_NETWORKS,
+        OPTION_QUIC_FOLLOW_DIRECT_SERVER,
+        OPTION_ALLOW_INSECURE_RELAY_SESSION,
+        OPTION_ALLOW_SERVER_PERMISSION_GRANTS,
         OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS,
         OPTION_ALLOW_AUTO_UPDATE,
     ];
@@ -3993,6 +4089,48 @@ impl Status {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn pairing_host_auth_parses_known_values_and_defaults_to_warn() {
+        assert_eq!(PairingHostAuth::parse(""), PairingHostAuth::Warn);
+        assert_eq!(PairingHostAuth::parse("warn"), PairingHostAuth::Warn);
+        assert_eq!(PairingHostAuth::parse(" OFF "), PairingHostAuth::Off);
+        assert_eq!(PairingHostAuth::parse("Enforce"), PairingHostAuth::Enforce);
+        assert_eq!(PairingHostAuth::parse("strict"), PairingHostAuth::Warn);
+    }
+
+    #[test]
+    fn round_two_keys_are_settings() {
+        for key in [
+            keys::OPTION_PERMISSION_PROMPT_GLOBAL_INPUT_BLOCK,
+            keys::OPTION_PERMISSION_REGRANT_WITHOUT_PROMPT,
+            keys::OPTION_DISABLE_PAIRING_HOST_PROOF,
+            keys::OPTION_PAIRING_HOST_AUTH,
+            keys::OPTION_TCP_PRELOGIN_TIMEOUT_SECS,
+            keys::OPTION_PRELOGIN_LIMIT_MODE,
+            keys::OPTION_PRELOGIN_MAX_PER_SOURCE,
+            keys::OPTION_PRELOGIN_MAX_TOTAL,
+            keys::OPTION_ALLOW_TERMINAL_OS_LOGIN_BEFORE_AUTHORIZATION,
+            keys::OPTION_ALLOW_UNAPPROVED_SWITCH_SIDES,
+            keys::OPTION_DIRECT_ACCESS_SCOPE,
+            keys::OPTION_DIRECT_ACCESS_EXTRA_NETWORKS,
+            keys::OPTION_QUIC_FOLLOW_DIRECT_SERVER,
+            keys::OPTION_ALLOW_INSECURE_RELAY_SESSION,
+            keys::OPTION_ALLOW_SERVER_PERMISSION_GRANTS,
+        ] {
+            assert!(keys::KEYS_SETTINGS.contains(&key), "{key}");
+        }
+        // The "allow-" options are off unless set to Y.
+        for key in [
+            keys::OPTION_ALLOW_TERMINAL_OS_LOGIN_BEFORE_AUTHORIZATION,
+            keys::OPTION_ALLOW_UNAPPROVED_SWITCH_SIDES,
+            keys::OPTION_ALLOW_INSECURE_RELAY_SESSION,
+            keys::OPTION_ALLOW_SERVER_PERMISSION_GRANTS,
+        ] {
+            assert!(!option2bool(key, ""), "{key}");
+            assert!(option2bool(key, "Y"), "{key}");
+        }
+    }
     use super::*;
 
     fn atomic_store_test_path(name: &str) -> PathBuf {
