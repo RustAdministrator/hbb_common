@@ -748,8 +748,32 @@ pub fn load_path<T: serde::Serialize + serde::de::DeserializeOwned + Default + s
     };
     toml05::from_str(&cfg_string).unwrap_or_else(|err| {
         log::error!("Failed to load config '{}': {}", file.display(), err);
+        keep_unreadable_config(&file);
         T::default()
     })
+}
+
+/// A config file that does not parse is replaced by defaults, and the next
+/// store overwrites it. Keep the original once, next to it, so that it can be
+/// recovered or inspected.
+fn keep_unreadable_config(file: &std::path::Path) {
+    let mut copy = file.as_os_str().to_owned();
+    copy.push(".corrupt");
+    let copy = PathBuf::from(copy);
+    if copy.exists() {
+        return;
+    }
+    match fs::copy(file, &copy) {
+        Ok(_) => log::warn!(
+            "Kept the unreadable config '{}' as '{}'",
+            file.display(),
+            copy.display()
+        ),
+        Err(err) => log::warn!(
+            "Failed to keep the unreadable config '{}': {err}",
+            file.display()
+        ),
+    }
 }
 
 #[inline]
@@ -4089,6 +4113,32 @@ impl Status {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_unreadable_config_is_kept_once_before_defaults_replace_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustadmin-hbb-corrupt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("settings.toml");
+        std::fs::write(&file, b"this is = = not toml [[").unwrap();
+
+        let loaded: Config2 = load_path(file.clone());
+        let _ = loaded;
+        let kept = dir.join("settings.toml.corrupt");
+        assert_eq!(std::fs::read(&kept).unwrap(), b"this is = = not toml [[");
+
+        // A second failure does not overwrite the first copy.
+        std::fs::write(&file, b"different [[ garbage").unwrap();
+        let _: Config2 = load_path(file.clone());
+        assert_eq!(std::fs::read(&kept).unwrap(), b"this is = = not toml [[");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn pairing_host_auth_parses_known_values_and_defaults_to_warn() {
