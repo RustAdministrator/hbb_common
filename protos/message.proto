@@ -126,6 +126,8 @@ message KeyboardCapabilities {
   // Receiver can map committed fallback text through the controller's source
   // layout without consulting or changing the receiver's active layout.
   bool layout_aware_text = 8;
+  // Receiver accepts physical keyboard family metadata independently of language.
+  bool physical_keyboard_family = 9;
 }
 
 message Features {
@@ -229,6 +231,14 @@ message MouseEvent {
   sint32 x = 2;
   sint32 y = 3;
   repeated ControlKey modifiers = 4;
+}
+
+// Physical keyboard family metadata is independent of source language and IME.
+enum KeyboardFamily {
+  Unknown = 0;
+  Ansi = 1;
+  Iso = 2;
+  Jis = 3;
 }
 
 enum KeyboardMode{
@@ -349,6 +359,10 @@ message KeyEvent {
   string source_language_tag = 11;
   string source_layout_type = 12;
   bool source_layout_text = 13;
+  // Physical keyboard family, independent of source language and IME.
+  KeyboardFamily keyboard_family = 14;
+  // USB HID usage from the physical keyboard; zero means absent.
+  uint32 usb_hid_usage = 15;
 }
 
 message CommittedText {
@@ -369,6 +383,8 @@ message PhysicalKey {
   uint32 modifier_mask = 4;
   // Bit 0 Caps Lock, bit 1 Num Lock, bit 2 Scroll Lock.
   uint32 lock_mask = 5;
+  // Physical keyboard family, independent of source language and IME.
+  KeyboardFamily keyboard_family = 6;
 }
 
 message ModifierSync {

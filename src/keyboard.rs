@@ -1,6 +1,6 @@
 use std::{fmt, slice::Iter, str::FromStr};
 
-use crate::protos::message::{keyboard_input, KeyboardInput, KeyboardMode};
+use crate::protos::message::{keyboard_input, KeyboardFamily, KeyboardInput, KeyboardMode};
 
 pub const KEYBOARD_INPUT_PROTOCOL_VERSION: u32 = 1;
 pub const MAX_COMMITTED_TEXT_BYTES: usize = 2 * 1024;
@@ -22,6 +22,58 @@ pub const KNOWN_KEYBOARD_LOCK_MASK: u32 =
     KEYBOARD_LOCK_CAPS | KEYBOARD_LOCK_NUM | KEYBOARD_LOCK_SCROLL;
 pub const MIN_USB_HID_KEYBOARD_USAGE: u32 = 0x04;
 pub const MAX_USB_HID_KEYBOARD_USAGE: u32 = 0xe7;
+
+pub fn keyboard_family_from_preference(preference: &str) -> KeyboardFamily {
+    if preference.eq_ignore_ascii_case("ansi") {
+        KeyboardFamily::Ansi
+    } else if preference.eq_ignore_ascii_case("iso") {
+        KeyboardFamily::Iso
+    } else if preference.eq_ignore_ascii_case("jis") {
+        KeyboardFamily::Jis
+    } else {
+        KeyboardFamily::Unknown
+    }
+}
+
+pub fn resolve_keyboard_family(
+    preference: &str,
+    detected: KeyboardFamily,
+    legacy_iso: bool,
+) -> KeyboardFamily {
+    let explicit = keyboard_family_from_preference(preference);
+    if explicit != KeyboardFamily::Unknown {
+        return explicit;
+    }
+    if matches!(
+        detected,
+        KeyboardFamily::Ansi | KeyboardFamily::Iso | KeyboardFamily::Jis
+    ) {
+        return detected;
+    }
+    if legacy_iso {
+        KeyboardFamily::Iso
+    } else {
+        KeyboardFamily::Unknown
+    }
+}
+
+pub fn macos_keyboard_type(family: KeyboardFamily) -> Option<u32> {
+    match family {
+        KeyboardFamily::Ansi => Some(40),
+        KeyboardFamily::Iso => Some(41),
+        KeyboardFamily::Jis => Some(42),
+        KeyboardFamily::Unknown => None,
+    }
+}
+
+pub fn keyboard_family_preference(family: KeyboardFamily) -> &'static str {
+    match family {
+        KeyboardFamily::Ansi => "ansi",
+        KeyboardFamily::Iso => "iso",
+        KeyboardFamily::Jis => "jis",
+        KeyboardFamily::Unknown => "auto",
+    }
+}
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 pub enum KeyboardInputError {
@@ -45,6 +97,8 @@ pub enum KeyboardInputError {
     InvalidSourceLayoutType,
     #[error("USB HID keyboard usage 0x{0:x} is outside usage page 0x07")]
     InvalidUsbHidUsage(u32),
+    #[error("physical-key keyboard family is unknown")]
+    InvalidKeyboardFamily,
     #[error("physical-key repeat requires a key-down event")]
     RepeatWithoutKeyDown,
     #[error("keyboard modifier mask contains unknown bits 0x{0:x}")]
@@ -97,6 +151,9 @@ pub fn validate_keyboard_input(input: &KeyboardInput) -> Result<(), KeyboardInpu
             }
         }
         Some(keyboard_input::Union::PhysicalKey(key)) => {
+            if key.keyboard_family.enum_value().is_err() {
+                return Err(KeyboardInputError::InvalidKeyboardFamily);
+            }
             if !(MIN_USB_HID_KEYBOARD_USAGE..=MAX_USB_HID_KEYBOARD_USAGE)
                 .contains(&key.usb_hid_usage)
             {
@@ -181,7 +238,10 @@ impl KeyboardMode {
 mod tests {
     use super::*;
     use crate::{
-        message_proto::{keyboard_input, CommittedText, ModifierSync, PhysicalKey},
+        message_proto::{
+            keyboard_input, CommittedText, KeyEvent, KeyboardCapabilities, ModifierSync,
+            PhysicalKey,
+        },
         protobuf::Message as _,
     };
 
@@ -255,6 +315,103 @@ mod tests {
             validate_keyboard_input(&input),
             Err(KeyboardInputError::InvalidUsbHidUsage(0x100))
         );
+    }
+
+    #[test]
+    fn validates_known_physical_keyboard_families() {
+        for family in [
+            KeyboardFamily::Unknown,
+            KeyboardFamily::Ansi,
+            KeyboardFamily::Iso,
+            KeyboardFamily::Jis,
+        ] {
+            let mut input = base_input();
+            input.set_physical_key(PhysicalKey {
+                usb_hid_usage: 0x04,
+                down: true,
+                keyboard_family: family.into(),
+                ..Default::default()
+            });
+            assert_eq!(validate_keyboard_input(&input), Ok(()));
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_physical_keyboard_family_values() {
+        let mut input = base_input();
+        input.set_physical_key(PhysicalKey {
+            usb_hid_usage: 0x04,
+            down: true,
+            ..Default::default()
+        });
+        input.mut_physical_key().keyboard_family = crate::protobuf::EnumOrUnknown::from_i32(99);
+        assert_eq!(
+            validate_keyboard_input(&input),
+            Err(KeyboardInputError::InvalidKeyboardFamily)
+        );
+    }
+
+    #[test]
+    fn old_serialized_defaults_preserve_keyboard_family_compatibility() {
+        let key_event =
+            KeyEvent::parse_from_bytes(&KeyEvent::new().write_to_bytes().unwrap()).unwrap();
+        assert_eq!(
+            key_event.keyboard_family.enum_value(),
+            Ok(KeyboardFamily::Unknown)
+        );
+        assert_eq!(key_event.usb_hid_usage, 0);
+
+        let physical_key =
+            PhysicalKey::parse_from_bytes(&PhysicalKey::new().write_to_bytes().unwrap()).unwrap();
+        assert_eq!(
+            physical_key.keyboard_family.enum_value(),
+            Ok(KeyboardFamily::Unknown)
+        );
+
+        let capabilities = KeyboardCapabilities::parse_from_bytes(
+            &KeyboardCapabilities::new().write_to_bytes().unwrap(),
+        )
+        .unwrap();
+        assert!(!capabilities.physical_keyboard_family);
+    }
+
+    #[test]
+    fn resolves_keyboard_family_by_explicit_detected_legacy_priority() {
+        assert_eq!(keyboard_family_from_preference("JiS"), KeyboardFamily::Jis);
+        assert_eq!(
+            keyboard_family_from_preference("auto"),
+            KeyboardFamily::Unknown
+        );
+        assert_eq!(
+            keyboard_family_from_preference("other"),
+            KeyboardFamily::Unknown
+        );
+
+        assert_eq!(
+            resolve_keyboard_family("ANSI", KeyboardFamily::Jis, true),
+            KeyboardFamily::Ansi
+        );
+        assert_eq!(
+            resolve_keyboard_family("auto", KeyboardFamily::Jis, true),
+            KeyboardFamily::Jis
+        );
+        assert_eq!(
+            resolve_keyboard_family("", KeyboardFamily::Unknown, true),
+            KeyboardFamily::Iso
+        );
+        assert_eq!(
+            resolve_keyboard_family("other", KeyboardFamily::Unknown, false),
+            KeyboardFamily::Unknown
+        );
+
+        assert_eq!(macos_keyboard_type(KeyboardFamily::Ansi), Some(40));
+        assert_eq!(macos_keyboard_type(KeyboardFamily::Iso), Some(41));
+        assert_eq!(macos_keyboard_type(KeyboardFamily::Jis), Some(42));
+        assert_eq!(macos_keyboard_type(KeyboardFamily::Unknown), None);
+        assert_eq!(keyboard_family_preference(KeyboardFamily::Ansi), "ansi");
+        assert_eq!(keyboard_family_preference(KeyboardFamily::Iso), "iso");
+        assert_eq!(keyboard_family_preference(KeyboardFamily::Jis), "jis");
+        assert_eq!(keyboard_family_preference(KeyboardFamily::Unknown), "auto");
     }
 
     #[test]
