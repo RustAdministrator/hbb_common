@@ -128,6 +128,8 @@ message KeyboardCapabilities {
   bool layout_aware_text = 8;
   // Receiver accepts physical keyboard family metadata independently of language.
   bool physical_keyboard_family = 9;
+  // Query/select the focused Windows application's installed input locale.
+  bool input_layout_control = 10;
 }
 
 message Features {
@@ -1008,6 +1010,32 @@ message VideoReferenceRefresh {
   bool strict_recovery = 5;
 }
 
+message KeyboardLayoutInfo {
+  // Opaque endpoint-local identifier, valid only for the current connection.
+  string id = 1;
+  string language_tag = 2;
+  string name = 3;
+}
+
+message KeyboardLayoutRequest {
+  enum Action {
+    Query = 0;
+    Select = 1;
+  }
+  uint64 request_id = 1;
+  Action action = 2;
+  string layout_id = 3;
+}
+
+message KeyboardLayoutStatus {
+  uint64 request_id = 1;
+  bool available = 2;
+  bool can_switch = 3;
+  string active_id = 4;
+  repeated KeyboardLayoutInfo layouts = 5;
+  string error = 6;
+}
+
 message Misc {
   oneof union {
     ChatMessage chat_message = 4;
@@ -1050,6 +1078,8 @@ message Misc {
     SessionPermissionResponse session_permission_response = 41;
     VideoFeedback video_feedback = 42;
     VideoReferenceRefresh video_reference_refresh = 43;
+    KeyboardLayoutRequest keyboard_layout_request = 44;
+    KeyboardLayoutStatus keyboard_layout_status = 45;
   }
 }
 
