@@ -27,6 +27,11 @@ pub mod bytes_codec;
 pub use anyhow::{self, bail};
 pub use futures_util;
 pub mod config;
+pub mod resource_policy;
+pub use resource_policy::{
+    ResourceMode, OPTION_HOST_RESOURCE_MODE, OPTION_REMOTE_RESOURCE_MODE,
+    OPTION_VIEWER_RESOURCE_MODE,
+};
 pub mod fs;
 pub mod mem;
 pub use lazy_static;

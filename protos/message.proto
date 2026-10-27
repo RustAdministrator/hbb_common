@@ -824,6 +824,14 @@ message OptionMessage {
   BoolOption show_my_cursor = 19;
   CaptureBackend capture_backend = 20;
   VideoProfile video_profile = 21;
+  enum ResourceMode {
+    ResourceModeNotSet = 0;
+    ResourceModeNormal = 1;
+    ResourceModeLowPower = 2;
+    ResourceModeMinimizeGpu = 3;
+  }
+  ResourceMode resource_mode = 22;
+  BoolOption video_suspended = 23;
 }
 
 message TestDelay {
@@ -846,6 +854,7 @@ message TestDelay {
   uint32 host_pipeline_p95_us = 17;
   string movie_fallback_reason = 18;
   uint32 movie_playout_delay_ms = 19;
+  string resource_mode = 20;
 }
 
 message PublicKey {
