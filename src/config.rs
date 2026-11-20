@@ -3634,6 +3634,18 @@ pub fn udp_source_check_mode() -> RolloutMode {
     )
 }
 
+/// Default of `file-clipboard-direction-check`: what to do with a file clipboard message
+/// that crosses against the clipboard direction policy. The policy has only covered text so
+/// far, so this starts by logging.
+pub const FILE_CLIPBOARD_DIRECTION_CHECK_DEFAULT: RolloutMode = RolloutMode::Warn;
+
+pub fn file_clipboard_direction_check_mode() -> RolloutMode {
+    RolloutMode::parse(
+        &Config::get_option(keys::OPTION_FILE_CLIPBOARD_DIRECTION_CHECK),
+        FILE_CLIPBOARD_DIRECTION_CHECK_DEFAULT,
+    )
+}
+
 pub mod keys {
     pub const OPTION_VIEW_ONLY: &str = "view_only";
     pub const OPTION_SHOW_MONITORS_TOOLBAR: &str = "show_monitors_toolbar";
@@ -3817,6 +3829,9 @@ pub mod keys {
     /// `off`, `warn` or `enforce` (default) for rendezvous datagrams that do
     /// not come from the rendezvous server's address.
     pub const OPTION_UDP_SOURCE_CHECK: &str = "udp-source-check";
+    /// `off`, `warn` (default) or `enforce` for file clipboard messages that cross against
+    /// the clipboard direction policy.
+    pub const OPTION_FILE_CLIPBOARD_DIRECTION_CHECK: &str = "file-clipboard-direction-check";
     pub const OPTION_SHOW_VIRTUAL_MOUSE: &str = "show-virtual-mouse";
     // joystick is the virtual mouse.
     // So `OPTION_SHOW_VIRTUAL_MOUSE` should also be set if `OPTION_SHOW_VIRTUAL_JOYSTICK` is set.
@@ -4072,6 +4087,7 @@ pub mod keys {
         OPTION_ALLOW_SERVER_PERMISSION_GRANTS,
         OPTION_RELAY_SECURE_POLICY,
         OPTION_UDP_SOURCE_CHECK,
+        OPTION_FILE_CLIPBOARD_DIRECTION_CHECK,
         OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS,
         OPTION_ALLOW_AUTO_UPDATE,
     ];
@@ -4211,6 +4227,7 @@ mod tests {
         }
         assert_eq!(RELAY_SECURE_POLICY_DEFAULT, RolloutMode::Enforce);
         assert_eq!(UDP_SOURCE_CHECK_DEFAULT, RolloutMode::Enforce);
+        assert_eq!(FILE_CLIPBOARD_DIRECTION_CHECK_DEFAULT, RolloutMode::Warn);
     }
 
     #[test]
@@ -4233,6 +4250,7 @@ mod tests {
             keys::OPTION_ALLOW_SERVER_PERMISSION_GRANTS,
             keys::OPTION_RELAY_SECURE_POLICY,
             keys::OPTION_UDP_SOURCE_CHECK,
+            keys::OPTION_FILE_CLIPBOARD_DIRECTION_CHECK,
         ] {
             assert!(keys::KEYS_SETTINGS.contains(&key), "{key}");
         }
