@@ -5,6 +5,10 @@ use super::{
         DatagramReceiveEvent, QuicDatagramReceiver, QuicDatagramSendCoordinator,
         QuicDatagramSender, VideoDatagramSendOutcome, DEFAULT_INTERACTIVE_DATAGRAM_RESERVE_BYTES,
     },
+    file_rate::{
+        cap_was_binding, next_file_rate_kbps, FileRateLimiter, FileRatePlan, FileRateShared,
+        FileRateSignals, MinRttWindow, FILE_RATE_TICK, FILE_RATE_VIDEO_IDLE,
+    },
     input::MouseMovementMode,
     protocol::MessageType,
     quic::{
@@ -182,6 +186,35 @@ struct QuicApplicationMetrics {
     video_delivery_lock: Mutex<()>,
     video_receive_recovery: Mutex<VideoReceiveRecovery>,
     video_epoch_holdback: Mutex<VideoEpochHoldback>,
+    // When video was last sent or received, on the clock of `process_clock_us`. Zero: never.
+    video_activity_us: AtomicU64,
+}
+
+/// Microseconds on a clock that starts when it is first read. Never zero.
+fn process_clock_us() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    (START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_micros()
+        .min(u128::from(u64::MAX - 1)) as u64)
+        + 1
+}
+
+impl QuicApplicationMetrics {
+    /// A video frame is being sent, or video data arrived.
+    fn note_video_activity(&self) {
+        self.video_activity_us
+            .store(process_clock_us(), Ordering::Relaxed);
+    }
+
+    /// Whether video was sent or received within `idle`.
+    fn video_active_within(&self, idle: Duration) -> bool {
+        let last = self.video_activity_us.load(Ordering::Relaxed);
+        last != 0
+            && process_clock_us().saturating_sub(last)
+                <= idle.as_micros().min(u128::from(u64::MAX)) as u64
+    }
 }
 
 struct VideoSendRecovery {
@@ -1212,6 +1245,7 @@ pub struct QuicApplicationStream {
     video_send_recovery: Arc<VideoSendRecovery>,
     latest_mouse: Arc<LatestSlot<MouseOutbound>>,
     datagram_send: Arc<QuicDatagramSendCoordinator>,
+    file_rate: Arc<FileRateShared>,
     audio_format: Arc<AtomicU64>,
     next_transport_frame_id: AtomicU64,
     video_ordering: Arc<VideoOrderingGate>,
@@ -1297,6 +1331,13 @@ impl QuicApplicationStream {
             None,
         );
         tasks.extend(task_pair);
+        let file_rate_plan = FileRatePlan::new(
+            NetworkTransportConfig::load()
+                .map_err(|error| QuicTransportError::Configuration(error.to_string()))?
+                .file_bandwidth_limit,
+            agreement.max_file_bitrate_kbps,
+        );
+        let file_rate = Arc::new(FileRateShared::new(&file_rate_plan));
         let (file, task_pair) = spawn_reliable_channel(
             channels.file,
             ReliableChannelKind::FileTransfer,
@@ -1305,7 +1346,7 @@ impl QuicApplicationStream {
             connection.clone(),
             video_ordering.clone(),
             metrics.clone(),
-            Some(agreement.max_file_bitrate_kbps),
+            Some(file_rate.clone()),
         );
         tasks.extend(task_pair);
         let (diagnostics, task_pair) = spawn_reliable_channel(
@@ -1349,6 +1390,14 @@ impl QuicApplicationStream {
             DEFAULT_INTERACTIVE_DATAGRAM_RESERVE_BYTES,
             connection.datagram_send_buffer_space(),
         );
+        if file_rate_plan.automatic {
+            tasks.push(tokio::spawn(run_file_rate_controller(
+                file_rate.clone(),
+                connection.clone(),
+                datagram_send.clone(),
+                metrics.clone(),
+            )));
+        }
         let negotiated_datagram_size = usize::from(agreement.max_datagram_payload);
         tasks.push(tokio::spawn(run_video_writer(
             QuicDatagramSender::new(connection.clone(), session_id)
@@ -1402,13 +1451,15 @@ impl QuicApplicationStream {
         )));
 
         log::info!(
-            "QUIC application channels ready: role={role:?}, protocol={application_protocol:?}, reliable_keyframes={}, keyframe_barrier={}, local={local_addr}, peer={}, mtu={}, datagram_payload_live={:?}, datagram_payload_negotiated={}",
+            "QUIC application channels ready: role={role:?}, protocol={application_protocol:?}, reliable_keyframes={}, keyframe_barrier={}, local={local_addr}, peer={}, mtu={}, datagram_payload_live={:?}, datagram_payload_negotiated={}, file_rate_ceiling_kbps={:?}, file_rate_automatic={}",
             agreement.reliable_keyframes,
             agreement.reliable_keyframe_barrier,
             connection.remote_address(),
             connection.stats().path.current_mtu,
             connection.max_datagram_size(),
             agreement.max_datagram_payload,
+            file_rate_plan.ceiling_kbps,
+            file_rate_plan.automatic,
         );
         Ok(Self {
             connection,
@@ -1425,6 +1476,7 @@ impl QuicApplicationStream {
             video_send_recovery,
             latest_mouse,
             datagram_send,
+            file_rate,
             audio_format: Arc::new(AtomicU64::new(0)),
             next_transport_frame_id: AtomicU64::new(1),
             video_ordering,
@@ -1450,6 +1502,17 @@ impl QuicApplicationStream {
         self.closing.load(Ordering::Acquire)
             || self.file.is_closed()
             || self.file.capacity() > FILE_OUTBOUND_BULK_RESERVE
+    }
+
+    /// The cap the file channel applies right now, in kilobits per second. `None`: no cap.
+    pub fn file_rate_cap_kbps(&self) -> Option<u64> {
+        self.file_rate.cap_kbps()
+    }
+
+    /// Replaces the agreed ceiling of the file channel. For tests that need a known rate.
+    #[cfg(test)]
+    pub(crate) fn set_file_rate_ceiling_kbps(&self, kbps: Option<u64>) {
+        self.file_rate.set_ceiling_kbps(kbps);
     }
 
     /// The largest serialized file message (a file action or a file response) this stream
@@ -1527,6 +1590,7 @@ impl QuicApplicationStream {
         }
         match classify_message(&message)? {
             ApplicationClass::Video(mut metadata) => {
+                self.metrics.note_video_activity();
                 metadata.frame_id = self
                     .next_transport_frame_id
                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
@@ -1996,11 +2060,7 @@ fn application_session_offer(
     } else {
         current_datagram_payload
     } as u16;
-    let file_kbps = if config.file_bandwidth_limit_mbps == 0 {
-        1_000_000
-    } else {
-        config.file_bandwidth_limit_mbps.saturating_mul(1_000)
-    };
+    let file_kbps = config.file_bandwidth_limit.advertised_kbps();
     Ok(SessionOffer {
         minimum_protocol_version: application_protocol as u16,
         maximum_protocol_version: application_protocol as u16,
@@ -2130,7 +2190,7 @@ fn spawn_reliable_channel(
     connection: Connection,
     video_ordering: Arc<VideoOrderingGate>,
     metrics: Arc<QuicApplicationMetrics>,
-    bandwidth_limit_kbps: Option<u32>,
+    rate: Option<Arc<FileRateShared>>,
 ) -> (mpsc::Sender<ReliableOutbound>, [JoinHandle<()>; 2]) {
     let (sender, receiver) = channel.into_split();
     let (outbound, outbound_rx) = mpsc::channel(capacity);
@@ -2141,7 +2201,7 @@ fn spawn_reliable_channel(
         outbound_rx,
         writer_inbound,
         writer_connection,
-        bandwidth_limit_kbps,
+        rate,
     ));
     let internal_control = (kind == ReliableChannelKind::Control).then(|| outbound.clone());
     let reader = tokio::spawn(run_reliable_reader(
@@ -2162,26 +2222,25 @@ async fn run_reliable_writer(
     mut outbound: mpsc::Receiver<ReliableOutbound>,
     inbound: mpsc::Sender<Result<BytesMut, Error>>,
     connection: Connection,
-    bandwidth_limit_kbps: Option<u32>,
+    rate: Option<Arc<FileRateShared>>,
 ) {
     let started = Instant::now();
+    let mut limiter = FileRateLimiter::default();
     while let Some(message) = outbound.recv().await {
         let ReliableOutbound {
             message_type,
             payload,
             completion,
         } = message;
-        if let Some(kbps) = bandwidth_limit_kbps.filter(|value| *value > 0) {
-            let bits = (payload.len() as u128).saturating_mul(8);
-            let delay_us = bits
-                .saturating_mul(1_000)
-                .div_ceil(u128::from(kbps))
-                .min(u128::from(u64::MAX)) as u64;
-            tokio::time::sleep(Duration::from_micros(delay_us)).await;
+        if let Some(rate) = rate.as_ref() {
+            limiter.pace(payload.len(), rate.cap_kbps()).await;
         }
         let timestamp = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         match sender.send(message_type, 0, timestamp, &payload).await {
             Ok(_) => {
+                if let Some(rate) = rate.as_ref() {
+                    rate.add_sent(payload.len());
+                }
                 if let Some(completion) = completion {
                     let _ = completion.send(Ok(()));
                 }
@@ -2197,6 +2256,70 @@ async fn run_reliable_writer(
         }
     }
     let _ = sender.finish();
+}
+
+/// The automatic mode of the file channel: once per tick it looks at the path and at the
+/// video, and sets what the file channel may send. See `file_rate`.
+async fn run_file_rate_controller(
+    rate: Arc<FileRateShared>,
+    connection: Connection,
+    datagram_send: Arc<QuicDatagramSendCoordinator>,
+    metrics: Arc<QuicApplicationMetrics>,
+) {
+    let mut ticks = tokio::time::interval(FILE_RATE_TICK);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut rtt_window = MinRttWindow::default();
+    let mut last_tick = Instant::now();
+    let mut last_rejected = datagram_send.stats().video_frames_rejected;
+    let mut last_congestion_events = connection.stats().path.congestion_events;
+    let mut last_sent = rate.sent_bytes();
+    loop {
+        ticks.tick().await;
+        if connection.close_reason().is_some() {
+            return;
+        }
+        let now = Instant::now();
+        let interval = now.saturating_duration_since(last_tick);
+        last_tick = now;
+        if interval.is_zero() {
+            continue;
+        }
+        let path = connection.stats().path;
+        let rejected = datagram_send.stats().video_frames_rejected;
+        let sent = rate.sent_bytes();
+        let signals = FileRateSignals {
+            video_active: metrics.video_active_within(FILE_RATE_VIDEO_IDLE),
+            smoothed_rtt: path.rtt,
+            min_rtt: rtt_window.update(now, path.rtt),
+            video_frames_rejected: rejected.saturating_sub(last_rejected),
+            congestion_events: path
+                .congestion_events
+                .saturating_sub(last_congestion_events),
+            cap_was_binding: cap_was_binding(
+                sent.saturating_sub(last_sent),
+                interval,
+                rate.cap_kbps(),
+            ),
+        };
+        last_rejected = rejected;
+        last_congestion_events = path.congestion_events;
+        last_sent = sent;
+        let current = rate.controller_kbps();
+        let next = next_file_rate_kbps(current, &signals);
+        if next != current {
+            log::debug!(
+                "QUIC file rate: {:?} -> {:?} kbps (video_active={}, rtt_ms={}, min_rtt_ms={}, video_frames_rejected={}, congestion_events={})",
+                current,
+                next,
+                signals.video_active,
+                signals.smoothed_rtt.as_millis(),
+                signals.min_rtt.as_millis(),
+                signals.video_frames_rejected,
+                signals.congestion_events,
+            );
+            rate.set_controller_kbps(next);
+        }
+    }
 }
 
 async fn run_reliable_reader(
@@ -2308,6 +2431,7 @@ async fn run_reliable_reader(
         };
         if let (Some(info), Some(context)) = (reliable_video, video_context.as_ref()) {
             if context.keyframe_barrier {
+                metrics.note_video_activity();
                 metrics
                     .reliable_keyframes_received
                     .fetch_add(1, Ordering::Relaxed);
@@ -2384,6 +2508,7 @@ async fn run_reliable_reader(
             return;
         }
         if let Some(info) = reliable_video {
+            metrics.note_video_activity();
             metrics
                 .reliable_keyframes_received
                 .fetch_add(1, Ordering::Relaxed);
@@ -2691,6 +2816,8 @@ async fn run_datagram_reader(
         };
         match event {
             DatagramReceiveEvent::Video(outcome) => {
+                // A video datagram arrived; the periodic expiry above is not video.
+                metrics.note_video_activity();
                 if !handle_video_outcome(
                     outcome,
                     receiver.video_stats(),
@@ -5065,6 +5192,8 @@ mod tests {
             })
         };
 
+        // The fixed cap of the builds before the automatic mode: with it the queue fills.
+        client_stream.set_file_rate_ceiling_kbps(Some(20_000));
         let mut stream = crate::Stream::from_quic(client_stream);
         let mut jobs = vec![TransferJob::new_read(
             3,
@@ -5552,5 +5681,156 @@ mod tests {
         assert_eq!(client_stream.file_message_limit(), 1024 * 1024);
         let stream = crate::Stream::from_quic(client_stream);
         assert_eq!(stream.file_message_limit(), Some(1024 * 1024));
+    }
+
+    /// Sends `blocks` file blocks of 128 KiB through the file channel and returns how long
+    /// they took to arrive. The sender waits for room as a transfer does.
+    async fn time_file_blocks(
+        sender: QuicApplicationStream,
+        receiver: QuicApplicationStream,
+        blocks: usize,
+    ) -> Duration {
+        use crate::message_proto::{FileResponse, FileTransferBlock};
+
+        const BLOCK: usize = 128 * 1024;
+        let mut response = FileResponse::new();
+        response.set_block(FileTransferBlock {
+            id: 1,
+            data: vec![0x5a; BLOCK].into(),
+            ..Default::default()
+        });
+        let mut block = Message::new();
+        block.set_file_response(response);
+
+        let receive = tokio::spawn(async move {
+            let mut stream = crate::Stream::from_quic(receiver);
+            for _ in 0..blocks {
+                stream.next().await.expect("open").expect("readable");
+            }
+            Instant::now()
+        });
+        let mut stream = crate::Stream::from_quic(sender);
+        let started = Instant::now();
+        for _ in 0..blocks {
+            while !stream.file_send_ready() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            stream.send(&block).await.expect("queued");
+        }
+        let finished = tokio::time::timeout(Duration::from_secs(120), receive)
+            .await
+            .expect("receiver finished")
+            .unwrap();
+        finished - started
+    }
+
+    /// The achieved rate of `blocks` blocks with a cap of `kbps` must be the cap: not above
+    /// it, and not far below it (the first block is free, and the clock of a loaded test
+    /// machine is not exact).
+    async fn assert_file_blocks_keep_the_cap(blocks: usize, kbps: u64) {
+        let Some((client_stream, server_stream)) = application_stream_pair().await else {
+            return;
+        };
+        client_stream.set_file_rate_ceiling_kbps(Some(kbps));
+        assert_eq!(client_stream.file_rate_cap_kbps(), Some(kbps));
+        let elapsed = time_file_blocks(client_stream, server_stream, blocks).await;
+        let achieved_kbps = blocks as f64 * 128.0 * 1024.0 * 8.0 / elapsed.as_secs_f64() / 1e3;
+        println!(
+            "cap {} kbps: {} MiB in {:?} = {:.0} kbps",
+            kbps,
+            blocks / 8,
+            elapsed,
+            achieved_kbps
+        );
+        assert!(
+            achieved_kbps <= kbps as f64 * 1.05 && achieved_kbps >= kbps as f64 * 0.85,
+            "{:.0} kbps with a cap of {} kbps",
+            achieved_kbps,
+            kbps
+        );
+    }
+
+    /// A number in the option is a cap, and the channel runs at it. The cap is far below
+    /// what this channel carries over loopback in a test build (about 500 Mbit/s when the
+    /// machine does nothing else), so it is the limiter and not the machine that sets the
+    /// rate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_channel_runs_at_the_cap_that_is_set() {
+        assert_file_blocks_keep_the_cap(64, 20_000).await;
+    }
+
+    /// 256 MiB at 80 Mbit/s. It takes about half a minute and wants the machine to itself,
+    /// so it is run on request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn file_channel_runs_at_the_cap_that_is_set_for_256_mib() {
+        assert_file_blocks_keep_the_cap(2048, 80_000).await;
+    }
+
+    /// The automatic mode on a real connection: no cap without video, the cap of the earlier
+    /// builds when video starts, no cap again when it has stopped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn automatic_file_rate_follows_the_video() {
+        let Some((client_stream, _server_stream)) = application_stream_pair().await else {
+            return;
+        };
+        async fn cap_becomes(
+            stream: &QuicApplicationStream,
+            expected: Option<u64>,
+            within: Duration,
+        ) -> bool {
+            let deadline = Instant::now() + within;
+            while Instant::now() < deadline {
+                if stream.file_rate_cap_kbps() == expected {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            false
+        }
+        // Both ends are automatic: nothing was agreed as a ceiling.
+        assert_eq!(client_stream.file_rate_cap_kbps(), None);
+        tokio::time::sleep(FILE_RATE_TICK * 2).await;
+        assert_eq!(client_stream.file_rate_cap_kbps(), None, "no video, no cap");
+
+        client_stream.metrics.note_video_activity();
+        assert!(
+            cap_becomes(&client_stream, Some(20_000), FILE_RATE_TICK * 4).await,
+            "video started: {:?}",
+            client_stream.file_rate_cap_kbps()
+        );
+        // Nothing is sent on the file channel, so the cap is not reached and stays.
+        client_stream.metrics.note_video_activity();
+        tokio::time::sleep(FILE_RATE_TICK * 2).await;
+        assert_eq!(client_stream.file_rate_cap_kbps(), Some(20_000));
+
+        assert!(
+            cap_becomes(
+                &client_stream,
+                None,
+                FILE_RATE_VIDEO_IDLE + FILE_RATE_TICK * 4
+            )
+            .await,
+            "video stopped: {:?}",
+            client_stream.file_rate_cap_kbps()
+        );
+    }
+
+    /// Measurement, not a check: what the file channel carries over loopback without a cap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn measure_uncapped_file_channel_over_loopback() {
+        let Some((client_stream, server_stream)) = application_stream_pair().await else {
+            return;
+        };
+        client_stream.set_file_rate_ceiling_kbps(None);
+        let blocks = 2048;
+        let elapsed = time_file_blocks(client_stream, server_stream, blocks).await;
+        println!(
+            "uncapped: {} MiB in {:?} = {:.0} Mbit/s",
+            blocks / 8,
+            elapsed,
+            blocks as f64 * 128.0 * 1024.0 * 8.0 / elapsed.as_secs_f64() / 1e6
+        );
     }
 }

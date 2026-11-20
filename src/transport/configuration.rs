@@ -1,3 +1,4 @@
+use super::file_rate::FileBandwidthLimit;
 use crate::config::{keys, Config};
 use std::{collections::HashMap, net::IpAddr, path::PathBuf, str::FromStr, time::Duration};
 
@@ -18,7 +19,8 @@ pub struct NetworkTransportConfig {
     pub connect_timeout: Duration,
     pub keepalive_interval: Duration,
     pub enable_ipv6: bool,
-    pub file_bandwidth_limit_mbps: u32,
+    /// The cap for the file channel: automatic unless the option says otherwise.
+    pub file_bandwidth_limit: FileBandwidthLimit,
     /// How long an unauthorized QUIC session may stay open; `None` disables
     /// the limit. Defaults to ten minutes, which legitimate logins stay under.
     pub prelogin_timeout: Option<Duration>,
@@ -119,16 +121,11 @@ impl NetworkTransportConfig {
                 keepalive_interval_ms.to_string(),
             ));
         }
-        let file_bandwidth_limit_mbps = parse_or_default::<u32>(
-            value(keys::OPTION_QUIC_FILE_BANDWIDTH_MBPS),
-            20,
-            NetworkConfigError::InvalidFileBandwidth,
-        )?;
-        if file_bandwidth_limit_mbps > 10_000 {
-            return Err(NetworkConfigError::InvalidFileBandwidth(
-                file_bandwidth_limit_mbps.to_string(),
-            ));
-        }
+        let file_bandwidth_value = value(keys::OPTION_QUIC_FILE_BANDWIDTH_MBPS);
+        let file_bandwidth_limit =
+            FileBandwidthLimit::parse(file_bandwidth_value).ok_or_else(|| {
+                NetworkConfigError::InvalidFileBandwidth(file_bandwidth_value.to_owned())
+            })?;
         let prelogin_timeout =
             parse_prelogin_timeout(value(keys::OPTION_QUIC_PRELOGIN_TIMEOUT_SECS))?;
         let enable_ipv6 = value(keys::OPTION_QUIC_ENABLE_IPV6) != "N";
@@ -144,7 +141,7 @@ impl NetworkTransportConfig {
             connect_timeout: Duration::from_millis(connect_timeout_ms),
             keepalive_interval: Duration::from_millis(keepalive_interval_ms),
             enable_ipv6,
-            file_bandwidth_limit_mbps,
+            file_bandwidth_limit,
             prelogin_timeout,
             trusted_peer_store,
         })
@@ -194,6 +191,32 @@ mod tests {
         assert_eq!(config.mode, RemoteTransportMode::QuicPreferred);
         assert_eq!(config.listen_port, DEFAULT_QUIC_PORT);
         assert_eq!(config.connect_timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn file_bandwidth_is_automatic_unless_the_option_says_otherwise() {
+        let with = |value: &str| {
+            let values = HashMap::from([(
+                keys::OPTION_QUIC_FILE_BANDWIDTH_MBPS.to_owned(),
+                value.to_owned(),
+            )]);
+            NetworkTransportConfig::from_values(&values, PathBuf::from("trusted"))
+                .map(|config| config.file_bandwidth_limit)
+        };
+        let unset =
+            NetworkTransportConfig::from_values(&HashMap::new(), PathBuf::from("trusted")).unwrap();
+        assert_eq!(unset.file_bandwidth_limit, FileBandwidthLimit::Auto);
+        assert_eq!(with("auto"), Ok(FileBandwidthLimit::Auto));
+        assert_eq!(with("0"), Ok(FileBandwidthLimit::Unlimited));
+        assert_eq!(with("20"), Ok(FileBandwidthLimit::Mbps(20)));
+        assert_eq!(
+            with("10001"),
+            Err(NetworkConfigError::InvalidFileBandwidth("10001".to_owned()))
+        );
+        assert_eq!(
+            with("fast"),
+            Err(NetworkConfigError::InvalidFileBandwidth("fast".to_owned()))
+        );
     }
 
     #[test]
