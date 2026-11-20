@@ -622,11 +622,27 @@ fn get_ext(name: &str) -> &str {
     ""
 }
 
+/// Extensions of files whose content is compressed already. Trying to compress their blocks
+/// again costs processor time and gains nothing.
+const COMPRESSED_EXTENSIONS: &[&str] = &[
+    // archives and compressed streams
+    "xz", "gz", "zip", "7z", "rar", "bz2", "tgz", "tbz2", "txz", "zst", "lz4", "lzma", "br", "cab",
+    "jar", "apk", "aab", "ipa", "msix", "appx", "deb", "rpm", "dmg", "squashfs",
+    // images
+    "png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "avif", "jxl",
+    // video and audio
+    "mp4", "m4v", "mkv", "mov", "avi", "webm", "wmv", "flv", "mts", "m2ts", "mpg", "mpeg", "mp3",
+    "aac", "m4a", "ogg", "oga", "opus", "flac", "wma",
+    // documents that are zip containers
+    "docx", "xlsx", "pptx", "odt", "ods", "odp", "epub",
+];
+
 #[inline]
 fn is_compressed_file(name: &str) -> bool {
-    let compressed_exts = ["xz", "gz", "zip", "7z", "rar", "bz2", "tgz", "png", "jpg"];
     let ext = get_ext(name);
-    compressed_exts.contains(&ext)
+    COMPRESSED_EXTENSIONS
+        .iter()
+        .any(|compressed| ext.eq_ignore_ascii_case(compressed))
 }
 
 /// Whether one path component names something Windows would not treat as a
@@ -1883,7 +1899,21 @@ async fn init_jobs(jobs: &mut Vec<TransferJob>, stream: &mut crate::Stream) -> R
     Ok(())
 }
 
-/// One step of the sending side of every read job. Called on a timer.
+/// How many blocks one call of [`handle_read_jobs`] may read. The callers run it on a 1 ms
+/// timer; one block per call holds a transfer to 128 MiB/s whatever the disk and the link
+/// can do. The call stays short enough for the loop that makes it to serve everything else.
+const READ_STEPS_PER_CALL: usize = 4;
+
+/// What one step of the read jobs did.
+#[derive(Default)]
+struct ReadStep {
+    /// The log line of a job that finished in this step; empty otherwise.
+    job_log: String,
+    /// A block was read and queued, and the same job may have more.
+    more: bool,
+}
+
+/// The sending side of every read job. Called on a timer.
 ///
 /// The stream does not wait in `send`, so this function reads from disk only when the stream
 /// reports room for file data, and never drops what it has read: a message that could not be
@@ -1895,9 +1925,25 @@ pub async fn handle_read_jobs(
     if !stream.file_send_ready() {
         return Ok(Default::default());
     }
-    init_jobs(jobs, stream).await?;
+    for _ in 0..READ_STEPS_PER_CALL {
+        // Before every step: the step before may have ended a file, and the next one has
+        // to be opened (and its digest sent) before it can be read.
+        init_jobs(jobs, stream).await?;
+        let step = read_jobs_step(jobs, stream).await?;
+        // One finished job per call: the caller gets one log line back.
+        if !step.job_log.is_empty() || !step.more || !stream.file_send_ready() {
+            return Ok(step.job_log);
+        }
+    }
+    Ok(Default::default())
+}
 
-    let mut job_log = Default::default();
+/// One step: the first active job sends what it kept, or reads and sends one block.
+async fn read_jobs_step(
+    jobs: &mut Vec<TransferJob>,
+    stream: &mut crate::Stream,
+) -> ResultType<ReadStep> {
+    let mut step = ReadStep::default();
     let mut finished = Vec::new();
     for job in jobs.iter_mut() {
         if job.is_last_job {
@@ -1907,7 +1953,7 @@ pub async fn handle_read_jobs(
             let last = final_log.clone();
             if send_or_keep(stream, message, final_log, &mut job.pending_send).await? {
                 if let Some(log) = last {
-                    job_log = log;
+                    step.job_log = log;
                     finished.push(job.id());
                 }
             }
@@ -1919,7 +1965,8 @@ pub async fn handle_read_jobs(
                 send_or_keep(stream, message, None, &mut job.pending_send).await?;
             }
             Ok(Some(block)) => {
-                send_or_keep(stream, new_block(block), None, &mut job.pending_send).await?;
+                step.more =
+                    send_or_keep(stream, new_block(block), None, &mut job.pending_send).await?;
             }
             Ok(None) => {
                 if job.job_completed() {
@@ -1936,7 +1983,7 @@ pub async fn handle_read_jobs(
                     if send_or_keep(stream, message, Some(log.clone()), &mut job.pending_send)
                         .await?
                     {
-                        job_log = log;
+                        step.job_log = log;
                         finished.push(job.id());
                     }
                 } else {
@@ -1950,7 +1997,7 @@ pub async fn handle_read_jobs(
     for id in finished {
         let _ = remove_job(id, jobs);
     }
-    Ok(job_log)
+    Ok(step)
 }
 
 /// Removes `path` and the directories below it when they hold no files. Links are removed,
@@ -3412,5 +3459,159 @@ mod tests {
         assert!(dir.join("kept.txt").exists());
         assert!(!dir.join("empty").exists());
         assert!(remove_all_empty_dir(&tmp.join("missing")).is_err());
+    }
+
+    // ---- small speed-ups ----
+
+    #[test]
+    fn already_compressed_files_are_recognised_whatever_the_case() {
+        for name in [
+            "a.zip",
+            "A.ZIP",
+            "photo.JPG",
+            "photo.jpeg",
+            "clip.Mp4",
+            "song.flac",
+            "disk.7z",
+            "report.docx",
+            "dir.with.dots/archive.tar.gz",
+            "x.zst",
+        ] {
+            assert!(is_compressed_file(name), "{}", name);
+        }
+        for name in ["a.txt", "zip", "a.zip.txt", "noext", "data.bin", "a.c", ""] {
+            assert!(!is_compressed_file(name), "{}", name);
+        }
+    }
+
+    /// One call reads several blocks when the stream has room, and still one job at a time.
+    #[tokio::test]
+    async fn one_call_reads_several_blocks() {
+        const BLOCK: usize = 128 * 1024;
+        let tmp = TestTempDir::new("rustdesk_fs_steps_per_call");
+        std::fs::create_dir_all(&tmp.path).unwrap();
+        let src = tmp.join("source.bin");
+        std::fs::write(&src, incompressible(10 * BLOCK)).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (peer, _) = listener.accept().await.unwrap();
+        let local = tcp.local_addr().unwrap();
+        // A plain TCP stream always has room.
+        let mut stream = Stream::from(tcp, local);
+        let mut jobs = vec![TransferJob::new_read(
+            61,
+            JobType::Generic,
+            "peer".to_owned(),
+            DataSource::FilePath(src),
+            0,
+            true,
+            false,
+            false,
+        )
+        .unwrap()];
+
+        let peer_local = peer.local_addr().unwrap();
+        let mut peer = Stream::from(peer, peer_local);
+        let received = tokio::spawn(async move {
+            let mut numbers = Vec::new();
+            loop {
+                let bytes = peer.next().await.unwrap().unwrap();
+                let message = Message::parse_from_bytes(&bytes).unwrap();
+                let Some(message::Union::FileResponse(response)) = message.union else {
+                    continue;
+                };
+                match response.union {
+                    Some(file_response::Union::Block(block)) => numbers.push(block.blk_id),
+                    Some(file_response::Union::Done(_)) => return numbers,
+                    other => panic!("unexpected file response: {:?}", other),
+                }
+            }
+        });
+
+        // Ten data blocks, the empty one, and the final message: far fewer calls than blocks.
+        let mut calls = 0;
+        while !jobs.is_empty() {
+            handle_read_jobs(&mut jobs, &mut stream).await.unwrap();
+            calls += 1;
+            assert!(calls <= 12, "the transfer does not end");
+        }
+        assert!(calls <= 5, "{} calls for 11 blocks", calls);
+        let numbers = tokio::time::timeout(std::time::Duration::from_secs(30), received)
+            .await
+            .expect("receiver finished")
+            .unwrap();
+        assert_eq!(numbers, (1..=11).collect::<Vec<u32>>());
+    }
+
+    /// Several steps in one call cross from one file to the next.
+    #[tokio::test]
+    async fn one_call_goes_on_to_the_next_file() {
+        let tmp = TestTempDir::new("rustdesk_fs_steps_across_files");
+        let source = tmp.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        for index in 0..6 {
+            // Data that does not compress, so that a block is as long as what was read.
+            std::fs::write(
+                source.join(format!("f{}", index)),
+                incompressible(index * 100),
+            )
+            .unwrap();
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (peer, _) = listener.accept().await.unwrap();
+        let local = tcp.local_addr().unwrap();
+        let mut stream = Stream::from(tcp, local);
+        let mut jobs = vec![TransferJob::new_read(
+            62,
+            JobType::Generic,
+            "peer".to_owned(),
+            DataSource::FilePath(source),
+            0,
+            true,
+            false,
+            false,
+        )
+        .unwrap()];
+        let files = jobs[0].files().len();
+        assert_eq!(files, 6);
+
+        let peer_local = peer.local_addr().unwrap();
+        let mut peer = Stream::from(peer, peer_local);
+        let received = tokio::spawn(async move {
+            let mut bytes_per_file = vec![0usize; 6];
+            loop {
+                let bytes = peer.next().await.unwrap().unwrap();
+                let message = Message::parse_from_bytes(&bytes).unwrap();
+                let Some(message::Union::FileResponse(response)) = message.union else {
+                    continue;
+                };
+                match response.union {
+                    Some(file_response::Union::Block(block)) => {
+                        bytes_per_file[block.file_num as usize] += block.data.len();
+                    }
+                    Some(file_response::Union::Done(_)) => return bytes_per_file,
+                    other => panic!("unexpected file response: {:?}", other),
+                }
+            }
+        });
+
+        let mut calls = 0;
+        while !jobs.is_empty() {
+            handle_read_jobs(&mut jobs, &mut stream).await.unwrap();
+            calls += 1;
+            assert!(calls <= 40, "the transfer does not end");
+        }
+        let mut bytes_per_file = tokio::time::timeout(std::time::Duration::from_secs(30), received)
+            .await
+            .expect("receiver finished")
+            .unwrap();
+        // The order of the files in the job is the order of the directory listing.
+        bytes_per_file.sort_unstable();
+        assert_eq!(bytes_per_file, vec![0, 100, 200, 300, 400, 500]);
     }
 }
