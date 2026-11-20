@@ -50,6 +50,10 @@ const CONTROL_OUTBOUND_CAPACITY: usize = 128;
 const INPUT_OUTBOUND_CAPACITY: usize = 128;
 const CLIPBOARD_OUTBOUND_CAPACITY: usize = 16;
 const FILE_OUTBOUND_CAPACITY: usize = 32;
+/// Slots of the file channel queue that file blocks never take, so that file-manager
+/// requests and replies (listings, confirmations, cancel) still get through while a
+/// transfer is waiting for the channel to drain.
+const FILE_OUTBOUND_BULK_RESERVE: usize = 8;
 const DIAGNOSTICS_OUTBOUND_CAPACITY: usize = 64;
 const AUDIO_OUTBOUND_CAPACITY: usize = 64;
 const CHANNEL_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1437,6 +1441,15 @@ impl QuicApplicationStream {
 
     pub fn enqueue(&self, payload: Bytes) -> crate::ResultType<()> {
         self.enqueue_with_latest_key(None, payload)
+    }
+
+    /// Whether the file channel can take another block of file data. `enqueue` never waits:
+    /// when the channel queue is full it returns `WouldBlock`. A closing or closed stream
+    /// answers yes so that the next `enqueue` reports the real error.
+    pub fn file_send_ready(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
+            || self.file.is_closed()
+            || self.file.capacity() > FILE_OUTBOUND_BULK_RESERVE
     }
 
     pub fn enqueue_latest(&self, key: u64, payload: Bytes) -> crate::ResultType<()> {
@@ -4875,6 +4888,185 @@ mod tests {
             Some((48_000, 2))
         );
         assert_eq!(pack_audio_format(&AudioFormat::new()), 0);
+    }
+
+    /// A connected application stream pair over loopback, or `None` where UDP is not permitted.
+    async fn application_stream_pair() -> Option<(QuicApplicationStream, QuicApplicationStream)> {
+        let server_certificate = certificate();
+        let client_certificate = certificate();
+        let server_identity = device_identity();
+        let client_identity = device_identity();
+        let server_identity_key = server_identity.public_key_bytes();
+        let client_identity_key = client_identity.public_key_bytes();
+        let options = QuicTransportOptions {
+            connect_timeout: Duration::from_secs(2),
+            authentication_timeout: Duration::from_secs(2),
+            ..Default::default()
+        };
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let server = match QuicServerEndpoint::bind(
+            bind,
+            server_certificate.credentials(),
+            client_certificate.certificate.clone(),
+            &options,
+        ) {
+            Ok(server) => server,
+            Err(QuicTransportError::UdpBind(error))
+                if error.contains("Operation not permitted") =>
+            {
+                return None
+            }
+            Err(error) => panic!("server endpoint failed: {}", error),
+        };
+        let client = QuicClientEndpoint::bind(
+            bind,
+            client_certificate.credentials(),
+            server_certificate.certificate.clone(),
+            &options,
+        )
+        .unwrap();
+        let server_address = server.local_addr().unwrap();
+        let auth_timeout = options.authentication_timeout;
+        let server_task = tokio::spawn(async move {
+            let connection = server.accept().await.unwrap();
+            let local_addr = connection
+                .local_ip()
+                .map(|ip| SocketAddr::new(ip, server_address.port()))
+                .unwrap_or(bind);
+            let authentication = AuthenticatedControlChannel::authenticate_server_discover_session(
+                connection,
+                &server_identity,
+                client_identity_key,
+                auth_timeout,
+            )
+            .await
+            .unwrap();
+            QuicApplicationStream::establish(
+                authentication,
+                ApplicationQuicRole::Server,
+                local_addr,
+            )
+            .await
+            .unwrap()
+        });
+        let connection = client.connect(server_address).await.unwrap();
+        let local_addr = client.local_addr().unwrap();
+        let authentication = AuthenticatedControlChannel::authenticate_client(
+            connection,
+            &client_identity,
+            server_identity_key,
+            [9; 16],
+            auth_timeout,
+        )
+        .await
+        .unwrap();
+        let client_stream = QuicApplicationStream::establish(
+            authentication,
+            ApplicationQuicRole::Client,
+            local_addr,
+        )
+        .await
+        .unwrap();
+        Some((client_stream, server_task.await.unwrap()))
+    }
+
+    /// The file channel queue holds 32 messages and is drained at the negotiated file rate, while
+    /// a transfer reads a block every millisecond. Without the readiness check the 34th block of
+    /// any file was refused and the session ended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_larger_than_the_file_channel_queue_is_delivered_complete() {
+        use crate::fs::{self, DataSource, JobType, TransferJob};
+        use crate::message_proto::{file_response, message, FileEntry};
+
+        const BLOCK: usize = 128 * 1024;
+        let Some((client_stream, server_stream)) = application_stream_pair().await else {
+            return;
+        };
+        let directory = std::env::temp_dir().join(format!(
+            "rustdesk_quic_file_queue_{}_{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("source.bin");
+        let result = directory.join("result.bin");
+        // 40 blocks: more than the queue, small enough to pass the default file rate quickly.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut data = Vec::with_capacity(40 * BLOCK + 8);
+        while data.len() < 40 * BLOCK {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            data.extend_from_slice(&state.to_le_bytes());
+        }
+        data.truncate(40 * BLOCK);
+        std::fs::write(&source, &data).unwrap();
+
+        let size = data.len() as u64;
+        let receiver = {
+            let result = result.clone();
+            tokio::spawn(async move {
+                let mut stream = crate::Stream::from_quic(server_stream);
+                let mut job = TransferJob::new_write(
+                    3,
+                    JobType::Generic,
+                    "peer".to_owned(),
+                    DataSource::FilePath(result),
+                    0,
+                    true,
+                    false,
+                    false,
+                )
+                .with_files(vec![FileEntry {
+                    size,
+                    ..Default::default()
+                }])
+                .unwrap();
+                loop {
+                    let bytes = stream.next().await.expect("open").expect("readable");
+                    let parsed = Message::parse_from_bytes(&bytes).unwrap();
+                    let Some(message::Union::FileResponse(response)) = parsed.union else {
+                        continue;
+                    };
+                    match response.union {
+                        Some(file_response::Union::Block(block)) => job.write(block).await.unwrap(),
+                        Some(file_response::Union::Done(_)) => {
+                            job.modify_time();
+                            return;
+                        }
+                        other => panic!("unexpected file response: {:?}", other),
+                    }
+                }
+            })
+        };
+
+        let mut stream = crate::Stream::from_quic(client_stream);
+        let mut jobs = vec![TransferJob::new_read(
+            3,
+            JobType::Generic,
+            "peer".to_owned(),
+            DataSource::FilePath(source),
+            0,
+            true,
+            false,
+            false,
+        )
+        .unwrap()];
+        let mut waited = false;
+        while !jobs.is_empty() {
+            waited |= !stream.file_send_ready();
+            fs::handle_read_jobs(&mut jobs, &mut stream)
+                .await
+                .expect("a full file channel must not end the transfer");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        tokio::time::timeout(Duration::from_secs(60), receiver)
+            .await
+            .expect("receiver finished")
+            .unwrap();
+        assert!(waited, "the test must exercise a full file channel");
+        assert!(std::fs::read(&result).unwrap() == data, "content differs");
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[tokio::test]

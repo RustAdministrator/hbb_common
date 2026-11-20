@@ -75,6 +75,13 @@ enum OutboundEntry {
     Video((i32, u64), OutboundMessage),
 }
 
+/// How many entries bulk file data may leave waiting in a duplex outbox.
+///
+/// File blocks are produced by a timer, far faster than a slow link drains them. Without a
+/// bound they fill the whole outbox: the next block is refused with `WouldBlock`, and input,
+/// control messages and video wait behind megabytes of file data. Sixteen 128 KiB blocks keep
+/// the writer busy between timer ticks and leave the rest of the queue to everything else.
+const BULK_OUTBOX_MAX_ENTRIES: usize = 16;
 const MAX_PENDING_VIDEO_TRACKS: usize = 16;
 const MAX_VIDEO_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_VIDEO_BYTES: usize = 64 * 1024 * 1024;
@@ -255,6 +262,14 @@ impl OutboundQueue {
 
     fn len(&self) -> usize {
         self.state.lock().unwrap().entries.len()
+    }
+
+    /// Whether a bulk producer may queue more now. A closed queue answers yes so that the
+    /// producer's next send reports the real error instead of waiting forever.
+    fn has_bulk_room(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.closed
+            || state.entries.len() < BULK_OUTBOX_MAX_ENTRIES.min((state.capacity / 2).max(1))
     }
 
     fn counters(&self) -> (u64, u64) {
@@ -1030,6 +1045,20 @@ impl Stream {
         })
     }
 
+    /// Whether file-transfer data can be handed to `send` now.
+    ///
+    /// `send` does not wait on a duplex or QUIC stream: it queues the message or fails with
+    /// `WouldBlock`. Code that reads file blocks on a timer must check this first and read
+    /// nothing when it is false, otherwise a block that was read cannot be delivered.
+    pub fn file_send_ready(&self) -> bool {
+        match self {
+            Self::Duplex(stream) => stream.outbox.has_bulk_room(),
+            #[cfg(feature = "quic-transport")]
+            Self::Quic(stream) => stream.file_send_ready(),
+            _ => true,
+        }
+    }
+
     pub fn async_writer_progress(&self) -> Option<AsyncStreamProgressSnapshot> {
         match self {
             Self::Duplex(stream) => Some(stream.progress_snapshot()),
@@ -1067,6 +1096,35 @@ mod tests {
         task::{Context, Poll},
     };
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    #[test]
+    fn bulk_data_gets_a_bounded_share_of_the_outbox() {
+        let queue = OutboundQueue::new(256);
+        for _ in 0..BULK_OUTBOX_MAX_ENTRIES {
+            assert!(queue.has_bulk_room());
+            queue.enqueue(message(b"block", "FileBlock")).unwrap();
+        }
+        assert!(
+            !queue.has_bulk_room(),
+            "bulk producers stop at the watermark"
+        );
+        // Everything else still has the rest of the queue.
+        queue.enqueue(message(b"input", "Input")).unwrap();
+        assert_eq!(queue.len(), BULK_OUTBOX_MAX_ENTRIES + 1);
+
+        // A small queue is never handed over to bulk data entirely.
+        let small = OutboundQueue::new(8);
+        for _ in 0..4 {
+            assert!(small.has_bulk_room());
+            small.enqueue(message(b"block", "FileBlock")).unwrap();
+        }
+        assert!(!small.has_bulk_room());
+
+        // A closed queue reports room so that the producer's send surfaces the error.
+        small.close();
+        assert!(small.has_bulk_room());
+        assert!(small.enqueue(message(b"block", "FileBlock")).is_err());
+    }
 
     fn message(value: &'static [u8], kind: &'static str) -> OutboundMessage {
         OutboundMessage {

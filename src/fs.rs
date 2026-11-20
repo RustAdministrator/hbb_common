@@ -415,6 +415,10 @@ pub struct TransferJob {
     default_overwrite_strategy: Option<bool>,
     #[serde(skip_serializing)]
     digest: FileDigest,
+    /// A message that was produced for the peer while the stream had no room for it. It is
+    /// sent before anything else is read. `Some(log)` marks the job's final message.
+    #[serde(skip_serializing)]
+    pending_send: Option<(Message, Option<String>)>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -1352,24 +1356,61 @@ pub fn get_job_immutable(id: i32, jobs: &[TransferJob]) -> Option<&TransferJob> 
     jobs.iter().find(|x| x.id() == id)
 }
 
+/// True for the error a queueing stream returns when its outbound queue is full.
+#[inline]
+pub fn is_would_block(err: &crate::anyhow::Error) -> bool {
+    err.downcast_ref::<std::io::Error>()
+        .is_some_and(|err| err.kind() == std::io::ErrorKind::WouldBlock)
+}
+
+/// Sends `message`, or keeps it in `slot` when the stream has no room right now.
+/// Returns whether it was sent. Any other error is returned to the caller.
+async fn send_or_keep(
+    stream: &mut crate::Stream,
+    message: Message,
+    final_log: Option<String>,
+    slot: &mut Option<(Message, Option<String>)>,
+) -> ResultType<bool> {
+    match stream.send(&message).await {
+        Ok(()) => Ok(true),
+        Err(err) if is_would_block(&err) => {
+            *slot = Some((message, final_log));
+            Ok(false)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 async fn init_jobs(jobs: &mut Vec<TransferJob>, stream: &mut crate::Stream) -> ResultType<()> {
     for job in jobs.iter_mut() {
-        if job.is_last_job {
+        if job.is_last_job || job.pending_send.is_some() {
+            // A kept message goes out first, in order.
             continue;
         }
         if let Err(err) = job.init_data_stream(stream).await {
-            stream
-                .send(&new_error(job.id(), err, job.file_num()))
-                .await?;
+            if is_would_block(&err) {
+                // The digest could not be queued; it is sent on a later tick.
+                continue;
+            }
+            let message = new_error(job.id(), err, job.file_num());
+            send_or_keep(stream, message, None, &mut job.pending_send).await?;
         }
     }
     Ok(())
 }
 
+/// One step of the sending side of every read job. Called on a timer.
+///
+/// The stream does not wait in `send`, so this function reads from disk only when the stream
+/// reports room for file data, and never drops what it has read: a message that could not be
+/// queued stays with its job and is sent first on a later call.
 pub async fn handle_read_jobs(
     jobs: &mut Vec<TransferJob>,
     stream: &mut crate::Stream,
 ) -> ResultType<String> {
+    if !stream.file_send_ready() {
+        return Ok(Default::default());
+    }
     init_jobs(jobs, stream).await?;
 
     let mut job_log = Default::default();
@@ -1378,27 +1419,41 @@ pub async fn handle_read_jobs(
         if job.is_last_job {
             continue;
         }
+        if let Some((message, final_log)) = job.pending_send.take() {
+            let last = final_log.clone();
+            if send_or_keep(stream, message, final_log, &mut job.pending_send).await? {
+                if let Some(log) = last {
+                    job_log = log;
+                    finished.push(job.id());
+                }
+            }
+            break;
+        }
         match job.read().await {
             Err(err) => {
-                stream
-                    .send(&new_error(job.id(), err, job.file_num()))
-                    .await?;
+                let message = new_error(job.id(), err, job.file_num());
+                send_or_keep(stream, message, None, &mut job.pending_send).await?;
             }
             Ok(Some(block)) => {
-                stream.send(&new_block(block)).await?;
+                send_or_keep(stream, new_block(block), None, &mut job.pending_send).await?;
             }
             Ok(None) => {
                 if job.job_completed() {
-                    job_log = serialize_transfer_job(job, true, false, "");
-                    finished.push(job.id());
-                    match job.job_error() {
-                        Some(err) => {
-                            job_log = serialize_transfer_job(job, false, false, &err);
-                            stream
-                                .send(&new_error(job.id(), err, job.file_num()))
-                                .await?
-                        }
-                        None => stream.send(&new_done(job.id(), job.file_num())).await?,
+                    let (log, message) = match job.job_error() {
+                        Some(err) => (
+                            serialize_transfer_job(job, false, false, &err),
+                            new_error(job.id(), err, job.file_num()),
+                        ),
+                        None => (
+                            serialize_transfer_job(job, true, false, ""),
+                            new_done(job.id(), job.file_num()),
+                        ),
+                    };
+                    if send_or_keep(stream, message, Some(log.clone()), &mut job.pending_send)
+                        .await?
+                    {
+                        job_log = log;
+                        finished.push(job.id());
                     }
                 } else {
                     // waiting confirmation.
@@ -1562,6 +1617,7 @@ pub fn serialize_transfer_job(job: &TransferJob, done: bool, cancel: bool, error
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protobuf::Message as _;
 
     struct TestTempDir {
         path: PathBuf,
@@ -1881,5 +1937,167 @@ mod tests {
             .set_files(vec![new_file_entry(r"\\?\C:\Windows\Temp\x.txt")])
             .expect_err("verbatim drive absolute path must be rejected");
         assert_err_contains(err, "absolute path");
+    }
+    /// Deterministic data that does not compress, so every block stays 128 KiB.
+    fn incompressible(len: usize) -> Vec<u8> {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut data = Vec::with_capacity(len + 8);
+        while data.len() < len {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            data.extend_from_slice(&state.to_le_bytes());
+        }
+        data.truncate(len);
+        data
+    }
+
+    #[test]
+    fn would_block_is_recognised_through_anyhow() {
+        let full: crate::anyhow::Error =
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, "outbox is full").into();
+        assert!(is_would_block(&full));
+        let closed: crate::anyhow::Error =
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed").into();
+        assert!(!is_would_block(&closed));
+        assert!(!is_would_block(&anyhow!("something else")));
+    }
+
+    /// The sender reads on a 1 ms timer; the receiver takes a few milliseconds per block. Before
+    /// the readiness check the outbox filled up and `handle_read_jobs` failed with `WouldBlock`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_receiver_gets_every_block_of_a_file_larger_than_the_outbox() {
+        const BLOCK: usize = 128 * 1024;
+        let tmp = TestTempDir::new("rustdesk_fs_backpressure");
+        std::fs::create_dir_all(&tmp.path).unwrap();
+        let src = tmp.join("source.bin");
+        let dst = tmp.join("result.bin");
+        // 64 blocks through an outbox of 8 entries.
+        let data = incompressible(64 * BLOCK + 1234);
+        std::fs::write(&src, &data).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let size = data.len() as u64;
+        let receiver = {
+            let dst = dst.clone();
+            tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let local = tcp.local_addr().unwrap();
+                let mut stream = Stream::from(tcp, local);
+                let mut job = TransferJob::new_write(
+                    7,
+                    JobType::Generic,
+                    "peer".to_owned(),
+                    DataSource::FilePath(dst),
+                    0,
+                    true,
+                    false,
+                    false,
+                )
+                .with_files(vec![FileEntry {
+                    size,
+                    ..Default::default()
+                }])
+                .unwrap();
+                let mut blocks = 0;
+                loop {
+                    let bytes = stream.next().await.expect("open").expect("readable");
+                    let message = Message::parse_from_bytes(&bytes).unwrap();
+                    let Some(message::Union::FileResponse(response)) = message.union else {
+                        continue;
+                    };
+                    match response.union {
+                        Some(file_response::Union::Block(block)) => {
+                            job.write(block).await.unwrap();
+                            blocks += 1;
+                            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+                        }
+                        Some(file_response::Union::Done(_)) => {
+                            job.modify_time();
+                            return blocks;
+                        }
+                        other => panic!("unexpected file response: {:?}", other),
+                    }
+                }
+            })
+        };
+
+        let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+        let local = tcp.local_addr().unwrap();
+        let mut stream = Stream::from(tcp, local).into_duplex(8);
+        let mut jobs = vec![TransferJob::new_read(
+            7,
+            JobType::Generic,
+            "peer".to_owned(),
+            DataSource::FilePath(src),
+            0,
+            true,
+            false,
+            false,
+        )
+        .unwrap()];
+        let mut skipped = 0;
+        while !jobs.is_empty() {
+            if !stream.file_send_ready() {
+                skipped += 1;
+            }
+            handle_read_jobs(&mut jobs, &mut stream)
+                .await
+                .expect("a full outbox must not end the transfer");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let blocks = tokio::time::timeout(std::time::Duration::from_secs(60), receiver)
+            .await
+            .expect("receiver finished")
+            .unwrap();
+        assert!(blocks >= 65, "blocks received: {}", blocks);
+        assert!(skipped > 0, "the test must exercise a full outbox");
+        assert!(std::fs::read(&dst).unwrap() == data, "content differs");
+    }
+
+    /// A message that could not be queued stays with the job and goes out first, once.
+    #[tokio::test]
+    async fn kept_message_is_sent_before_anything_else_is_read() {
+        let tmp = TestTempDir::new("rustdesk_fs_pending");
+        std::fs::create_dir_all(&tmp.path).unwrap();
+        let src = tmp.join("source.bin");
+        std::fs::write(&src, b"abc").unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (peer, _) = listener.accept().await.unwrap();
+        let local = tcp.local_addr().unwrap();
+        let mut stream = Stream::from(tcp, local);
+        let mut jobs = vec![TransferJob::new_read(
+            9,
+            JobType::Generic,
+            "peer".to_owned(),
+            DataSource::FilePath(src),
+            0,
+            true,
+            false,
+            false,
+        )
+        .unwrap()];
+        // As if a final message had been refused by a full queue on an earlier tick.
+        jobs[0].pending_send = Some((new_done(9, 0), Some("kept".to_owned())));
+
+        let log = handle_read_jobs(&mut jobs, &mut stream).await.unwrap();
+        assert_eq!(log, "kept");
+        assert!(jobs.is_empty(), "the kept final message ends the job");
+
+        let peer_local = peer.local_addr().unwrap();
+        let mut peer = Stream::from(peer, peer_local);
+        let bytes = peer.next().await.unwrap().unwrap();
+        let message = Message::parse_from_bytes(&bytes).unwrap();
+        let Some(message::Union::FileResponse(response)) = message.union else {
+            panic!("expected a file response");
+        };
+        assert!(
+            matches!(response.union, Some(file_response::Union::Done(_))),
+            "the kept message is sent as it was, before any block"
+        );
     }
 }
