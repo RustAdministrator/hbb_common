@@ -453,6 +453,13 @@ pub struct TransferJob {
     /// A resume offset agreed for a file that is not open yet: `(file number, offset)`.
     #[serde(skip_serializing)]
     pending_resume: Option<(i32, u64)>,
+    /// Number of the last block read from, or written to, the current file. The blocks of a
+    /// file are numbered from 1 in `FileTransferBlock::blk_id`; zero means none yet.
+    #[serde(skip_serializing)]
+    last_block_id: u32,
+    /// The file `last_block_id` counts for, on the reading side.
+    #[serde(skip_serializing)]
+    block_id_file_num: i32,
     /// A job that reads local files for the peer.
     #[serde(skip_serializing)]
     reads_local_files: bool,
@@ -952,6 +959,18 @@ impl TransferJob {
                 }
             }
         }
+        // Zero is a sender that does not number its blocks; there is nothing to check then.
+        if block.blk_id != 0 {
+            let expected = next_block_id(self.last_block_id);
+            if block.blk_id != expected {
+                bail!(
+                    "block {} of the file arrived where block {} was expected: file data was lost or repeated on the way",
+                    block.blk_id,
+                    expected
+                );
+            }
+            self.last_block_id = block.blk_id;
+        }
         let written = if block.compressed {
             let tmp = decompress_limited(&block.data, FILE_BLOCK_DECOMPRESS_MAX_LEN)?;
             self.data_stream
@@ -1047,6 +1066,8 @@ impl TransferJob {
     /// Records what is known about the file that was just opened for writing.
     fn note_file_opened(&mut self, file_num: usize, already_present: u64) {
         self.file_opened = true;
+        // Both sides count the blocks of a file from where this connection starts it.
+        self.last_block_id = 0;
         self.file_written = already_present;
         // The digest that precedes a file is the sender's own measurement of that file; the
         // listing may be older. A listing size of zero means "not known".
@@ -1230,13 +1251,26 @@ impl TransferJob {
             }
             self.transferred += buf.len() as u64;
         }
+        let blk_id = self.next_read_block_id(file_num as i32);
         Ok(Some(FileTransferBlock {
             id: self.id,
             file_num: file_num as _,
             data: buf.into(),
             compressed,
+            blk_id,
             ..Default::default()
         }))
+    }
+
+    /// The number of the block that was just read from file `file_num`. The empty block that
+    /// ends a file is numbered too, so the receiver notices when the last data block is lost.
+    fn next_read_block_id(&mut self, file_num: i32) -> u32 {
+        if self.block_id_file_num != file_num {
+            self.block_id_file_num = file_num;
+            self.last_block_id = 0;
+        }
+        self.last_block_id = next_block_id(self.last_block_id);
+        self.last_block_id
     }
 
     // Only for generic job and file stream
@@ -1458,6 +1492,13 @@ impl TransferJob {
             is_remote: self.is_remote,
         }
     }
+}
+
+/// The block number that follows `last` within a file. Zero is never used: it means "not
+/// numbered".
+#[inline]
+fn next_block_id(last: u32) -> u32 {
+    last.checked_add(1).unwrap_or(1)
 }
 
 #[inline]
@@ -2764,5 +2805,132 @@ mod tests {
         reader.init_data_stream_for_cm().await.unwrap();
         read_current_file(&mut reader).await;
         assert_eq!((reader.file_num(), reader.gen_meta().file_num), (1, 1));
+    }
+
+    // ---- the blocks of a file are numbered, and a gap fails the job (FT-07) ----
+
+    fn numbered_block(id: i32, file_num: i32, blk_id: u32, data: &[u8]) -> FileTransferBlock {
+        let mut block = data_block(id, file_num, data);
+        block.blk_id = blk_id;
+        block
+    }
+
+    #[tokio::test]
+    async fn reader_numbers_the_blocks_of_every_file_from_one() {
+        let tmp = TestTempDir::new("rustdesk_fs_block_numbers");
+        std::fs::create_dir_all(&tmp.path).unwrap();
+        // Three data blocks and the empty one that ends the file; then one and the end.
+        std::fs::write(tmp.join("one"), incompressible(300_000)).unwrap();
+        std::fs::write(tmp.join("two"), b"2").unwrap();
+        let mut reader = TransferJob::new_read(
+            41,
+            JobType::Generic,
+            "peer".to_owned(),
+            DataSource::FilePath(tmp.path.clone()),
+            0,
+            true,
+            false,
+            true,
+        )
+        .unwrap();
+
+        let mut numbers = Vec::new();
+        while (reader.file_num() as usize) < reader.files().len() {
+            peer_confirms_current_file(&mut reader).await;
+            let blocks = read_current_file(&mut reader).await;
+            numbers.push(blocks.iter().map(|block| block.blk_id).collect::<Vec<_>>());
+        }
+        numbers.sort();
+        assert_eq!(numbers, vec![vec![1, 2], vec![1, 2, 3, 4]]);
+    }
+
+    #[tokio::test]
+    async fn lost_block_fails_the_job() {
+        let tmp = TestTempDir::new("rustdesk_fs_lost_block");
+        std::fs::create_dir_all(&tmp.path).unwrap();
+        // This receiver does not know the size, so only the numbers can show the loss.
+        let mut job = write_job_for(42, &tmp.path, &[("x", 0)]);
+
+        job.write(numbered_block(42, 0, 1, b"first "))
+            .await
+            .unwrap();
+        // Block 2 never arrives.
+        let third = job.write(numbered_block(42, 0, 3, b"third")).await;
+        let _ = job.write(numbered_block(42, 0, 4, b"")).await;
+        let finished = finish(&mut job).await;
+        drop(job);
+
+        assert!(
+            !tmp.join("x").exists(),
+            "a file with a hole was moved into place"
+        );
+        assert!(third.is_err() && finished.is_err());
+    }
+
+    #[tokio::test]
+    async fn repeated_block_fails_the_job() {
+        let tmp = TestTempDir::new("rustdesk_fs_repeated_block");
+        std::fs::create_dir_all(&tmp.path).unwrap();
+        let mut job = write_job_for(43, &tmp.path, &[("x", 0)]);
+
+        job.write(numbered_block(43, 0, 1, b"once")).await.unwrap();
+        let err = job
+            .write(numbered_block(43, 0, 1, b"once"))
+            .await
+            .unwrap_err();
+        assert_err_contains(
+            err,
+            "block 1 of the file arrived where block 2 was expected",
+        );
+        assert!(job.has_failed());
+        assert!(job.finish_file().await.is_err());
+        assert!(!tmp.join("x").exists());
+    }
+
+    #[tokio::test]
+    async fn blocks_without_numbers_are_accepted() {
+        let tmp = TestTempDir::new("rustdesk_fs_unnumbered_blocks");
+        std::fs::create_dir_all(&tmp.path).unwrap();
+        let mut job = write_job_for(44, &tmp.path, &[("x", 6)]);
+
+        // A sender that does not number its blocks leaves the field at zero.
+        job.write(data_block(44, 0, b"abc")).await.unwrap();
+        job.write(data_block(44, 0, b"def")).await.unwrap();
+        job.write(data_block(44, 0, b"")).await.unwrap();
+        job.finish_file().await.unwrap();
+        assert_eq!(std::fs::read(tmp.join("x")).unwrap(), b"abcdef");
+    }
+
+    #[tokio::test]
+    async fn numbering_starts_again_for_each_file_and_for_a_resumed_file() {
+        let tmp = TestTempDir::new("rustdesk_fs_block_numbers_restart");
+        std::fs::create_dir_all(&tmp.path).unwrap();
+        std::fs::write(tmp.join("b.download"), b"12345").unwrap();
+        std::fs::write(tmp.join("b.digest"), b"{}").unwrap();
+        let mut job = write_job_for(45, &tmp.path, &[("a", 2), ("b", 10)]);
+
+        job.write(numbered_block(45, 0, 1, b"aa")).await.unwrap();
+        job.write(numbered_block(45, 0, 2, b"")).await.unwrap();
+        // The sender continues the second file at byte 5 and counts from one again.
+        job.confirm(&FileTransferSendConfirmRequest {
+            id: 45,
+            file_num: 1,
+            union: Some(file_transfer_send_confirm_request::Union::OffsetBlk(5)),
+            ..Default::default()
+        })
+        .await;
+        job.write(numbered_block(45, 1, 1, b"67890")).await.unwrap();
+        job.write(numbered_block(45, 1, 2, b"")).await.unwrap();
+        job.finish_file().await.unwrap();
+
+        assert_eq!(std::fs::read(tmp.join("a")).unwrap(), b"aa");
+        assert_eq!(std::fs::read(tmp.join("b")).unwrap(), b"1234567890");
+    }
+
+    #[test]
+    fn block_numbers_never_use_zero() {
+        assert_eq!(next_block_id(0), 1);
+        assert_eq!(next_block_id(41), 42);
+        assert_eq!(next_block_id(u32::MAX), 1);
     }
 }
