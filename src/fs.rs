@@ -1,10 +1,14 @@
 #[cfg(windows)]
 use std::os::windows::prelude::*;
 use std::{
+    collections::HashSet,
     fmt::{Debug, Display},
     io::Cursor,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicI32, Ordering},
+    sync::{
+        atomic::{AtomicI32, Ordering},
+        Mutex,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -24,6 +28,9 @@ use crate::{
 
 static NEXT_JOB_ID: AtomicI32 = AtomicI32::new(1);
 const FILE_BLOCK_DECOMPRESS_MAX_LEN: usize = 128 * 1024;
+/// The most a job that receives into memory (a print job) accepts. Such a job is started by
+/// the peer and nothing else bounds it.
+const MEMORY_JOB_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
 pub fn get_next_job_id() -> i32 {
     NEXT_JOB_ID.fetch_add(1, Ordering::SeqCst)
@@ -31,6 +38,32 @@ pub fn get_next_job_id() -> i32 {
 
 pub fn update_next_job_id(id: i32) {
     NEXT_JOB_ID.store(id, Ordering::SeqCst);
+}
+
+/// Makes sure no later [`get_next_job_id`] returns `id` or anything below it. A job restored
+/// from an earlier run keeps its id, while the counter starts again at 1 in every run; without
+/// this a new job gets the id of a restored one, and blocks go to whichever is found first.
+pub fn reserve_job_id(id: i32) {
+    NEXT_JOB_ID.fetch_max(id.saturating_add(1), Ordering::SeqCst);
+}
+
+/// A directory tree holds more entries than the caller allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TooManyEntries {
+    pub limit: usize,
+}
+
+impl std::fmt::Display for TooManyEntries {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "more than {} entries", self.limit)
+    }
+}
+
+impl std::error::Error for TooManyEntries {}
+
+/// The limit a walk was stopped at, when that is why it failed.
+pub fn too_many_entries(err: &crate::anyhow::Error) -> Option<TooManyEntries> {
+    err.downcast_ref::<TooManyEntries>().copied()
 }
 
 pub fn read_dir(path: &Path, include_hidden: bool) -> ResultType<FileDirectory> {
@@ -141,12 +174,15 @@ pub fn get_home_as_string() -> String {
     get_string(&Config::get_home())
 }
 
+/// Collects the files under `path` into `files`. Stops with [`TooManyEntries`] as soon as
+/// there are more than `max_files`, instead of walking the rest of the tree first.
 fn read_dir_recursive(
     path: &Path,
     prefix: &Path,
     include_hidden: bool,
-) -> ResultType<Vec<FileEntry>> {
-    let mut files = Vec::new();
+    max_files: usize,
+    files: &mut Vec<FileEntry>,
+) -> ResultType<()> {
     if path.is_dir() {
         // to-do: symbol link handling, cp the link rather than the content
         // to-do: file mode, for unix
@@ -157,22 +193,29 @@ fn read_dir_recursive(
                     let mut entry = entry.clone();
                     entry.name = get_string(&prefix.join(entry.name));
                     files.push(entry);
+                    if files.len() > max_files {
+                        return Err(TooManyEntries { limit: max_files }.into());
+                    }
                 }
                 Ok(FileType::Dir) => {
-                    if let Ok(mut tmp) = read_dir_recursive(
+                    // A subdirectory that cannot be read is left out, as before. Running
+                    // over the limit is not that kind of error.
+                    if let Err(err) = read_dir_recursive(
                         &path.join(&entry.name),
                         &prefix.join(&entry.name),
                         include_hidden,
+                        max_files,
+                        files,
                     ) {
-                        for entry in tmp.drain(0..) {
-                            files.push(entry);
+                        if too_many_entries(&err).is_some() {
+                            return Err(err);
                         }
                     }
                 }
                 _ => {}
             }
         }
-        Ok(files)
+        Ok(())
     } else if path.is_file() {
         let (size, modified_time) = if let Ok(meta) = std::fs::metadata(path) {
             (
@@ -194,23 +237,49 @@ fn read_dir_recursive(
             modified_time,
             ..Default::default()
         });
-        Ok(files)
+        Ok(())
     } else {
         bail!("Not exists");
     }
 }
 
 pub fn get_recursive_files(path: &str, include_hidden: bool) -> ResultType<Vec<FileEntry>> {
-    read_dir_recursive(&get_path(path), &get_path(""), include_hidden)
+    get_recursive_files_limited(path, include_hidden, usize::MAX)
 }
 
+/// [`get_recursive_files`] that gives up with [`TooManyEntries`] once the tree is known to
+/// hold more than `max_files` files.
+pub fn get_recursive_files_limited(
+    path: &str,
+    include_hidden: bool,
+    max_files: usize,
+) -> ResultType<Vec<FileEntry>> {
+    let mut files = Vec::new();
+    read_dir_recursive(
+        &get_path(path),
+        &get_path(""),
+        include_hidden,
+        max_files,
+        &mut files,
+    )?;
+    Ok(files)
+}
+
+/// Collects the empty directories under `path`. `budget` is what is left of the number of
+/// directories the walk may visit; the walk stops with [`TooManyEntries`] when it is used up.
 fn read_empty_dirs_recursive(
     path: &Path,
     prefix: &Path,
     include_hidden: bool,
-) -> ResultType<Vec<FileDirectory>> {
-    let mut dirs = Vec::new();
+    limit: usize,
+    budget: &mut usize,
+    dirs: &mut Vec<FileDirectory>,
+) -> ResultType<()> {
     if path.is_dir() {
+        if *budget == 0 {
+            return Err(TooManyEntries { limit }.into());
+        }
+        *budget -= 1;
         // to-do: symbol link handling, cp the link rather than the content
         // to-do: file mode, for unix
         let fd = read_dir(path, include_hidden)?;
@@ -218,25 +287,25 @@ fn read_empty_dirs_recursive(
             dirs.push(fd);
         } else {
             for entry in fd.entries.iter() {
-                match entry.entry_type.enum_value() {
-                    Ok(FileType::Dir) => {
-                        if let Ok(mut tmp) = read_empty_dirs_recursive(
-                            &path.join(&entry.name),
-                            &prefix.join(&entry.name),
-                            include_hidden,
-                        ) {
-                            for entry in tmp.drain(0..) {
-                                dirs.push(entry);
-                            }
+                if let Ok(FileType::Dir) = entry.entry_type.enum_value() {
+                    if let Err(err) = read_empty_dirs_recursive(
+                        &path.join(&entry.name),
+                        &prefix.join(&entry.name),
+                        include_hidden,
+                        limit,
+                        budget,
+                        dirs,
+                    ) {
+                        if too_many_entries(&err).is_some() {
+                            return Err(err);
                         }
                     }
-                    _ => {}
                 }
             }
         }
-        Ok(dirs)
+        Ok(())
     } else if path.is_file() {
-        Ok(dirs)
+        Ok(())
     } else {
         bail!("Not exists");
     }
@@ -246,7 +315,27 @@ pub fn get_empty_dirs_recursive(
     path: &str,
     include_hidden: bool,
 ) -> ResultType<Vec<FileDirectory>> {
-    read_empty_dirs_recursive(&get_path(path), &get_path(""), include_hidden)
+    get_empty_dirs_recursive_limited(path, include_hidden, usize::MAX)
+}
+
+/// [`get_empty_dirs_recursive`] that visits at most `max_dirs` directories and gives up with
+/// [`TooManyEntries`] when the tree has more.
+pub fn get_empty_dirs_recursive_limited(
+    path: &str,
+    include_hidden: bool,
+    max_dirs: usize,
+) -> ResultType<Vec<FileDirectory>> {
+    let mut dirs = Vec::new();
+    let mut budget = max_dirs;
+    read_empty_dirs_recursive(
+        &get_path(path),
+        &get_path(""),
+        include_hidden,
+        max_dirs,
+        &mut budget,
+        &mut dirs,
+    )?;
+    Ok(dirs)
 }
 
 #[inline]
@@ -460,6 +549,9 @@ pub struct TransferJob {
     /// The file `last_block_id` counts for, on the reading side.
     #[serde(skip_serializing)]
     block_id_file_num: i32,
+    /// Held while this job writes to its destination. See [`TransferJob::claim_destination`].
+    #[serde(skip_serializing)]
+    destination_claim: Option<DestinationClaim>,
     /// A job that reads local files for the peer.
     #[serde(skip_serializing)]
     reads_local_files: bool,
@@ -467,6 +559,33 @@ pub struct TransferJob {
     /// been processed by the peer, because the stream is ordered.
     #[serde(skip_serializing)]
     peer_confirmed_file_num: i32,
+}
+
+lazy_static::lazy_static! {
+    /// Destinations that a write job of this process is writing to right now.
+    static ref ACTIVE_DESTINATIONS: Mutex<HashSet<String>> = Default::default();
+}
+
+/// One entry of the set of destinations in use; leaving it is dropping this.
+#[derive(Debug)]
+struct DestinationClaim(String);
+
+impl DestinationClaim {
+    fn key(path: &Path) -> String {
+        let key = get_string(path);
+        if cfg!(windows) {
+            // The same file under another spelling of its name.
+            key.replace('/', "\\").to_lowercase()
+        } else {
+            key
+        }
+    }
+}
+
+impl Drop for DestinationClaim {
+    fn drop(&mut self) {
+        ACTIVE_DESTINATIONS.lock().unwrap().remove(&self.0);
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -527,12 +646,53 @@ pub fn windows_component_unsafe(component: &str) -> bool {
     }
     let base = component.split('.').next().unwrap_or("").trim_end();
     let upper = base.to_ascii_uppercase();
-    matches!(
+    if matches!(
         upper.as_str(),
         "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
-    ) || ((upper.starts_with("COM") || upper.starts_with("LPT"))
-        && upper.len() == 4
-        && matches!(upper.as_bytes()[3], b'1'..=b'9'))
+    ) {
+        return true;
+    }
+    // COM0-COM9 and LPT0-LPT9, and the same with a superscript one, two or three.
+    let Some(number) = upper
+        .strip_prefix("COM")
+        .or_else(|| upper.strip_prefix("LPT"))
+    else {
+        return false;
+    };
+    let mut number = number.chars();
+    matches!(
+        (number.next(), number.next()),
+        (Some('0'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}'), None)
+    )
+}
+
+/// Whether the last component of `path` names something Windows would not treat as a plain
+/// file. Used for a single-file transfer, whose destination is the path itself.
+pub fn windows_destination_unsafe(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(windows_component_unsafe)
+}
+
+/// Checks a path that the user interface built as the destination of a transfer written on
+/// this system. The interface joins a folder the user chose with a name that comes from the
+/// peer, so a path that climbs out with `..` is never what the user chose.
+pub fn validate_local_destination(path: &str) -> ResultType<()> {
+    validate_fs_path_argument(path, "destination path")?;
+    for component in Path::new(path).components() {
+        match component {
+            std::path::Component::ParentDir => {
+                bail!("destination path must not contain '..'");
+            }
+            std::path::Component::Normal(name) => {
+                if cfg!(windows) && name.to_str().is_some_and(windows_component_unsafe) {
+                    bail!("destination path component is not a plain Windows file name");
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 pub fn validate_file_name_no_traversal(name: &str) -> ResultType<()> {
@@ -688,11 +848,38 @@ impl TransferJob {
         is_remote: bool,
         enable_overwrite_detection: bool,
     ) -> ResultType<Self> {
+        Self::new_read_limited(
+            id,
+            r#type,
+            remote,
+            data_source,
+            file_num,
+            show_hidden,
+            is_remote,
+            enable_overwrite_detection,
+            usize::MAX,
+        )
+    }
+
+    /// [`TransferJob::new_read`] that fails with [`TooManyEntries`] as soon as the source is
+    /// known to hold more than `max_files` files, without walking the rest of it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_read_limited(
+        id: i32,
+        r#type: JobType,
+        remote: String,
+        data_source: DataSource,
+        file_num: i32,
+        show_hidden: bool,
+        is_remote: bool,
+        enable_overwrite_detection: bool,
+        max_files: usize,
+    ) -> ResultType<Self> {
         log::info!("new read {}", data_source);
         let (files, total_size) = match &data_source {
             DataSource::FilePath(p) => {
                 let p = p.to_str().ok_or(anyhow!("Invalid path"))?;
-                let files = get_recursive_files(p, show_hidden)?;
+                let files = get_recursive_files_limited(p, show_hidden, max_files)?;
                 let total_size = files.iter().map(|x| x.size).sum();
                 (files, total_size)
             }
@@ -736,6 +923,11 @@ impl TransferJob {
         if let DataSource::FilePath(base) = &self.data_source {
             for file in &files {
                 validate_no_symlink_components(base, &file.name)?;
+            }
+            // A single file is written to the path itself, so the name to check is there.
+            let single_file = files.len() == 1 && files[0].name.is_empty();
+            if cfg!(windows) && single_file && windows_destination_unsafe(base) {
+                bail!("destination is not a plain Windows file name");
             }
         }
         self.total_size = files.iter().map(|x| x.size).sum();
@@ -793,6 +985,24 @@ impl TransferJob {
     #[inline]
     pub fn has_failed(&self) -> bool {
         self.failed
+    }
+
+    /// Marks the destination of this write job as in use until the job is dropped. Fails when
+    /// another job of this process is writing there: the two would share the same temporary
+    /// `.download` files and each would damage the other's result.
+    pub fn claim_destination(&mut self) -> ResultType<()> {
+        if self.destination_claim.is_some() {
+            return Ok(());
+        }
+        let DataSource::FilePath(path) = &self.data_source else {
+            return Ok(());
+        };
+        let key = DestinationClaim::key(path);
+        if !ACTIVE_DESTINATIONS.lock().unwrap().insert(key.clone()) {
+            bail!("another transfer is already writing to this destination");
+        }
+        self.destination_claim = Some(DestinationClaim(key));
+        Ok(())
     }
 
     /// Moves the current file into place without waiting for its last write and without
@@ -956,6 +1166,13 @@ impl TransferJob {
             DataSource::MemoryCursor(c) => {
                 if self.data_stream.is_none() {
                     self.data_stream = Some(DataStream::BufStream(TokioBufStream::new(c.clone())));
+                }
+                // Everything received for such a job stays in memory until it is complete.
+                if self.finished_size >= MEMORY_JOB_MAX_BYTES {
+                    bail!(
+                        "data received in memory is over the limit of {} bytes",
+                        MEMORY_JOB_MAX_BYTES
+                    );
                 }
             }
         }
@@ -1736,6 +1953,12 @@ pub async fn handle_read_jobs(
     Ok(job_log)
 }
 
+/// Removes `path` and the directories below it when they hold no files. Links are removed,
+/// not followed.
+///
+/// A directory that still holds files stays, and that is not an error: the caller removed
+/// the files it wanted to remove before calling this. Any other failure to remove `path`
+/// itself is returned.
 pub fn remove_all_empty_dir(path: &Path) -> ResultType<()> {
     let fd = read_dir(path, true)?;
     for entry in fd.entries.iter() {
@@ -1744,13 +1967,36 @@ pub fn remove_all_empty_dir(path: &Path) -> ResultType<()> {
                 remove_all_empty_dir(&path.join(&entry.name)).ok();
             }
             Ok(FileType::DirLink) | Ok(FileType::FileLink) => {
-                std::fs::remove_file(path.join(&entry.name)).ok();
+                remove_link(&path.join(&entry.name)).ok();
             }
             _ => {}
         }
     }
-    std::fs::remove_dir(path).ok();
-    Ok(())
+    match std::fs::remove_dir(path) {
+        Err(err) if !is_dir_not_empty(&err) => Err(err.into()),
+        _ => Ok(()),
+    }
+}
+
+/// Removes a link without touching what it points to. On Windows a link to a directory is
+/// itself a directory and `remove_file` refuses it.
+fn remove_link(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(path).or_else(|_| std::fs::remove_dir(path))
+}
+
+fn is_dir_not_empty(err: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        // ERROR_DIR_NOT_EMPTY
+        err.raw_os_error() == Some(145)
+    }
+    #[cfg(not(windows))]
+    {
+        matches!(
+            err.raw_os_error(),
+            Some(libc::ENOTEMPTY) | Some(libc::EEXIST)
+        )
+    }
 }
 
 #[inline]
@@ -1969,6 +2215,7 @@ mod tests {
             "NUL.txt",
             "Aux.tar.gz",
             "COM1",
+            "COM0",
             "lpt9.log",
             "PRN ",
             "name.",
@@ -1982,7 +2229,6 @@ mod tests {
             "readme",
             ".hidden",
             "console.txt",
-            "COM0",
             "COM10",
             "LPT",
             "com.example.app",
@@ -2932,5 +3178,239 @@ mod tests {
         assert_eq!(next_block_id(0), 1);
         assert_eq!(next_block_id(41), 42);
         assert_eq!(next_block_id(u32::MAX), 1);
+    }
+
+    // ---- paths, job ids and limits (N-03, N-04, FT-11, FT-12, FT-15) ----
+
+    #[test]
+    fn restored_job_id_is_never_handed_out_again() {
+        // The counter is shared by every test of this process, so only relations are checked.
+        let restored = get_next_job_id() + 1000;
+        reserve_job_id(restored);
+        assert!(get_next_job_id() > restored);
+        // Reserving an id that is already behind the counter changes nothing.
+        let before = get_next_job_id();
+        reserve_job_id(1);
+        assert_eq!(get_next_job_id(), before + 1);
+        reserve_job_id(i32::MAX);
+    }
+
+    fn tree_with_files(prefix: &str, dirs: usize, files_per_dir: usize) -> TestTempDir {
+        let tmp = TestTempDir::new(prefix);
+        for dir in 0..dirs {
+            let path = tmp.join(&format!("d{}", dir));
+            std::fs::create_dir_all(&path).unwrap();
+            for file in 0..files_per_dir {
+                std::fs::write(path.join(format!("f{}", file)), b"x").unwrap();
+            }
+        }
+        tmp
+    }
+
+    #[test]
+    fn file_walk_stops_at_the_limit() {
+        let tmp = tree_with_files("rustdesk_fs_walk_limit", 4, 5);
+        let root = get_string(&tmp.path);
+
+        assert_eq!(get_recursive_files(&root, true).unwrap().len(), 20);
+        assert_eq!(
+            get_recursive_files_limited(&root, true, 20).unwrap().len(),
+            20
+        );
+        let err = get_recursive_files_limited(&root, true, 19).unwrap_err();
+        assert_eq!(too_many_entries(&err), Some(TooManyEntries { limit: 19 }));
+        let err = get_recursive_files_limited(&root, true, 0).unwrap_err();
+        assert_eq!(too_many_entries(&err), Some(TooManyEntries { limit: 0 }));
+        // Another failure is not mistaken for the limit.
+        let err =
+            get_recursive_files_limited(&get_string(&tmp.join("missing")), true, 5).unwrap_err();
+        assert_eq!(too_many_entries(&err), None);
+
+        let job = |limit| {
+            TransferJob::new_read_limited(
+                51,
+                JobType::Generic,
+                "peer".to_owned(),
+                DataSource::FilePath(tmp.path.clone()),
+                0,
+                true,
+                false,
+                true,
+                limit,
+            )
+        };
+        assert_eq!(job(20).unwrap().files().len(), 20);
+        assert!(too_many_entries(&job(19).unwrap_err()).is_some());
+    }
+
+    #[test]
+    fn empty_directory_walk_stops_at_the_limit() {
+        let tmp = tree_with_files("rustdesk_fs_empty_dirs_limit", 3, 1);
+        for dir in 0..4 {
+            std::fs::create_dir_all(tmp.join(&format!("empty{}", dir))).unwrap();
+        }
+        let root = get_string(&tmp.path);
+
+        // The root, three directories with a file and four empty ones are visited.
+        assert_eq!(get_empty_dirs_recursive(&root, true).unwrap().len(), 4);
+        assert_eq!(
+            get_empty_dirs_recursive_limited(&root, true, 8)
+                .unwrap()
+                .len(),
+            4
+        );
+        let err = get_empty_dirs_recursive_limited(&root, true, 7).unwrap_err();
+        assert_eq!(too_many_entries(&err), Some(TooManyEntries { limit: 7 }));
+    }
+
+    #[tokio::test]
+    async fn job_that_receives_into_memory_is_bounded() {
+        let mut job = TransferJob::new_write(
+            52,
+            JobType::Printer,
+            "peer".to_owned(),
+            DataSource::MemoryCursor(std::io::Cursor::new(Vec::new())),
+            0,
+            false,
+            true,
+            false,
+        );
+        job.write(data_block(52, 0, b"page")).await.unwrap();
+        assert!(!job.has_failed());
+        // As if the peer had already sent everything that is accepted.
+        job.finished_size = MEMORY_JOB_MAX_BYTES;
+        let err = job.write(data_block(52, 0, b"more")).await.unwrap_err();
+        assert_err_contains(err, "over the limit");
+        assert!(job.has_failed());
+    }
+
+    #[test]
+    fn windows_device_names_include_port_zero_and_superscript_digits() {
+        for name in [
+            "COM0",
+            "com0.txt",
+            "LPT0",
+            "COM9",
+            "LPT1",
+            "COM\u{b9}",
+            "lpt\u{b2}.log",
+            "COM\u{b3}",
+            "NUL",
+            "con.txt",
+            "a:b",
+            "name.",
+            "name ",
+        ] {
+            assert!(windows_component_unsafe(name), "{} must be refused", name);
+        }
+        for name in [
+            "COM",
+            "COM10",
+            "COMA",
+            "LPT",
+            "LPT00",
+            "COMPUTER.txt",
+            "com1x",
+            "console",
+            "nul1",
+            "a.b",
+        ] {
+            assert!(!windows_component_unsafe(name), "{} is a plain name", name);
+        }
+        assert!(windows_destination_unsafe(Path::new("/downloads/NUL")));
+        assert!(windows_destination_unsafe(Path::new("/downloads/x:stream")));
+        assert!(!windows_destination_unsafe(Path::new(
+            "/downloads/report.txt"
+        )));
+        assert!(!windows_destination_unsafe(Path::new("/")));
+    }
+
+    #[test]
+    fn local_destination_must_not_climb_out_of_its_folder() {
+        assert!(validate_local_destination("/home/user/Downloads/report.txt").is_ok());
+        assert!(validate_local_destination("relative/report.txt").is_ok());
+        assert!(validate_local_destination("/home/user/Downloads/../.ssh/keys").is_err());
+        assert!(validate_local_destination("../x").is_err());
+        assert!(validate_local_destination("").is_err());
+        assert!(validate_local_destination("a\0b").is_err());
+        // A name that only looks like a parent step is a name.
+        assert!(validate_local_destination("/home/user/Downloads/..x/a..b").is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn local_destination_is_checked_with_windows_rules() {
+        assert!(validate_local_destination(r"C:\Users\user\Downloads\report.txt").is_ok());
+        assert!(validate_local_destination(r"C:\Users\user\Downloads\..\..\x.bat").is_err());
+        assert!(validate_local_destination(r"C:\Users\user\Downloads\NUL").is_err());
+        assert!(validate_local_destination(r"C:\Users\user\Downloads\x.txt:stream").is_err());
+        let mut job = new_validation_job(53);
+        job.data_source = DataSource::FilePath(PathBuf::from(r"C:\Users\user\Downloads\COM0"));
+        let err = job
+            .set_files(vec![new_file_entry("")])
+            .expect_err("a device name as the destination of a single file");
+        assert_err_contains(err, "not a plain Windows file name");
+    }
+
+    #[tokio::test]
+    async fn second_job_to_the_same_destination_is_refused() {
+        let tmp = TestTempDir::new("rustdesk_fs_destination_claim");
+        std::fs::create_dir_all(&tmp.path).unwrap();
+        let mut first = write_job_for(54, &tmp.path, &[("x", 0)]);
+        let mut second = write_job_for(55, &tmp.path, &[("x", 0)]);
+        let other_dir = tmp.join("other");
+        let mut elsewhere = write_job_for(56, &other_dir, &[("x", 0)]);
+
+        first.claim_destination().unwrap();
+        // Asking again for the same job is not a second claim.
+        first.claim_destination().unwrap();
+        let err = second.claim_destination().unwrap_err();
+        assert_err_contains(err, "already writing to this destination");
+        elsewhere.claim_destination().unwrap();
+
+        // The destination is free again when the job that held it is gone.
+        drop(first);
+        second.claim_destination().unwrap();
+    }
+
+    #[test]
+    fn directory_with_only_links_and_empty_directories_is_removed() {
+        let tmp = TestTempDir::new("rustdesk_fs_remove_links");
+        let target = tmp.join("target");
+        let doomed = tmp.join("doomed");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("keep"), b"keep").unwrap();
+        std::fs::create_dir_all(doomed.join("empty").join("deeper")).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&target, doomed.join("dir-link")).unwrap();
+            std::os::unix::fs::symlink(target.join("keep"), doomed.join("file-link")).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            // Needs the privilege to create links; the test is still valid without them.
+            let _ = std::os::windows::fs::symlink_dir(&target, doomed.join("dir-link"));
+            let _ =
+                std::os::windows::fs::symlink_file(target.join("keep"), doomed.join("file-link"));
+        }
+
+        remove_all_empty_dir(&doomed).unwrap();
+
+        assert!(!doomed.exists(), "the directory is still there");
+        assert_eq!(std::fs::read(target.join("keep")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn directory_that_still_holds_a_file_stays_without_an_error() {
+        let tmp = TestTempDir::new("rustdesk_fs_remove_not_empty");
+        let dir = tmp.join("dir");
+        std::fs::create_dir_all(dir.join("empty")).unwrap();
+        std::fs::write(dir.join("kept.txt"), b"kept").unwrap();
+
+        remove_all_empty_dir(&dir).unwrap();
+
+        assert!(dir.join("kept.txt").exists());
+        assert!(!dir.join("empty").exists());
+        assert!(remove_all_empty_dir(&tmp.join("missing")).is_err());
     }
 }
