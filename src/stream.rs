@@ -1059,6 +1059,20 @@ impl Stream {
         }
     }
 
+    /// The largest serialized file message (a file action or a file response) this stream
+    /// carries, when that is less than any other message. `None` means no such limit.
+    ///
+    /// Over QUIC a larger file message is refused by `send`. Whoever builds a reply that can
+    /// grow with the user's data, such as a directory listing, checks this first and answers
+    /// with an error the peer can show.
+    pub fn file_message_limit(&self) -> Option<usize> {
+        match self {
+            #[cfg(feature = "quic-transport")]
+            Self::Quic(stream) => Some(stream.file_message_limit()),
+            _ => None,
+        }
+    }
+
     pub fn async_writer_progress(&self) -> Option<AsyncStreamProgressSnapshot> {
         match self {
             Self::Duplex(stream) => Some(stream.progress_snapshot()),
@@ -1096,6 +1110,17 @@ mod tests {
         task::{Context, Poll},
     };
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    #[tokio::test]
+    async fn only_a_quic_stream_limits_file_messages() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+        let local = tcp.local_addr().unwrap();
+        let stream = Stream::from(tcp, local);
+        assert_eq!(stream.file_message_limit(), None);
+        assert_eq!(stream.into_duplex(8).file_message_limit(), None);
+    }
 
     #[test]
     fn bulk_data_gets_a_bounded_share_of_the_outbox() {

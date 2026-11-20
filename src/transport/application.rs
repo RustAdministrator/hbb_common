@@ -1452,6 +1452,17 @@ impl QuicApplicationStream {
             || self.file.capacity() > FILE_OUTBOUND_BULK_RESERVE
     }
 
+    /// The largest serialized file message (a file action or a file response) this stream
+    /// carries. A sender checks this before it builds a large reply such as a directory
+    /// listing, so that it can answer with an error instead.
+    pub fn file_message_limit(&self) -> usize {
+        if self.raw_mode.load(Ordering::Acquire) {
+            MessageType::ApplicationRaw.max_payload_len()
+        } else {
+            MessageType::FileChunk.max_payload_len()
+        }
+    }
+
     pub fn enqueue_latest(&self, key: u64, payload: Bytes) -> crate::ResultType<()> {
         self.enqueue_with_latest_key(Some(key), payload)
     }
@@ -1588,6 +1599,20 @@ impl QuicApplicationStream {
             }
             class => {
                 let (sender, message_type) = reliable_sender(self, class);
+                if class == ApplicationClass::File && payload.len() > message_type.max_payload_len()
+                {
+                    // The writer cannot frame this message, and its failure closes the whole
+                    // connection. Refuse it here, where the caller can still answer its peer.
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "file message of {} bytes is above the {} bytes a QUIC file channel carries",
+                            payload.len(),
+                            message_type.max_payload_len()
+                        ),
+                    )
+                    .into());
+                }
                 sender
                     .try_send(ReliableOutbound {
                         message_type,
@@ -5441,5 +5466,91 @@ mod tests {
         assert!(client_stream
             .enqueue(Bytes::from(delta.write_to_bytes().unwrap()))
             .is_err());
+    }
+
+    /// A directory listing whose serialized message is exactly `size` bytes.
+    fn listing_message_of_size(size: usize) -> Message {
+        use crate::message_proto::{FileDirectory, FileEntry, FileResponse};
+        let entries = (0..(size.saturating_sub(4096)) / 32)
+            .map(|index| FileEntry {
+                name: format!("entry-{:020}", index),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let build = |padding: usize| {
+            let mut response = FileResponse::new();
+            response.set_dir(FileDirectory {
+                id: 1,
+                path: "p".repeat(padding),
+                entries: entries.clone(),
+                ..Default::default()
+            });
+            let mut message = Message::new();
+            message.set_file_response(response);
+            message
+        };
+        let mut padding = 1;
+        for _ in 0..16 {
+            let current = build(padding).compute_size() as usize;
+            if current == size {
+                return build(padding);
+            }
+            padding = (padding + size).saturating_sub(current).max(1);
+        }
+        panic!("cannot build a listing of {} bytes", size);
+    }
+
+    fn listing_entries(bytes: &[u8]) -> usize {
+        use crate::message_proto::{file_response, message};
+        match Message::parse_from_bytes(bytes).unwrap().union {
+            Some(message::Union::FileResponse(response)) => match response.union {
+                Some(file_response::Union::Dir(directory)) => directory.entries.len(),
+                other => panic!("unexpected file response: {:?}", other),
+            },
+            other => panic!("unexpected message: {:?}", other),
+        }
+    }
+
+    /// A listing above what the file channel carries used to be queued; the writer then failed
+    /// on it and closed the connection, which ended the session on a normal user action.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oversize_file_message_is_refused_and_the_connection_stays_usable() {
+        const LIMIT: usize = 1024 * 1024;
+        let Some((client_stream, server_stream)) = application_stream_pair().await else {
+            return;
+        };
+        let mut sender = crate::Stream::from_quic(server_stream);
+        let mut receiver = crate::Stream::from_quic(client_stream);
+        let too_large = listing_message_of_size(LIMIT + 1);
+        let largest = listing_message_of_size(LIMIT);
+        let expected_entries = listing_entries(&largest.write_to_bytes().unwrap());
+
+        let refused = sender.send(&too_large).await;
+        sender
+            .send(&largest)
+            .await
+            .expect("a listing of exactly the limit is accepted");
+        let received = tokio::time::timeout(Duration::from_secs(10), receiver.next())
+            .await
+            .expect("the connection must stay usable");
+        let bytes = received
+            .expect("the connection was closed")
+            .expect("the connection failed");
+
+        assert_eq!(listing_entries(&bytes), expected_entries);
+        assert!(
+            refused.is_err(),
+            "the oversize listing must be refused where the caller can still react"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_message_limit_is_reported_for_the_file_channel() {
+        let Some((client_stream, _server_stream)) = application_stream_pair().await else {
+            return;
+        };
+        assert_eq!(client_stream.file_message_limit(), 1024 * 1024);
+        let stream = crate::Stream::from_quic(client_stream);
+        assert_eq!(stream.file_message_limit(), Some(1024 * 1024));
     }
 }
