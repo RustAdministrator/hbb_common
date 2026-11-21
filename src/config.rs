@@ -3915,6 +3915,10 @@ pub mod keys {
     /// `N` lets an HTTP request go directly to the server, as before, when a proxy is
     /// configured but cannot be used. By default such a request fails instead.
     pub const OPTION_HTTP_PROXY_FAIL_CLOSED: &str = "http-proxy-fail-closed";
+    /// `N` makes the host build a new VP8, VP9 or AV1 encoder at every frame rate tier change
+    /// of the Movie profile, as before (it starts with a keyframe). By default the encoder is
+    /// kept: it takes the rate from the frame timestamps.
+    pub const OPTION_MOVIE_TIER_KEEPS_SOFTWARE_ENCODER: &str = "movie-tier-keeps-software-encoder";
     /// `off`, `warn` (default) or `enforce` for file clipboard messages that cross against
     /// the clipboard direction policy.
     pub const OPTION_FILE_CLIPBOARD_DIRECTION_CHECK: &str = "file-clipboard-direction-check";
@@ -4180,6 +4184,7 @@ pub mod keys {
         OPTION_ENABLE_TEXTURE_ENCODE,
         OPTION_VIDEO_RECOVERY_AFTER_KEYFRAME,
         OPTION_HTTP_PROXY_FAIL_CLOSED,
+        OPTION_MOVIE_TIER_KEEPS_SOFTWARE_ENCODER,
         OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS,
         OPTION_ALLOW_AUTO_UPDATE,
     ];
@@ -4348,6 +4353,7 @@ mod tests {
             keys::OPTION_ENABLE_TEXTURE_ENCODE,
             keys::OPTION_VIDEO_RECOVERY_AFTER_KEYFRAME,
             keys::OPTION_HTTP_PROXY_FAIL_CLOSED,
+            keys::OPTION_MOVIE_TIER_KEEPS_SOFTWARE_ENCODER,
         ] {
             assert!(keys::KEYS_SETTINGS.contains(&key), "{key}");
         }
