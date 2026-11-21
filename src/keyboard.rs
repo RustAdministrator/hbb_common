@@ -31,7 +31,7 @@ pub fn keyboard_family_from_preference(preference: &str) -> KeyboardFamily {
     } else if preference.eq_ignore_ascii_case("jis") {
         KeyboardFamily::Jis
     } else {
-        KeyboardFamily::Unknown
+        KeyboardFamily::KeyboardFamilyUnknown
     }
 }
 
@@ -41,7 +41,7 @@ pub fn resolve_keyboard_family(
     legacy_iso: bool,
 ) -> KeyboardFamily {
     let explicit = keyboard_family_from_preference(preference);
-    if explicit != KeyboardFamily::Unknown {
+    if explicit != KeyboardFamily::KeyboardFamilyUnknown {
         return explicit;
     }
     if matches!(
@@ -53,7 +53,7 @@ pub fn resolve_keyboard_family(
     if legacy_iso {
         KeyboardFamily::Iso
     } else {
-        KeyboardFamily::Unknown
+        KeyboardFamily::KeyboardFamilyUnknown
     }
 }
 
@@ -62,7 +62,7 @@ pub fn macos_keyboard_type(family: KeyboardFamily) -> Option<u32> {
         KeyboardFamily::Ansi => Some(40),
         KeyboardFamily::Iso => Some(41),
         KeyboardFamily::Jis => Some(42),
-        KeyboardFamily::Unknown => None,
+        KeyboardFamily::KeyboardFamilyUnknown => None,
     }
 }
 
@@ -71,7 +71,7 @@ pub fn keyboard_family_preference(family: KeyboardFamily) -> &'static str {
         KeyboardFamily::Ansi => "ansi",
         KeyboardFamily::Iso => "iso",
         KeyboardFamily::Jis => "jis",
-        KeyboardFamily::Unknown => "auto",
+        KeyboardFamily::KeyboardFamilyUnknown => "auto",
     }
 }
 
@@ -320,7 +320,7 @@ mod tests {
     #[test]
     fn validates_known_physical_keyboard_families() {
         for family in [
-            KeyboardFamily::Unknown,
+            KeyboardFamily::KeyboardFamilyUnknown,
             KeyboardFamily::Ansi,
             KeyboardFamily::Iso,
             KeyboardFamily::Jis,
@@ -357,7 +357,7 @@ mod tests {
             KeyEvent::parse_from_bytes(&KeyEvent::new().write_to_bytes().unwrap()).unwrap();
         assert_eq!(
             key_event.keyboard_family.enum_value(),
-            Ok(KeyboardFamily::Unknown)
+            Ok(KeyboardFamily::KeyboardFamilyUnknown)
         );
         assert_eq!(key_event.usb_hid_usage, 0);
 
@@ -365,7 +365,7 @@ mod tests {
             PhysicalKey::parse_from_bytes(&PhysicalKey::new().write_to_bytes().unwrap()).unwrap();
         assert_eq!(
             physical_key.keyboard_family.enum_value(),
-            Ok(KeyboardFamily::Unknown)
+            Ok(KeyboardFamily::KeyboardFamilyUnknown)
         );
 
         let capabilities = KeyboardCapabilities::parse_from_bytes(
@@ -380,11 +380,11 @@ mod tests {
         assert_eq!(keyboard_family_from_preference("JiS"), KeyboardFamily::Jis);
         assert_eq!(
             keyboard_family_from_preference("auto"),
-            KeyboardFamily::Unknown
+            KeyboardFamily::KeyboardFamilyUnknown
         );
         assert_eq!(
             keyboard_family_from_preference("other"),
-            KeyboardFamily::Unknown
+            KeyboardFamily::KeyboardFamilyUnknown
         );
 
         assert_eq!(
@@ -396,22 +396,28 @@ mod tests {
             KeyboardFamily::Jis
         );
         assert_eq!(
-            resolve_keyboard_family("", KeyboardFamily::Unknown, true),
+            resolve_keyboard_family("", KeyboardFamily::KeyboardFamilyUnknown, true),
             KeyboardFamily::Iso
         );
         assert_eq!(
-            resolve_keyboard_family("other", KeyboardFamily::Unknown, false),
-            KeyboardFamily::Unknown
+            resolve_keyboard_family("other", KeyboardFamily::KeyboardFamilyUnknown, false),
+            KeyboardFamily::KeyboardFamilyUnknown
         );
 
         assert_eq!(macos_keyboard_type(KeyboardFamily::Ansi), Some(40));
         assert_eq!(macos_keyboard_type(KeyboardFamily::Iso), Some(41));
         assert_eq!(macos_keyboard_type(KeyboardFamily::Jis), Some(42));
-        assert_eq!(macos_keyboard_type(KeyboardFamily::Unknown), None);
+        assert_eq!(
+            macos_keyboard_type(KeyboardFamily::KeyboardFamilyUnknown),
+            None
+        );
         assert_eq!(keyboard_family_preference(KeyboardFamily::Ansi), "ansi");
         assert_eq!(keyboard_family_preference(KeyboardFamily::Iso), "iso");
         assert_eq!(keyboard_family_preference(KeyboardFamily::Jis), "jis");
-        assert_eq!(keyboard_family_preference(KeyboardFamily::Unknown), "auto");
+        assert_eq!(
+            keyboard_family_preference(KeyboardFamily::KeyboardFamilyUnknown),
+            "auto"
+        );
     }
 
     #[test]

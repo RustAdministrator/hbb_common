@@ -3634,6 +3634,18 @@ pub fn udp_source_check_mode() -> RolloutMode {
     )
 }
 
+/// Default of `file-clipboard-direction-check`: what to do with a file clipboard message
+/// that crosses against the clipboard direction policy. The policy has only covered text so
+/// far, so this starts by logging.
+pub const FILE_CLIPBOARD_DIRECTION_CHECK_DEFAULT: RolloutMode = RolloutMode::Warn;
+
+pub fn file_clipboard_direction_check_mode() -> RolloutMode {
+    RolloutMode::parse(
+        &Config::get_option(keys::OPTION_FILE_CLIPBOARD_DIRECTION_CHECK),
+        FILE_CLIPBOARD_DIRECTION_CHECK_DEFAULT,
+    )
+}
+
 pub mod keys {
     pub const OPTION_VIEW_ONLY: &str = "view_only";
     pub const OPTION_SHOW_MONITORS_TOOLBAR: &str = "show_monitors_toolbar";
@@ -3664,6 +3676,9 @@ pub mod keys {
     pub const OPTION_CUSTOM_FPS: &str = "custom-fps";
     pub const OPTION_CUSTOM_FPS_MODE: &str = "custom-fps-mode";
     pub const OPTION_VIDEO_PROFILE: &str = "video-profile";
+    /// `N` switches off the pacing of decoded frames on a desktop viewer in the Movie profile
+    /// (frames are then shown as soon as they are decoded, as before). On by default.
+    pub const OPTION_MOVIE_PLAYOUT_PACING: &str = "movie-playout-pacing";
     pub const OPTION_CODEC_PREFERENCE: &str = "codec-preference";
     pub const OPTION_ENCODER_CODEC_PREFERENCE: &str = "encoder-codec-preference";
     pub const OPTION_CAPTURE_BACKEND: &str = "capture-backend";
@@ -3817,6 +3832,19 @@ pub mod keys {
     /// `off`, `warn` or `enforce` (default) for rendezvous datagrams that do
     /// not come from the rendezvous server's address.
     pub const OPTION_UDP_SOURCE_CHECK: &str = "udp-source-check";
+    /// `N` switches off the host's reaction to video datagrams that the transport keeps
+    /// refusing in the Movie profile (it lowers the bitrate before frames are lost). On by
+    /// default.
+    pub const OPTION_VIDEO_ADMISSION_BACKOFF: &str = "video-admission-backoff";
+    /// `N` makes the Windows capture helpers hand frames to the service through one buffer,
+    /// as before (a frame can then be put together from two captures). Two buffers by default.
+    pub const OPTION_CAPTURE_FRAME_SLOTS: &str = "capture-frame-slots";
+    /// `N` keeps a Windows host built with `vram` from encoding out of a GPU texture; capture
+    /// stays as it is and the hardware encoder is fed through RAM. On by default.
+    pub const OPTION_ENABLE_TEXTURE_ENCODE: &str = "enable-texture-encode";
+    /// `off`, `warn` (default) or `enforce` for file clipboard messages that cross against
+    /// the clipboard direction policy.
+    pub const OPTION_FILE_CLIPBOARD_DIRECTION_CHECK: &str = "file-clipboard-direction-check";
     pub const OPTION_SHOW_VIRTUAL_MOUSE: &str = "show-virtual-mouse";
     // joystick is the virtual mouse.
     // So `OPTION_SHOW_VIRTUAL_MOUSE` should also be set if `OPTION_SHOW_VIRTUAL_JOYSTICK` is set.
@@ -3941,6 +3969,7 @@ pub mod keys {
     ];
     // DEFAULT_LOCAL_SETTINGS, OVERWRITE_LOCAL_SETTINGS
     pub const KEYS_LOCAL_SETTINGS: &[&str] = &[
+        OPTION_MOVIE_PLAYOUT_PACING,
         OPTION_THEME,
         OPTION_LANGUAGE,
         OPTION_ENABLE_CONFIRM_CLOSING_TABS,
@@ -4072,6 +4101,10 @@ pub mod keys {
         OPTION_ALLOW_SERVER_PERMISSION_GRANTS,
         OPTION_RELAY_SECURE_POLICY,
         OPTION_UDP_SOURCE_CHECK,
+        OPTION_FILE_CLIPBOARD_DIRECTION_CHECK,
+        OPTION_VIDEO_ADMISSION_BACKOFF,
+        OPTION_CAPTURE_FRAME_SLOTS,
+        OPTION_ENABLE_TEXTURE_ENCODE,
         OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS,
         OPTION_ALLOW_AUTO_UPDATE,
     ];
@@ -4211,6 +4244,7 @@ mod tests {
         }
         assert_eq!(RELAY_SECURE_POLICY_DEFAULT, RolloutMode::Enforce);
         assert_eq!(UDP_SOURCE_CHECK_DEFAULT, RolloutMode::Enforce);
+        assert_eq!(FILE_CLIPBOARD_DIRECTION_CHECK_DEFAULT, RolloutMode::Warn);
     }
 
     #[test]
@@ -4233,6 +4267,10 @@ mod tests {
             keys::OPTION_ALLOW_SERVER_PERMISSION_GRANTS,
             keys::OPTION_RELAY_SECURE_POLICY,
             keys::OPTION_UDP_SOURCE_CHECK,
+            keys::OPTION_FILE_CLIPBOARD_DIRECTION_CHECK,
+            keys::OPTION_VIDEO_ADMISSION_BACKOFF,
+            keys::OPTION_CAPTURE_FRAME_SLOTS,
+            keys::OPTION_ENABLE_TEXTURE_ENCODE,
         ] {
             assert!(keys::KEYS_SETTINGS.contains(&key), "{key}");
         }

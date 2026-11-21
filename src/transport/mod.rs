@@ -2,6 +2,7 @@ pub mod adaptation;
 pub mod audio_datagram;
 pub mod clipboard;
 pub mod configuration;
+pub mod file_rate;
 pub mod file_transfer;
 pub mod input;
 pub mod pairing;
