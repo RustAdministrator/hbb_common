@@ -3842,6 +3842,10 @@ pub mod keys {
     /// `N` keeps a Windows host built with `vram` from encoding out of a GPU texture; capture
     /// stays as it is and the hardware encoder is fed through RAM. On by default.
     pub const OPTION_ENABLE_TEXTURE_ENCODE: &str = "enable-texture-encode";
+    /// `N` makes the host wait three refresh cooldowns, as before, before it sends another
+    /// keyframe to a viewer that lost a frame again right behind a recovery keyframe. One
+    /// cooldown by default.
+    pub const OPTION_VIDEO_RECOVERY_AFTER_KEYFRAME: &str = "video-recovery-after-keyframe";
     /// `off`, `warn` (default) or `enforce` for file clipboard messages that cross against
     /// the clipboard direction policy.
     pub const OPTION_FILE_CLIPBOARD_DIRECTION_CHECK: &str = "file-clipboard-direction-check";
@@ -4105,6 +4109,7 @@ pub mod keys {
         OPTION_VIDEO_ADMISSION_BACKOFF,
         OPTION_CAPTURE_FRAME_SLOTS,
         OPTION_ENABLE_TEXTURE_ENCODE,
+        OPTION_VIDEO_RECOVERY_AFTER_KEYFRAME,
         OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS,
         OPTION_ALLOW_AUTO_UPDATE,
     ];
@@ -4271,6 +4276,7 @@ mod tests {
             keys::OPTION_VIDEO_ADMISSION_BACKOFF,
             keys::OPTION_CAPTURE_FRAME_SLOTS,
             keys::OPTION_ENABLE_TEXTURE_ENCODE,
+            keys::OPTION_VIDEO_RECOVERY_AFTER_KEYFRAME,
         ] {
             assert!(keys::KEYS_SETTINGS.contains(&key), "{key}");
         }
