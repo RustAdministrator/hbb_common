@@ -12,7 +12,6 @@ use std::{
 use anyhow::Result;
 use bytes::Bytes;
 use rand::Rng;
-use regex::Regex;
 use serde as de;
 use serde_derive::{Deserialize, Serialize};
 use serde_json;
@@ -2349,12 +2348,66 @@ impl Config {
 }
 
 const PEERS: &str = "peers";
+/// Prefix of a peer file named by the standard base64 of its id.
+const PEER_FILE_BASE64: &str = "base64_";
+/// Prefix of a peer file named by the URL-safe base64 of its id, for an id whose standard
+/// base64 holds a `/`.
+const PEER_FILE_BASE64_URL_SAFE: &str = "base64url_";
+
+/// A character that a file name cannot hold on one of the platforms.
+fn peer_id_char_needs_encoding(c: char) -> bool {
+    matches!(c, '<' | '>' | ':' | '/' | '\\' | '|' | '?' | '*')
+}
+
+/// The name of the file of a peer, without the extension. An id that a file name cannot hold is
+/// base64-encoded. The standard alphabet is kept wherever it gives a file name, so that every
+/// file of an earlier version keeps its name; where it holds a `/` (the file would go into a
+/// subdirectory, and the peer would not be listed) the URL-safe alphabet is used. `.` and `..`
+/// name directories, and the empty id no file at all, so they are encoded too.
+fn peer_file_stem(id: &str) -> String {
+    let plain =
+        !id.is_empty() && id != "." && id != ".." && !id.chars().any(peer_id_char_needs_encoding);
+    if plain {
+        return id.to_owned();
+    }
+    let standard = base64::encode(id, base64::Variant::Original);
+    if !id.is_empty() && !standard.contains('/') {
+        return format!("{PEER_FILE_BASE64}{standard}");
+    }
+    format!(
+        "{PEER_FILE_BASE64_URL_SAFE}{}",
+        base64::encode(id, base64::Variant::UrlSafeNoPadding)
+    )
+}
+
+/// The id of a peer from the name of its file, without the extension.
+fn peer_id_from_file_stem(stem: String) -> String {
+    if let Some(encoded) = stem.strip_prefix(PEER_FILE_BASE64_URL_SAFE) {
+        let decoded =
+            base64::decode(encoded, base64::Variant::UrlSafeNoPadding).unwrap_or_default();
+        return String::from_utf8_lossy(&decoded).into_owned();
+    }
+    if stem.starts_with(PEER_FILE_BASE64) && stem.len() != PEER_FILE_BASE64.len() {
+        let decoded = base64::decode(&stem[PEER_FILE_BASE64.len()..], base64::Variant::Original)
+            .unwrap_or_default();
+        return String::from_utf8_lossy(&decoded).into_owned();
+    }
+    stem
+}
 
 impl PeerConfig {
     pub fn load(id: &str) -> PeerConfig {
         let _lock = CONFIG.read().unwrap();
-        let mut config: PeerConfig = load_path(Self::path(id));
-        let mut store = false;
+        let path = Self::path(id);
+        // A file under the name an earlier version gave it is read, stored under the current
+        // name and then removed.
+        let legacy = if path.exists() {
+            None
+        } else {
+            Self::legacy_path(id).filter(|legacy| legacy.exists())
+        };
+        let mut config: PeerConfig = load_path(legacy.clone().unwrap_or(path));
+        let mut store = legacy.is_some();
         let (password, _, store2) = decrypt_vec_or_original(&config.password, PASSWORD_ENC_VERSION);
         config.password = password;
         store = store || store2;
@@ -2367,6 +2420,11 @@ impl PeerConfig {
         }
         if store {
             config.store_(id);
+        }
+        if let Some(legacy) = legacy {
+            if Self::path(id).exists() {
+                Self::remove_legacy_file(&legacy);
+            }
         }
         config
     }
@@ -2410,6 +2468,9 @@ impl PeerConfig {
     }
 
     pub fn remove_result(id: &str) -> crate::ResultType<bool> {
+        if let Some(legacy) = Self::legacy_path(id).filter(|legacy| legacy.exists()) {
+            Self::remove_legacy_file(&legacy);
+        }
         match fs::remove_file(Self::path(id)) {
             Ok(()) => Ok(true),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -2418,22 +2479,34 @@ impl PeerConfig {
     }
 
     fn path(id: &str) -> PathBuf {
-        //If the id contains invalid chars, encode it
-        let forbidden_paths = Regex::new(r".*[<>:/\\|\?\*].*");
-        let path: PathBuf;
-        if let Ok(forbidden_paths) = forbidden_paths {
-            let id_encoded = if forbidden_paths.is_match(id) {
-                "base64_".to_string() + base64::encode(id, base64::Variant::Original).as_str()
-            } else {
-                id.to_string()
-            };
-            path = [PEERS, id_encoded.as_str()].iter().collect();
-        } else {
-            log::warn!("Regex create failed: {:?}", forbidden_paths.err());
-            // fallback for failing to create this regex.
-            path = [PEERS, id.replace(":", "_").as_str()].iter().collect();
-        }
+        let path: PathBuf = [PEERS, peer_file_stem(id).as_str()].iter().collect();
         Config::with_extension(Config::path(path))
+    }
+
+    /// Where an earlier version put the file of this id, when that differs from `path`: an id
+    /// whose name in the standard base64 alphabet held a `/` was stored in a subdirectory.
+    fn legacy_path(id: &str) -> Option<PathBuf> {
+        if !id.chars().any(peer_id_char_needs_encoding) {
+            return None;
+        }
+        let legacy = base64::encode(id, base64::Variant::Original);
+        if !legacy.contains('/') {
+            return None;
+        }
+        let path: PathBuf = [PEERS, format!("{PEER_FILE_BASE64}{legacy}").as_str()]
+            .iter()
+            .collect();
+        Some(Config::with_extension(Config::path(path)))
+    }
+
+    fn remove_legacy_file(legacy: &Path) {
+        fs::remove_file(legacy).ok();
+        // The subdirectory it was in, if that is empty now; never the peers directory.
+        if let Some(directory) = legacy.parent() {
+            if directory != Config::path(PEERS) {
+                fs::remove_dir(directory).ok();
+            }
+        }
     }
 
     // The number of peers to load in the first round when showing the peers card list in the main window.
@@ -2468,14 +2541,7 @@ impl PeerConfig {
                         .unwrap_or("")
                         .to_owned();
 
-                    let id_decoded_string = if id.starts_with("base64_") && id.len() != 7 {
-                        let id_decoded =
-                            base64::decode(&id[7..], base64::Variant::Original).unwrap_or_default();
-                        String::from_utf8_lossy(&id_decoded).as_ref().to_owned()
-                    } else {
-                        id
-                    };
-                    (id_decoded_string, p)
+                    (peer_id_from_file_stem(id), p)
                 })
                 .filter(|(id, _)| {
                     let Some(filters) = id_filters else {
@@ -2584,7 +2650,7 @@ impl PeerConfig {
     }
 
     pub fn exists(id: &str) -> bool {
-        Self::path(id).exists()
+        Self::path(id).exists() || Self::legacy_path(id).is_some_and(|legacy| legacy.exists())
     }
 
     serde_field_string!(
@@ -5163,5 +5229,108 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    /// A peer config with an informed platform, so that the listing keeps it.
+    fn listed_peer_config() -> PeerConfig {
+        let mut cfg = PeerConfig::default();
+        cfg.info.platform = "Linux".to_string();
+        cfg
+    }
+
+    /// The file of a peer is named after its id, base64-encoded when the id holds a character
+    /// that a file name cannot. The standard alphabet has `/`: for an id such as `ab?cd` the
+    /// file went into a subdirectory, and the peer vanished from the list. `.` and `..` named
+    /// the directory itself.
+    #[test]
+    fn every_peer_id_gets_a_file_of_its_own_in_the_peers_directory() {
+        let peers = Config::path(PEERS);
+        for id in ["ab?cd", "x?y?z/w", ".", ".."] {
+            let path = PeerConfig::path(id);
+            assert_eq!(
+                path.parent(),
+                Some(peers.as_path()),
+                "{:?} -> {:?}",
+                id,
+                path
+            );
+            assert!(
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".toml") && name != ".toml"),
+                "{:?} -> {:?}",
+                id,
+                path
+            );
+        }
+        let id = "r6?test-peer-list";
+        PeerConfig::remove(id);
+        listed_peer_config().store(id);
+        let listed = PeerConfig::peers(Some(vec![id.to_string()]));
+        PeerConfig::remove(id);
+        assert_eq!(
+            listed
+                .iter()
+                .map(|(listed, _, _)| listed.as_str())
+                .collect::<Vec<_>>(),
+            vec![id]
+        );
+    }
+
+    /// Every file an earlier version could list keeps its name: plain ids, and ids whose
+    /// standard base64 has no `/`. Both kinds of encoded names are read back as the id.
+    #[test]
+    fn peer_file_names_of_earlier_versions_are_kept_and_both_encodings_are_read() {
+        assert_eq!(peer_file_stem("123456789"), "123456789");
+        assert_eq!(
+            peer_file_stem("192.168.1.2:21118"),
+            "base64_MTkyLjE2OC4xLjI6MjExMTg="
+        );
+        assert_eq!(peer_file_stem("ab?cd"), "base64url_YWI_Y2Q");
+        assert_eq!(peer_file_stem(".."), "base64_Li4=");
+        assert_eq!(peer_file_stem(""), "base64url_");
+        for id in [
+            "123456789",
+            "192.168.1.2:21118",
+            "ab?cd",
+            "x?y?z/w",
+            ".",
+            "..",
+            "",
+        ] {
+            assert_eq!(peer_id_from_file_stem(peer_file_stem(id)), id, "{:?}", id);
+        }
+        assert_eq!(peer_id_from_file_stem("base64_".to_string()), "base64_");
+    }
+
+    /// A peer stored by an earlier version in a subdirectory: its settings are found again,
+    /// moved under the current name, and the peer is listed.
+    #[test]
+    fn peer_file_in_the_subdirectory_of_an_earlier_version_is_moved() {
+        let id = "r6?test-legacy-peer";
+        PeerConfig::remove(id);
+        let legacy = PeerConfig::legacy_path(id).expect("this id had a subdirectory");
+        assert_ne!(legacy.parent(), Some(Config::path(PEERS).as_path()));
+        let mut cfg = listed_peer_config();
+        cfg.view_style = "adaptive".to_string();
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, toml::to_string(&cfg).unwrap()).unwrap();
+        assert!(PeerConfig::exists(id));
+
+        let loaded = PeerConfig::load(id);
+        assert_eq!(loaded.view_style, "adaptive");
+        assert!(
+            PeerConfig::path(id).exists(),
+            "not stored under the current name"
+        );
+        assert!(!legacy.exists(), "the old file is still there");
+        assert!(
+            !legacy.parent().unwrap().exists(),
+            "the empty subdirectory is still there"
+        );
+        let listed = PeerConfig::peers(Some(vec![id.to_string()]));
+        PeerConfig::remove(id);
+        assert_eq!(listed.len(), 1);
+        assert!(!PeerConfig::exists(id));
     }
 }
