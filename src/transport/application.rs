@@ -2820,6 +2820,49 @@ async fn run_audio_writer(
     }
 }
 
+/// Hands every audio packet that is due to the session, with the format message before the
+/// first one of a new format. `false` when the session is gone.
+async fn deliver_ready_audio(
+    receiver: &mut QuicDatagramReceiver,
+    inbound: &mpsc::Sender<Result<BytesMut, Error>>,
+    received_audio_format: &mut Option<(u32, u8)>,
+) -> bool {
+    while let Some(item) = receiver.pop_audio(Instant::now()) {
+        match item {
+            AudioPlayoutItem::Packet(packet) => {
+                let format = (packet.metadata.sample_rate_hz, packet.metadata.channels);
+                if *received_audio_format != Some(format) {
+                    let format_message = audio_format_message(format.0, format.1);
+                    if inbound
+                        .send(Ok(BytesMut::from(format_message.as_slice())))
+                        .await
+                        .is_err()
+                    {
+                        return false;
+                    }
+                    *received_audio_format = Some(format);
+                }
+                if validate_datagram_application_message(
+                    ApplicationClassTag::Audio,
+                    &packet.payload,
+                )
+                .is_ok()
+                    && inbound
+                        .send(Ok(BytesMut::from(packet.payload.as_slice())))
+                        .await
+                        .is_err()
+                {
+                    return false;
+                }
+            }
+            AudioPlayoutItem::PacketLoss { sequence_number } => {
+                log::debug!("QUIC audio packet loss: sequence={sequence_number}");
+            }
+        }
+    }
+    true
+}
+
 async fn run_datagram_reader(
     mut receiver: QuicDatagramReceiver,
     inbound: mpsc::Sender<Result<BytesMut, Error>>,
@@ -2845,6 +2888,12 @@ async fn run_datagram_reader(
                 }
             }
             _ = video_expiry.tick() => {
+                // The last packets of a burst wait for the playout delay; nothing arrives to
+                // ask for them again.
+                if !deliver_ready_audio(&mut receiver, &inbound, &mut received_audio_format).await
+                {
+                    return;
+                }
                 let outcome = receiver.expire_video(Instant::now());
                 if (keyframe_barrier
                     || outcome.dropped_frames > 0
@@ -2890,38 +2939,8 @@ async fn run_datagram_reader(
                 }
             }
             DatagramReceiveEvent::AudioAccepted => {
-                while let Some(item) = receiver.pop_audio(Instant::now()) {
-                    match item {
-                        AudioPlayoutItem::Packet(packet) => {
-                            let format = (packet.metadata.sample_rate_hz, packet.metadata.channels);
-                            if received_audio_format != Some(format) {
-                                let format_message = audio_format_message(format.0, format.1);
-                                if inbound
-                                    .send(Ok(BytesMut::from(format_message.as_slice())))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                                received_audio_format = Some(format);
-                            }
-                            if validate_datagram_application_message(
-                                ApplicationClassTag::Audio,
-                                &packet.payload,
-                            )
-                            .is_ok()
-                                && inbound
-                                    .send(Ok(BytesMut::from(packet.payload.as_slice())))
-                                    .await
-                                    .is_err()
-                            {
-                                return;
-                            }
-                        }
-                        AudioPlayoutItem::PacketLoss { sequence_number } => {
-                            log::debug!("QUIC audio packet loss: sequence={sequence_number}");
-                        }
-                    }
+                if !deliver_ready_audio(&mut receiver, &inbound, &mut received_audio_format).await {
+                    return;
                 }
             }
             DatagramReceiveEvent::ApplicationMouse(Some((_movement, payload))) => {
@@ -6278,5 +6297,55 @@ mod tests {
             recovery.lock().unwrap().observe(frame(12, false), true),
             VideoReceiveDecision::Accept
         );
+    }
+
+    /// A burst of sound that ends: the last packets wait in the jitter buffer for the playout
+    /// delay, but the buffer was only asked when a packet arrived. With nothing arriving after
+    /// the burst, those packets were never played. Two packets, then silence: both must reach
+    /// the session within a few ticks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn last_audio_packets_of_a_burst_are_delivered_without_a_next_packet() {
+        let Some((client_stream, mut server_stream)) = application_stream_pair().await else {
+            return;
+        };
+        let mut format = Message::new();
+        let mut misc = Misc::new();
+        misc.set_audio_format(AudioFormat {
+            sample_rate: 48_000,
+            channels: 2,
+            ..Default::default()
+        });
+        format.set_misc(misc);
+        client_stream
+            .enqueue(Bytes::from(format.write_to_bytes().unwrap()))
+            .unwrap();
+        for value in 1..=2u8 {
+            let mut audio = Message::new();
+            audio.set_audio_frame(AudioFrame {
+                data: Bytes::from(vec![value; 80]),
+                ..Default::default()
+            });
+            client_stream
+                .enqueue(Bytes::from(audio.write_to_bytes().unwrap()))
+                .unwrap();
+        }
+        let mut delivered = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_millis(300), async {
+            while delivered.len() < 2 {
+                let bytes = server_stream.next().await.unwrap().unwrap();
+                if let Ok(message) = Message::parse_from_bytes(&bytes) {
+                    if let Some(message::Union::AudioFrame(frame)) = message.union {
+                        delivered.push(frame.data[0]);
+                    }
+                }
+            }
+        })
+        .await;
+        assert_eq!(
+            delivered,
+            vec![1, 2],
+            "audio packets still held after the burst"
+        );
+        drop(client_stream);
     }
 }
