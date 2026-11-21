@@ -834,4 +834,63 @@ mod test {
         assert_eq!(get_version_number("1.1.11-1"), 1001111);
         assert_eq!(get_version_number("1.2.3"), 1002030);
     }
+
+    /// The fingerprint cache is one `static mut HashMap`, and the update checks call
+    /// `get_fingerprint` from threads of their own. Two inserts at once into a `HashMap` are a
+    /// data race: here many threads ask for many different parameter sets at the same time,
+    /// and every thread must get the same answer for the same set.
+    #[test]
+    fn fingerprints_asked_for_from_many_threads_at_once_are_right() {
+        use crate::fingerprint::get_fingerprint;
+        let names = [
+            "eol",
+            "endianness",
+            "brand",
+            "speed_max",
+            "cores",
+            "physical_cores",
+            "mem_total",
+            "platform",
+            "arch",
+            "id",
+            "addr",
+        ];
+        let subset = |mask: u32| -> Vec<String> {
+            names
+                .iter()
+                .enumerate()
+                .filter(|(bit, _)| mask & (1 << bit) != 0)
+                .map(|(_, name)| name.to_string())
+                .collect()
+        };
+        // The first call fills the system information and creates the cache.
+        let _ = get_fingerprint(Some(subset(1)), None);
+        let masks: Vec<u32> = (2..(1u32 << names.len())).collect();
+        let answers: Vec<Vec<(u32, Vec<u8>)>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8u32)
+                .map(|worker| {
+                    let masks = &masks;
+                    scope.spawn(move || {
+                        let mut seen = Vec::new();
+                        for index in 0..masks.len() {
+                            // Each worker walks the masks in its own order.
+                            let mask = masks[(index * 7 + worker as usize * 131) % masks.len()];
+                            seen.push((mask, get_fingerprint(Some(subset(mask)), None)));
+                        }
+                        seen
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect()
+        });
+        // Every worker got the same answer for the same parameters.
+        let mut first = std::collections::HashMap::new();
+        for (mask, fingerprint) in answers.into_iter().flatten() {
+            let expected = first.entry(mask).or_insert_with(|| fingerprint.clone());
+            assert_eq!(&fingerprint, expected, "mask {:#x}", mask);
+        }
+    }
 }

@@ -192,7 +192,10 @@ pub struct FingerprintingInfo {
 
 static mut FINGERPRINTING_INFO: Option<FingerprintingInfo> = None;
 static INIT: Once = Once::new();
-static mut CACHED_FINGERPRINTS: Option<HashMap<String, Vec<u8>>> = None;
+/// Fingerprints computed so far, by their parameters. The update checks ask from threads of
+/// their own, so the map is behind a lock; `None` until the system information is in.
+static CACHED_FINGERPRINTS: std::sync::Mutex<Option<HashMap<String, Vec<u8>>>> =
+    std::sync::Mutex::new(None);
 
 impl FingerprintingInfo {
     fn new() -> Self {
@@ -246,7 +249,7 @@ pub fn get_fingerprinting_info() -> FingerprintingInfo {
     unsafe {
         INIT.call_once(|| {
             FINGERPRINTING_INFO = Some(FingerprintingInfo::new());
-            CACHED_FINGERPRINTS = Some(HashMap::new());
+            *CACHED_FINGERPRINTS.lock().unwrap() = Some(HashMap::new());
         });
         #[allow(static_mut_refs)]
         FINGERPRINTING_INFO.clone().unwrap_or_default()
@@ -279,20 +282,21 @@ pub fn get_fingerprint(only: Option<Vec<String>>, except: Option<Vec<String>>) -
 
     let cache_key = parameters.join("");
 
-    unsafe {
-        #[allow(static_mut_refs)]
-        if let Some(cache) = &mut CACHED_FINGERPRINTS {
-            if let Some(fingerprint) = cache.get(&cache_key) {
-                return fingerprint.clone();
-            }
-
-            let fingerprint = calculate_fingerprint(&parameters);
-            cache.insert(cache_key, fingerprint.clone());
-            fingerprint
-        } else {
-            calculate_fingerprint(&parameters)
-        }
+    let cached = CACHED_FINGERPRINTS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|cache| cache.get(&cache_key).cloned());
+    if let Some(fingerprint) = cached {
+        return fingerprint;
     }
+    // Not under the lock: the first computation fills the system information, and that
+    // creates the cache.
+    let fingerprint = calculate_fingerprint(&parameters);
+    if let Some(cache) = CACHED_FINGERPRINTS.lock().unwrap().as_mut() {
+        cache.insert(cache_key, fingerprint.clone());
+    }
+    fingerprint
 }
 
 struct Sha512Hasher {
