@@ -643,6 +643,8 @@ impl VideoEpochHoldback {
 #[derive(Clone, Copy, Debug, Default)]
 struct VideoReceiveState {
     last_frame_id: u64,
+    /// The keyframe the stream is decoded from now; zero before the first one.
+    keyframe_id: u64,
     awaiting_keyframe: bool,
     codec: Option<VideoCodec>,
 }
@@ -744,6 +746,7 @@ impl VideoReceiveRecovery {
             let state = self.streams.entry(info.key).or_default();
             state.codec = Some(info.codec);
             state.last_frame_id = info.frame_id;
+            state.keyframe_id = info.frame_id;
             state.awaiting_keyframe = false;
             return VideoReceiveDecision::Accept;
         }
@@ -787,6 +790,26 @@ impl VideoReceiveRecovery {
         if self.streams.len() <= 1 {
             self.mark_reference_loss();
         }
+    }
+
+    /// Whether a frame lost in reassembly can be one the picture decoded now depends on.
+    ///
+    /// `reference_keyframe_id` is the id of the keyframe the lost delta followed, where the
+    /// sender puts it on the wire. The report of a loss can come after the keyframe that
+    /// repaired it: a frame lost before the keyframe the one stream is decoded from now took
+    /// nothing from the picture, and stopping the stream for it would freeze a picture that
+    /// has just recovered. A frame that follows a keyframe still on its way is found by the
+    /// gap in the frame ids once that keyframe is here.
+    fn unattributed_loss_is_current(&self, reference_keyframe_id: Option<u64>) -> bool {
+        let Some(reference_keyframe_id) = reference_keyframe_id else {
+            return true;
+        };
+        if self.streams.len() != 1 {
+            return true;
+        }
+        self.streams.values().next().map_or(true, |state| {
+            state.keyframe_id == 0 || state.keyframe_id == reference_keyframe_id
+        })
     }
 
     fn mark_stream_reference_loss(&mut self, key: VideoStreamKey) {
@@ -3156,14 +3179,26 @@ fn handle_video_outcome(
         .video_reassembly_last_frame_fragments
         .store(video_stats.last_frame_fragments, Ordering::Relaxed);
     let _delivery_guard = metrics.video_delivery_lock.lock().unwrap();
-    let strict_reassembly_loss = outcome.dropped_frames > 0
+    // With the keyframe barrier a delta carries the id of the keyframe it follows where a
+    // frame without the barrier, and a keyframe, carries its timestamp.
+    let stale_reassembly_loss = keyframe_barrier
+        && outcome.dropped_frames > 0
+        && !outcome.dropped_keyframe
+        && !recovery
+            .lock()
+            .unwrap()
+            .unattributed_loss_is_current(outcome.dropped_newest_timestamp_us);
+    let reassembly_loss = outcome.dropped_frames > 0 && !stale_reassembly_loss;
+    let strict_reassembly_loss = reassembly_loss
         && recovery
             .lock()
             .unwrap()
             .latest_source()
             .is_some_and(|source| source.codec.is_reference_sensitive());
-    let mut needs_keyframe = outcome.request_keyframe || outcome.dropped_frames > 0;
-    if outcome.dropped_frames > 0 && (!keyframe_barrier || strict_reassembly_loss) {
+    // No keyframe is asked for a frame that was lost before the current one.
+    let mut needs_keyframe =
+        !stale_reassembly_loss && (outcome.request_keyframe || reassembly_loss);
+    if reassembly_loss && (!keyframe_barrier || strict_reassembly_loss) {
         recovery.lock().unwrap().note_unattributed_loss();
     }
     let holdback_outcome = if keyframe_barrier {
@@ -4761,6 +4796,8 @@ mod tests {
             request_keyframe: true,
             dropped_frames: 1,
             frame: None,
+            dropped_newest_timestamp_us: None,
+            dropped_keyframe: false,
         };
         assert!(handle_video_outcome(
             outcome,
@@ -4803,6 +4840,8 @@ mod tests {
             request_keyframe: true,
             dropped_frames: 1,
             frame: None,
+            dropped_newest_timestamp_us: None,
+            dropped_keyframe: false,
         };
         assert!(handle_video_outcome(
             outcome,
@@ -4841,6 +4880,8 @@ mod tests {
             request_keyframe: true,
             dropped_frames: 1,
             frame: None,
+            dropped_newest_timestamp_us: None,
+            dropped_keyframe: false,
         };
         assert!(handle_video_outcome(
             outcome,
@@ -4872,6 +4913,8 @@ mod tests {
             request_keyframe: true,
             dropped_frames: 1,
             frame: None,
+            dropped_newest_timestamp_us: None,
+            dropped_keyframe: false,
         };
         assert!(handle_video_outcome(
             outcome,
@@ -5936,6 +5979,8 @@ mod tests {
             request_keyframe: true,
             dropped_frames: 1,
             frame: None,
+            dropped_newest_timestamp_us: None,
+            dropped_keyframe: false,
         };
         assert!(handle_video_outcome(
             outcome,
@@ -5988,6 +6033,8 @@ mod tests {
             request_keyframe: true,
             dropped_frames: 1,
             frame: None,
+            dropped_newest_timestamp_us: None,
+            dropped_keyframe: false,
         };
         assert!(handle_video_outcome(
             outcome,
@@ -6002,5 +6049,234 @@ mod tests {
             VIDEO_EPOCH_REORDER_MIN,
         ));
         assert!(recovery.lock().unwrap().stream_awaiting_keyframe(key));
+    }
+
+    /// One H.264 stream is decoded from keyframe `keyframe_id` and has accepted the delta
+    /// after it. Then the reassembler reports a frame it dropped incomplete, a delta that
+    /// followed keyframe `lost_after_keyframe`. Returns whether the stream now waits for a
+    /// keyframe, whether one was asked for, and what the next delta of the stream gets.
+    fn one_stream_after_a_report_of_a_dropped_frame(
+        keyframe_id: u64,
+        lost_after_keyframe: u64,
+        lost_keyframe: bool,
+    ) -> (bool, bool, VideoReceiveDecision) {
+        let (inbound, _inbound_rx) = mpsc::channel(4);
+        let (control, mut control_rx) = mpsc::channel(4);
+        let metrics = QuicApplicationMetrics::default();
+        let recovery = Mutex::new(VideoReceiveRecovery::default());
+        let frame = |frame_id: u64, keyframe: bool| VideoSourceInfo {
+            key: VideoStreamKey {
+                display: 0,
+                stream_id: 7,
+            },
+            frame_id,
+            keyframe,
+            codec: VideoCodec::H264,
+        };
+        {
+            let mut recovery = recovery.lock().unwrap();
+            assert_eq!(
+                recovery.observe(frame(keyframe_id, true), true),
+                VideoReceiveDecision::Accept
+            );
+            assert_eq!(
+                recovery.observe(frame(keyframe_id + 1, false), true),
+                VideoReceiveDecision::Accept
+            );
+        }
+        let outcome = super::super::video_datagram::VideoReassemblyOutcome {
+            request_keyframe: true,
+            dropped_frames: 1,
+            frame: None,
+            dropped_newest_timestamp_us: Some(lost_after_keyframe),
+            dropped_keyframe: lost_keyframe,
+        };
+        assert!(handle_video_outcome(
+            outcome,
+            &super::super::video_datagram::VideoReassemblyStats::default(),
+            &inbound,
+            &control,
+            true,
+            true,
+            &metrics,
+            &recovery,
+            Instant::now(),
+            VIDEO_EPOCH_REORDER_MIN,
+        ));
+        let mut recovery = recovery.lock().unwrap();
+        let waits = recovery.stream_awaiting_keyframe(frame(keyframe_id, true).key);
+        let asked = control_rx.try_recv().is_ok();
+        let next = recovery.observe(frame(keyframe_id + 2, false), true);
+        (waits, asked, next)
+    }
+
+    /// The report of a dropped frame can come after the keyframe that repaired the loss: the
+    /// reassembler waits for the rest of a frame before it gives it up, and meanwhile the
+    /// gap was seen, a keyframe was asked for and has arrived. The stream decoded from that
+    /// keyframe lost nothing: it must go on, and no second keyframe is asked for.
+    #[test]
+    fn late_report_of_a_frame_lost_before_the_current_keyframe_does_not_stop_the_stream() {
+        let (waits, asked, next) = one_stream_after_a_report_of_a_dropped_frame(20, 10, false);
+        assert!(
+            !waits,
+            "the stream was stopped for a frame of an older keyframe"
+        );
+        assert!(
+            !asked,
+            "a keyframe was asked for although the picture is whole"
+        );
+        assert_eq!(next, VideoReceiveDecision::Accept);
+    }
+
+    /// A frame lost after the keyframe the stream is decoded from stops it at once, without
+    /// waiting for the gap in the frame ids to show.
+    #[test]
+    fn report_of_a_frame_lost_after_the_current_keyframe_stops_the_stream_at_once() {
+        let (waits, asked, next) = one_stream_after_a_report_of_a_dropped_frame(20, 20, false);
+        assert!(waits);
+        assert!(asked);
+        assert_eq!(next, VideoReceiveDecision::Suppress);
+    }
+
+    /// A delta that follows a keyframe still on its way: the stream shown now lost nothing.
+    /// When that keyframe is here, the gap in the frame ids after it is what stops the stream.
+    #[test]
+    fn report_of_a_frame_lost_after_a_keyframe_still_on_its_way_does_not_stop_the_stream() {
+        let (waits, asked, next) = one_stream_after_a_report_of_a_dropped_frame(20, 30, false);
+        assert!(!waits);
+        assert!(!asked);
+        assert_eq!(next, VideoReceiveDecision::Accept);
+    }
+
+    /// A keyframe that was sent in datagrams and lost is always a loss of the stream shown
+    /// now, whatever its timestamp field holds: the deltas after it cannot be decoded.
+    #[test]
+    fn report_of_a_dropped_keyframe_stops_the_stream() {
+        let (waits, asked, next) = one_stream_after_a_report_of_a_dropped_frame(20, 10, true);
+        assert!(waits);
+        assert!(asked);
+        assert_eq!(next, VideoReceiveDecision::Suppress);
+    }
+
+    /// The session of 2026-11-21 (revision 280, one H.264 stream at thirty frames a second),
+    /// through the real reassembler. A datagram of a delta is lost. The next frame arrives a
+    /// frame time later; the gap is seen, a keyframe is asked for and arrives about 110 ms
+    /// after the loss. The reassembler must have reported the lost frame by then, and must
+    /// not report it after the keyframe: a report that came then stopped the stream that had
+    /// just recovered, and the host, which had just sent a keyframe, did not send another
+    /// for three seconds.
+    #[test]
+    fn lost_delta_is_reported_at_once_and_not_after_the_keyframe_that_repaired_it() {
+        use super::super::video_datagram::{
+            fragment_video_frame, VideoFrameMetadata, VideoReassembler, VideoReassemblyConfig,
+            VideoReassemblyOutcome,
+        };
+        let (inbound, _inbound_rx) = mpsc::channel(4);
+        let (control, _control_rx) = mpsc::channel(8);
+        let metrics = QuicApplicationMetrics::default();
+        let recovery = Mutex::new(VideoReceiveRecovery::default());
+        let key = VideoStreamKey {
+            display: 0,
+            stream_id: 7,
+        };
+        let frame = |frame_id: u64, keyframe: bool| VideoSourceInfo {
+            key,
+            frame_id,
+            keyframe,
+            codec: VideoCodec::H264,
+        };
+        // A delta on the wire: `wire_id` in the order of sending, the id of the keyframe it
+        // follows where a frame without the barrier has its timestamp.
+        let delta = |wire_id: u64, keyframe_id: u64, size: usize| {
+            fragment_video_frame(
+                [7; 16],
+                1,
+                42,
+                VideoFrameMetadata {
+                    frame_id: wire_id,
+                    codec: VideoCodec::H264,
+                    flags: 0,
+                    presentation_timestamp_us: keyframe_id,
+                },
+                &vec![1; size],
+                700,
+            )
+            .unwrap()
+        };
+        let mut reassembler = VideoReassembler::new(VideoReassemblyConfig {
+            require_initial_keyframe: false,
+            ..VideoReassemblyConfig::default()
+        })
+        .unwrap();
+        let report = |outcome: VideoReassemblyOutcome, at: Instant| {
+            // Only what the reassembler says about lost frames; the frames themselves are
+            // handed to `observe` below.
+            assert!(handle_video_outcome(
+                VideoReassemblyOutcome {
+                    frame: None,
+                    ..outcome
+                },
+                &super::super::video_datagram::VideoReassemblyStats::default(),
+                &inbound,
+                &control,
+                true,
+                true,
+                &metrics,
+                &recovery,
+                at,
+                VIDEO_EPOCH_REORDER_MIN,
+            ));
+        };
+        let start = Instant::now();
+        let ms = Duration::from_millis;
+        assert_eq!(
+            recovery.lock().unwrap().observe(frame(4, true), true),
+            VideoReceiveDecision::Accept
+        );
+        assert_eq!(
+            recovery.lock().unwrap().observe(frame(5, false), true),
+            VideoReceiveDecision::Accept
+        );
+
+        // Frame 6 (wire id 10) loses its last datagram.
+        let lost = delta(10, 4, 3000);
+        for packet in &lost[..lost.len() - 1] {
+            report(reassembler.push(packet, start).unwrap(), start);
+        }
+        // Frame 7 (wire id 11) arrives whole, a frame time later.
+        let mut reported_with_the_next_frame = 0;
+        for packet in delta(11, 4, 1000) {
+            let outcome = reassembler.push(&packet, start + ms(33)).unwrap();
+            reported_with_the_next_frame += outcome.dropped_frames;
+            report(outcome, start + ms(33));
+        }
+        assert_eq!(
+            reported_with_the_next_frame, 1,
+            "the lost frame is known when the next one is complete"
+        );
+        assert!(recovery.lock().unwrap().stream_awaiting_keyframe(key));
+
+        // The keyframe that was asked for arrives 110 ms after the loss, and a delta after it.
+        assert_eq!(
+            recovery.lock().unwrap().observe(frame(10, true), true),
+            VideoReceiveDecision::Accept
+        );
+        assert_eq!(
+            recovery.lock().unwrap().observe(frame(11, false), true),
+            VideoReceiveDecision::Accept
+        );
+        // The reassembler is asked every 25 ms; nothing it says now may stop the stream.
+        for tick in 0..12u64 {
+            let at = start + ms(115 + tick * 25);
+            report(reassembler.expire(at), at);
+        }
+        assert!(
+            !recovery.lock().unwrap().stream_awaiting_keyframe(key),
+            "a late report stopped the stream after its keyframe had arrived"
+        );
+        assert_eq!(
+            recovery.lock().unwrap().observe(frame(12, false), true),
+            VideoReceiveDecision::Accept
+        );
     }
 }
