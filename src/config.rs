@@ -3839,6 +3839,9 @@ pub mod keys {
     /// `N` makes the Windows capture helpers hand frames to the service through one buffer,
     /// as before (a frame can then be put together from two captures). Two buffers by default.
     pub const OPTION_CAPTURE_FRAME_SLOTS: &str = "capture-frame-slots";
+    /// `N` keeps a Windows host built with `vram` from encoding out of a GPU texture; capture
+    /// stays as it is and the hardware encoder is fed through RAM. On by default.
+    pub const OPTION_ENABLE_TEXTURE_ENCODE: &str = "enable-texture-encode";
     /// `off`, `warn` (default) or `enforce` for file clipboard messages that cross against
     /// the clipboard direction policy.
     pub const OPTION_FILE_CLIPBOARD_DIRECTION_CHECK: &str = "file-clipboard-direction-check";
@@ -4101,6 +4104,7 @@ pub mod keys {
         OPTION_FILE_CLIPBOARD_DIRECTION_CHECK,
         OPTION_VIDEO_ADMISSION_BACKOFF,
         OPTION_CAPTURE_FRAME_SLOTS,
+        OPTION_ENABLE_TEXTURE_ENCODE,
         OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS,
         OPTION_ALLOW_AUTO_UPDATE,
     ];
@@ -4266,6 +4270,7 @@ mod tests {
             keys::OPTION_FILE_CLIPBOARD_DIRECTION_CHECK,
             keys::OPTION_VIDEO_ADMISSION_BACKOFF,
             keys::OPTION_CAPTURE_FRAME_SLOTS,
+            keys::OPTION_ENABLE_TEXTURE_ENCODE,
         ] {
             assert!(keys::KEYS_SETTINGS.contains(&key), "{key}");
         }
