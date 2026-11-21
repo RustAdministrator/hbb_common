@@ -1,3 +1,13 @@
+// The session key is never applied to this transport: `WebRTCStream::set_key` does nothing,
+// while `is_secured` says the stream is secured, so the session would run without the encryption
+// every other transport gives it once the peers have agreed a key. DTLS protects the data channel
+// only between the endpoints that the signalling put together. Wrap the payloads in `Encrypt`, as
+// `tcp.rs` and `websocket.rs` do, before this feature is built into anything.
+compile_error!(
+    "the `webrtc` feature carries the session without the session key: \
+     wrap the payloads of `WebRTCStream` in `Encrypt` before enabling it"
+);
+
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
