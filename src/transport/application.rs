@@ -774,6 +774,21 @@ impl VideoReceiveRecovery {
         }
     }
 
+    /// A frame was lost in reassembly. The datagram header has no stream key, so it cannot be
+    /// told whose it was.
+    ///
+    /// With one stream it is that stream's, and it waits for a keyframe at once. With several,
+    /// marking them all made every display wait for a keyframe because one of them lost a
+    /// frame. The stream that did lose it shows a gap in its own frame ids at its next frame,
+    /// and `observe` stops it there: a delta is only ever accepted when it follows the last
+    /// accepted frame of its own stream. A frame lost whole, with none of its datagrams
+    /// arriving, has always been found that way.
+    fn note_unattributed_loss(&mut self) {
+        if self.streams.len() <= 1 {
+            self.mark_reference_loss();
+        }
+    }
+
     fn mark_stream_reference_loss(&mut self, key: VideoStreamKey) {
         if let Some(state) = self.streams.get_mut(&key) {
             state.awaiting_keyframe = true;
@@ -2540,6 +2555,21 @@ async fn run_local_video_refresh(
     }
 }
 
+/// The frame id that goes on the wire for a frame that is about to be sent in datagrams: the
+/// next one in the order of sending.
+///
+/// The id a frame gets when it is queued (`metadata.frame_id`) follows the order of queueing
+/// and stays what the sender's own recovery bookkeeping compares. The writer does not send in
+/// that order: it serves the tracks by bytes, so with two displays a small frame queued later
+/// goes out before a large one queued earlier. The receiver has one sequence for all streams
+/// and drops a frame whose id is not above the last one it completed, so with the queueing id
+/// on the wire it silently discarded the large frame.
+fn wire_frame_id(_item: &VideoOutbound, next_wire_frame_id: &mut u64) -> u64 {
+    let id = *next_wire_frame_id;
+    *next_wire_frame_id = next_wire_frame_id.saturating_add(1);
+    id
+}
+
 async fn run_video_writer(
     mut sender: QuicDatagramSender,
     video: Arc<TrackLatestSlot>,
@@ -2553,6 +2583,7 @@ async fn run_video_writer(
 ) {
     let started = Instant::now();
     let mut reference_epochs = BTreeMap::<VideoStreamKey, u64>::new();
+    let mut next_wire_frame_id = 1u64;
     loop {
         let mut item = tokio::select! {
             item = video.take() => item,
@@ -2650,7 +2681,9 @@ async fn run_video_writer(
                 continue;
             }
         }
-        match sender.send_video_frame(item.metadata, &item.payload) {
+        let mut wire_metadata = item.metadata;
+        wire_metadata.frame_id = wire_frame_id(&item, &mut next_wire_frame_id);
+        match sender.send_video_frame(wire_metadata, &item.payload) {
             Ok(VideoDatagramSendOutcome::Sent { .. }) => {}
             Ok(VideoDatagramSendOutcome::RejectedNoSpace {
                 failure,
@@ -3131,7 +3164,7 @@ fn handle_video_outcome(
             .is_some_and(|source| source.codec.is_reference_sensitive());
     let mut needs_keyframe = outcome.request_keyframe || outcome.dropped_frames > 0;
     if outcome.dropped_frames > 0 && (!keyframe_barrier || strict_reassembly_loss) {
-        recovery.lock().unwrap().mark_reference_loss();
+        recovery.lock().unwrap().note_unattributed_loss();
     }
     let holdback_outcome = if keyframe_barrier {
         if let Some(frame) = outcome.frame {
@@ -5832,5 +5865,142 @@ mod tests {
             elapsed,
             blocks as f64 * 128.0 * 1024.0 * 8.0 / elapsed.as_secs_f64() / 1e6
         );
+    }
+
+    /// Two displays: a large frame queued first and small frames of the other display queued
+    /// after it. The writer serves the tracks by bytes, so the small, later frames go out
+    /// first. The receiver drops a frame whose id is not above the last completed one, so the
+    /// ids on the wire must rise in the order of sending.
+    #[tokio::test]
+    async fn wire_frame_ids_rise_in_the_order_of_sending() {
+        let slot = TrackLatestSlot::new(2);
+        let mut enqueue_id = 0u64;
+        let mut queue = |display: i32, stream: u64, size: usize| {
+            enqueue_id += 1;
+            let mut value = sized_video(display, stream, size);
+            value.metadata.frame_id = enqueue_id;
+            assert!(admit_video(&slot, value));
+        };
+        queue(0, 1, 1000);
+        queue(1, 2, 100);
+        let mut next_wire_frame_id = 1u64;
+        let mut on_the_wire = Vec::new();
+        let mut large_sent = false;
+        for _ in 0..12 {
+            let item = slot.take().await;
+            let display = item.source_info.unwrap().key.display;
+            on_the_wire.push(wire_frame_id(&item, &mut next_wire_frame_id));
+            if display == 0 {
+                large_sent = true;
+                break;
+            }
+            queue(1, 2, 100);
+        }
+        assert!(large_sent, "the large frame was never served");
+        assert!(on_the_wire.len() >= 3, "{:?}", on_the_wire);
+        assert!(
+            on_the_wire.windows(2).all(|pair| pair[0] < pair[1]),
+            "ids on the wire in the order of sending: {:?}",
+            on_the_wire
+        );
+    }
+
+    /// Two displays. A frame is lost in reassembly; the datagram header does not say whose it
+    /// was. The display that lost nothing must go on without a keyframe; the one that did is
+    /// stopped by the gap in its own frame ids.
+    #[test]
+    fn reassembly_loss_stops_only_the_stream_that_shows_a_gap() {
+        let (inbound, _inbound_rx) = mpsc::channel(4);
+        let (control, _control_rx) = mpsc::channel(4);
+        let metrics = QuicApplicationMetrics::default();
+        let recovery = Mutex::new(VideoReceiveRecovery::default());
+        let frame = |display: i32, stream_id: u64, frame_id: u64, keyframe: bool| VideoSourceInfo {
+            key: VideoStreamKey { display, stream_id },
+            frame_id,
+            keyframe,
+            codec: VideoCodec::H264,
+        };
+        {
+            let mut recovery = recovery.lock().unwrap();
+            assert_eq!(
+                recovery.observe(frame(0, 7, 4, true), true),
+                VideoReceiveDecision::Accept
+            );
+            assert_eq!(
+                recovery.observe(frame(1, 8, 1, true), true),
+                VideoReceiveDecision::Accept
+            );
+        }
+        // Frame 5 of display 0 never completes.
+        let outcome = super::super::video_datagram::VideoReassemblyOutcome {
+            request_keyframe: true,
+            dropped_frames: 1,
+            frame: None,
+        };
+        assert!(handle_video_outcome(
+            outcome,
+            &super::super::video_datagram::VideoReassemblyStats::default(),
+            &inbound,
+            &control,
+            true,
+            true,
+            &metrics,
+            &recovery,
+            Instant::now(),
+            VIDEO_EPOCH_REORDER_MIN,
+        ));
+        let mut recovery = recovery.lock().unwrap();
+        assert_eq!(
+            recovery.observe(frame(1, 8, 2, false), true),
+            VideoReceiveDecision::Accept,
+            "the display that lost nothing"
+        );
+        assert_eq!(
+            recovery.observe(frame(0, 7, 6, false), true),
+            VideoReceiveDecision::SuppressAfterGap,
+            "the display that lost frame 5"
+        );
+        assert!(recovery.stream_awaiting_keyframe(frame(0, 7, 6, false).key));
+        assert!(!recovery.stream_awaiting_keyframe(frame(1, 8, 2, false).key));
+    }
+
+    /// With one stream the lost frame can only be its own: it is stopped at once, as before.
+    #[test]
+    fn reassembly_loss_with_one_stream_stops_it_at_once() {
+        let (inbound, _inbound_rx) = mpsc::channel(4);
+        let (control, _control_rx) = mpsc::channel(4);
+        let metrics = QuicApplicationMetrics::default();
+        let recovery = Mutex::new(VideoReceiveRecovery::default());
+        let key = VideoStreamKey {
+            display: 0,
+            stream_id: 7,
+        };
+        recovery.lock().unwrap().observe(
+            VideoSourceInfo {
+                key,
+                frame_id: 4,
+                keyframe: true,
+                codec: VideoCodec::H264,
+            },
+            true,
+        );
+        let outcome = super::super::video_datagram::VideoReassemblyOutcome {
+            request_keyframe: true,
+            dropped_frames: 1,
+            frame: None,
+        };
+        assert!(handle_video_outcome(
+            outcome,
+            &super::super::video_datagram::VideoReassemblyStats::default(),
+            &inbound,
+            &control,
+            true,
+            true,
+            &metrics,
+            &recovery,
+            Instant::now(),
+            VIDEO_EPOCH_REORDER_MIN,
+        ));
+        assert!(recovery.lock().unwrap().stream_awaiting_keyframe(key));
     }
 }
