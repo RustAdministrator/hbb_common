@@ -3919,6 +3919,9 @@ pub mod keys {
     /// of the Movie profile, as before (it starts with a keyframe). By default the encoder is
     /// kept: it takes the rate from the frame timestamps.
     pub const OPTION_MOVIE_TIER_KEEPS_SOFTWARE_ENCODER: &str = "movie-tier-keeps-software-encoder";
+    /// `N` keeps the frame rate tiers of the Movie profile at 60 and below, as before. By
+    /// default viewers whose screens run faster, and who ask for it, get tiers up to 120.
+    pub const OPTION_MOVIE_TIERS_ABOVE_60: &str = "movie-tiers-above-60";
     /// `off`, `warn` (default) or `enforce` for file clipboard messages that cross against
     /// the clipboard direction policy.
     pub const OPTION_FILE_CLIPBOARD_DIRECTION_CHECK: &str = "file-clipboard-direction-check";
@@ -4185,6 +4188,7 @@ pub mod keys {
         OPTION_VIDEO_RECOVERY_AFTER_KEYFRAME,
         OPTION_HTTP_PROXY_FAIL_CLOSED,
         OPTION_MOVIE_TIER_KEEPS_SOFTWARE_ENCODER,
+        OPTION_MOVIE_TIERS_ABOVE_60,
         OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS,
         OPTION_ALLOW_AUTO_UPDATE,
     ];
@@ -4354,6 +4358,7 @@ mod tests {
             keys::OPTION_VIDEO_RECOVERY_AFTER_KEYFRAME,
             keys::OPTION_HTTP_PROXY_FAIL_CLOSED,
             keys::OPTION_MOVIE_TIER_KEEPS_SOFTWARE_ENCODER,
+            keys::OPTION_MOVIE_TIERS_ABOVE_60,
         ] {
             assert!(keys::KEYS_SETTINGS.contains(&key), "{key}");
         }
