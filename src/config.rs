@@ -3676,6 +3676,9 @@ pub mod keys {
     pub const OPTION_CUSTOM_FPS: &str = "custom-fps";
     pub const OPTION_CUSTOM_FPS_MODE: &str = "custom-fps-mode";
     pub const OPTION_VIDEO_PROFILE: &str = "video-profile";
+    /// `N` switches off the pacing of decoded frames on a desktop viewer in the Movie profile
+    /// (frames are then shown as soon as they are decoded, as before). On by default.
+    pub const OPTION_MOVIE_PLAYOUT_PACING: &str = "movie-playout-pacing";
     pub const OPTION_CODEC_PREFERENCE: &str = "codec-preference";
     pub const OPTION_ENCODER_CODEC_PREFERENCE: &str = "encoder-codec-preference";
     pub const OPTION_CAPTURE_BACKEND: &str = "capture-backend";
@@ -3960,6 +3963,7 @@ pub mod keys {
     ];
     // DEFAULT_LOCAL_SETTINGS, OVERWRITE_LOCAL_SETTINGS
     pub const KEYS_LOCAL_SETTINGS: &[&str] = &[
+        OPTION_MOVIE_PLAYOUT_PACING,
         OPTION_THEME,
         OPTION_LANGUAGE,
         OPTION_ENABLE_CONFIRM_CLOSING_TABS,
