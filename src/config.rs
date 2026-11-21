@@ -3829,6 +3829,10 @@ pub mod keys {
     /// `off`, `warn` or `enforce` (default) for rendezvous datagrams that do
     /// not come from the rendezvous server's address.
     pub const OPTION_UDP_SOURCE_CHECK: &str = "udp-source-check";
+    /// `N` switches off the host's reaction to video datagrams that the transport keeps
+    /// refusing in the Movie profile (it lowers the bitrate before frames are lost). On by
+    /// default.
+    pub const OPTION_VIDEO_ADMISSION_BACKOFF: &str = "video-admission-backoff";
     /// `off`, `warn` (default) or `enforce` for file clipboard messages that cross against
     /// the clipboard direction policy.
     pub const OPTION_FILE_CLIPBOARD_DIRECTION_CHECK: &str = "file-clipboard-direction-check";
@@ -4088,6 +4092,7 @@ pub mod keys {
         OPTION_RELAY_SECURE_POLICY,
         OPTION_UDP_SOURCE_CHECK,
         OPTION_FILE_CLIPBOARD_DIRECTION_CHECK,
+        OPTION_VIDEO_ADMISSION_BACKOFF,
         OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS,
         OPTION_ALLOW_AUTO_UPDATE,
     ];
@@ -4251,6 +4256,7 @@ mod tests {
             keys::OPTION_RELAY_SECURE_POLICY,
             keys::OPTION_UDP_SOURCE_CHECK,
             keys::OPTION_FILE_CLIPBOARD_DIRECTION_CHECK,
+            keys::OPTION_VIDEO_ADMISSION_BACKOFF,
         ] {
             assert!(keys::KEYS_SETTINGS.contains(&key), "{key}");
         }
