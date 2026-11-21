@@ -333,6 +333,9 @@ impl WsFramedStream {
                     return Some(Ok(bytes));
                 }
                 WsMessage::Text(text) => {
+                    if self.encrypt.is_some() {
+                        return Some(Err(text_frame_on_encrypted_stream()));
+                    }
                     let bytes = BytesMut::from(text.as_bytes());
                     return Some(Ok(bytes));
                 }
@@ -380,7 +383,12 @@ impl WsReadHalf {
                     }
                     return Some(Ok(bytes));
                 }
-                WsMessage::Text(text) => return Some(Ok(BytesMut::from(text.as_bytes()))),
+                WsMessage::Text(text) => {
+                    if self.decrypt.is_some() {
+                        return Some(Err(text_frame_on_encrypted_stream()));
+                    }
+                    return Some(Ok(BytesMut::from(text.as_bytes())));
+                }
                 WsMessage::Close(_) => return None,
                 _ => continue,
             }
@@ -414,6 +422,17 @@ impl WsWriteHalf {
         }
         Ok(())
     }
+}
+
+/// Once the session key is set, the peer sends everything encrypted, in binary frames
+/// (`send_bytes`). A text frame then cannot come from it: it was put on the way, by a relay or
+/// on a plain `ws://` link, and passing it on would hand the session a message that was never
+/// decrypted.
+fn text_frame_on_encrypted_stream() -> Error {
+    Error::new(
+        ErrorKind::InvalidData,
+        "WebSocket text frame on an encrypted stream",
+    )
 }
 
 pub fn is_ws_endpoint(endpoint: &str) -> bool {
@@ -683,5 +702,75 @@ mod tests {
         assert_eq!(check_ws("127.0.0.1:23455"), "ws://127.0.0.1:23458");
         assert_eq!(check_ws("127.0.0.1:23456"), "ws://127.0.0.1:23458");
         assert_eq!(check_ws("127.0.0.1:34567"), "ws://127.0.0.1:34569");
+    }
+
+    /// A connected pair of framed streams over loopback, the second one in the server role.
+    async fn websocket_pair() -> (WsFramedStream, WsFramedStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let viewer = WsFramedStream::from_tcp_stream(client.unwrap(), addr)
+            .await
+            .unwrap();
+        let host = WsFramedStream {
+            stream: WebSocketStream::from_raw_socket(
+                MaybeTlsStream::Plain(accepted.unwrap().0),
+                Role::Server,
+                None,
+            )
+            .await,
+            addr,
+            encrypt: None,
+            send_timeout: 0,
+        };
+        (viewer, host)
+    }
+
+    /// Once the session key is set, everything the peer sends is encrypted and goes in binary
+    /// frames. A text frame then cannot come from the peer: one injected on the way (by a relay,
+    /// or on a plain `ws://` link) must not reach the session as if it were a decrypted message.
+    #[tokio::test]
+    async fn text_frame_is_refused_once_the_session_key_is_set() {
+        let key = Key([23; crate::sodiumoxide::crypto::secretbox::KEYBYTES]);
+        let (mut viewer, mut host) = websocket_pair().await;
+        viewer.set_key(key.clone());
+        host.set_key(key.clone());
+        host.stream
+            .send(WsMessage::Text("injected".into()))
+            .await
+            .unwrap();
+        let received = viewer.next().await.unwrap();
+        assert!(
+            received.is_err(),
+            "a text frame was taken as a message: {:?}",
+            received
+        );
+        // The stream goes on: an encrypted binary frame after it is read as before.
+        host.send_raw(b"after".to_vec()).await.unwrap();
+        assert_eq!(&viewer.next().await.unwrap().unwrap()[..], b"after");
+
+        // The same for the read half of a split stream.
+        let (mut reader, _writer) = viewer.into_split();
+        host.stream
+            .send(WsMessage::Text("injected".into()))
+            .await
+            .unwrap();
+        let received = reader.next().await.unwrap();
+        assert!(
+            received.is_err(),
+            "the read half took a text frame: {:?}",
+            received
+        );
+    }
+
+    /// Before a key is set nothing is encrypted, and a text frame is passed on as before.
+    #[tokio::test]
+    async fn text_frame_without_a_session_key_is_passed_on() {
+        let (mut viewer, mut host) = websocket_pair().await;
+        host.stream
+            .send(WsMessage::Text("plain".into()))
+            .await
+            .unwrap();
+        assert_eq!(&viewer.next().await.unwrap().unwrap()[..], b"plain");
     }
 }
