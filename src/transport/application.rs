@@ -512,6 +512,23 @@ impl VideoEpochHoldback {
         self.streams.retain(|key, _| {
             key.display != info.key.display || key.stream_id == info.key.stream_id
         });
+        // The keyframe replaces every older epoch of its stream: those frames are not waited
+        // for any more, and a gap among them needs no keyframe of its own. Without this the gap
+        // that made the viewer ask for this keyframe asked for another one as it arrived.
+        if let Some(state) = self.streams.get_mut(&info.key) {
+            let superseded = state
+                .pending
+                .keys()
+                .copied()
+                .filter(|(epoch, _)| *epoch < info.frame_id)
+                .collect::<Vec<_>>();
+            for key in superseded {
+                if let Some(frame) = state.pending.remove(&key) {
+                    state.pending_bytes = state.pending_bytes.saturating_sub(frame.payload.len());
+                }
+            }
+            state.gap_started_at = None;
+        }
         let mut outcome = self.expire(now, reorder_window);
         self.prepare_stream(info.key, &mut outcome);
         let state = self.streams.entry(info.key).or_default();
@@ -6347,5 +6364,76 @@ mod tests {
             "audio packets still held after the burst"
         );
         drop(client_stream);
+    }
+
+    /// Epoch 10 of stream 7 waits for its missing delta 11 when the keyframe of a recovery
+    /// (20) arrives, just as the reorder window of the gap is over. The keyframe replaces the
+    /// whole older epoch: that gap needs no keyframe of its own. Asking for one here put a
+    /// needless request behind every such recovery.
+    #[test]
+    fn keyframe_of_a_stream_supersedes_a_gap_in_its_older_epoch() {
+        let now = Instant::now();
+        let mut holdback = VideoEpochHoldback::default();
+        holdback.accept_keyframe(
+            source_video(7, 10, true),
+            Bytes::from_static(b"keyframe-10"),
+            now,
+            VIDEO_EPOCH_REORDER_MIN,
+        );
+        let held = holdback.admit_delta(
+            source_video(7, 12, false),
+            10,
+            Bytes::from_static(b"delta-12"),
+            now,
+            VIDEO_EPOCH_REORDER_MIN,
+        );
+        assert_eq!(held.held_frames, 1);
+
+        let recovered = holdback.accept_keyframe(
+            source_video(7, 20, true),
+            Bytes::from_static(b"keyframe-20"),
+            now + VIDEO_EPOCH_REORDER_MIN,
+            VIDEO_EPOCH_REORDER_MIN,
+        );
+        assert!(
+            !recovered.recovery_required,
+            "a keyframe was asked for although one had just arrived"
+        );
+        assert_eq!(
+            recovered
+                .ready
+                .iter()
+                .map(|(info, _)| info.frame_id)
+                .collect::<Vec<_>>(),
+            vec![20]
+        );
+    }
+
+    /// A gap in another display's stream still asks for its keyframe.
+    #[test]
+    fn keyframe_of_one_display_does_not_hide_a_gap_of_another() {
+        let now = Instant::now();
+        let mut holdback = VideoEpochHoldback::default();
+        holdback.accept_keyframe(
+            source_video_for_display(1, 8, 30, true),
+            Bytes::from_static(b"keyframe-30"),
+            now,
+            VIDEO_EPOCH_REORDER_MIN,
+        );
+        holdback.admit_delta(
+            source_video_for_display(1, 8, 32, false),
+            30,
+            Bytes::from_static(b"delta-32"),
+            now,
+            VIDEO_EPOCH_REORDER_MIN,
+        );
+        let other = holdback.accept_keyframe(
+            source_video(7, 20, true),
+            Bytes::from_static(b"keyframe-20"),
+            now + VIDEO_EPOCH_REORDER_MIN,
+            VIDEO_EPOCH_REORDER_MIN,
+        );
+        assert!(other.recovery_required, "the gap of display 1 was hidden");
+        assert_eq!(other.gap_events, 1);
     }
 }
