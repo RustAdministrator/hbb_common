@@ -3912,6 +3912,9 @@ pub mod keys {
     /// keyframe to a viewer that lost a frame again right behind a recovery keyframe. One
     /// cooldown by default.
     pub const OPTION_VIDEO_RECOVERY_AFTER_KEYFRAME: &str = "video-recovery-after-keyframe";
+    /// `N` lets an HTTP request go directly to the server, as before, when a proxy is
+    /// configured but cannot be used. By default such a request fails instead.
+    pub const OPTION_HTTP_PROXY_FAIL_CLOSED: &str = "http-proxy-fail-closed";
     /// `off`, `warn` (default) or `enforce` for file clipboard messages that cross against
     /// the clipboard direction policy.
     pub const OPTION_FILE_CLIPBOARD_DIRECTION_CHECK: &str = "file-clipboard-direction-check";
@@ -4176,6 +4179,7 @@ pub mod keys {
         OPTION_CAPTURE_FRAME_SLOTS,
         OPTION_ENABLE_TEXTURE_ENCODE,
         OPTION_VIDEO_RECOVERY_AFTER_KEYFRAME,
+        OPTION_HTTP_PROXY_FAIL_CLOSED,
         OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS,
         OPTION_ALLOW_AUTO_UPDATE,
     ];
@@ -4343,6 +4347,7 @@ mod tests {
             keys::OPTION_CAPTURE_FRAME_SLOTS,
             keys::OPTION_ENABLE_TEXTURE_ENCODE,
             keys::OPTION_VIDEO_RECOVERY_AFTER_KEYFRAME,
+            keys::OPTION_HTTP_PROXY_FAIL_CLOSED,
         ] {
             assert!(keys::KEYS_SETTINGS.contains(&key), "{key}");
         }
