@@ -3926,6 +3926,10 @@ pub mod keys {
     /// capture thread whenever its answer is older than 200 ms, as before. By default a fresh
     /// answer is fetched on a thread of its own while the capture uses the one it has.
     pub const OPTION_LOGON_UI_CHECK_OFF_CAPTURE_THREAD: &str = "logon-ui-check-off-capture-thread";
+    /// `N` makes the Standard capture loop sleep one period from the time it measures its own
+    /// work from, as before. By default it sleeps to deadlines one period apart, so the work
+    /// before that time and the sleep's overshoot do not add to every period.
+    pub const OPTION_STANDARD_LOOP_DEADLINE: &str = "standard-loop-deadline";
     /// `off`, `warn` (default) or `enforce` for file clipboard messages that cross against
     /// the clipboard direction policy.
     pub const OPTION_FILE_CLIPBOARD_DIRECTION_CHECK: &str = "file-clipboard-direction-check";
@@ -4194,6 +4198,7 @@ pub mod keys {
         OPTION_MOVIE_TIER_KEEPS_SOFTWARE_ENCODER,
         OPTION_MOVIE_TIERS_ABOVE_60,
         OPTION_LOGON_UI_CHECK_OFF_CAPTURE_THREAD,
+        OPTION_STANDARD_LOOP_DEADLINE,
         OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS,
         OPTION_ALLOW_AUTO_UPDATE,
     ];
@@ -4365,6 +4370,7 @@ mod tests {
             keys::OPTION_MOVIE_TIER_KEEPS_SOFTWARE_ENCODER,
             keys::OPTION_MOVIE_TIERS_ABOVE_60,
             keys::OPTION_LOGON_UI_CHECK_OFF_CAPTURE_THREAD,
+            keys::OPTION_STANDARD_LOOP_DEADLINE,
         ] {
             assert!(keys::KEYS_SETTINGS.contains(&key), "{key}");
         }
