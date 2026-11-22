@@ -3930,6 +3930,11 @@ pub mod keys {
     /// work from, as before. By default it sleeps to deadlines one period apart, so the work
     /// before that time and the sleep's overshoot do not add to every period.
     pub const OPTION_STANDARD_LOOP_DEADLINE: &str = "standard-loop-deadline";
+    /// `N` leaves a custom image quality that the encoder cannot take while it runs (VAAPI) to
+    /// the next time the encoder is made for another reason, as before. By default the encoder
+    /// is made again once the viewer has left the setting alone for a second.
+    pub const OPTION_CUSTOM_QUALITY_REMAKES_FIXED_ENCODER: &str =
+        "custom-quality-remakes-fixed-encoder";
     /// `off`, `warn` (default) or `enforce` for file clipboard messages that cross against
     /// the clipboard direction policy.
     pub const OPTION_FILE_CLIPBOARD_DIRECTION_CHECK: &str = "file-clipboard-direction-check";
@@ -4199,6 +4204,7 @@ pub mod keys {
         OPTION_MOVIE_TIERS_ABOVE_60,
         OPTION_LOGON_UI_CHECK_OFF_CAPTURE_THREAD,
         OPTION_STANDARD_LOOP_DEADLINE,
+        OPTION_CUSTOM_QUALITY_REMAKES_FIXED_ENCODER,
         OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS,
         OPTION_ALLOW_AUTO_UPDATE,
     ];
@@ -4371,6 +4377,7 @@ mod tests {
             keys::OPTION_MOVIE_TIERS_ABOVE_60,
             keys::OPTION_LOGON_UI_CHECK_OFF_CAPTURE_THREAD,
             keys::OPTION_STANDARD_LOOP_DEADLINE,
+            keys::OPTION_CUSTOM_QUALITY_REMAKES_FIXED_ENCODER,
         ] {
             assert!(keys::KEYS_SETTINGS.contains(&key), "{key}");
         }
