@@ -3935,6 +3935,10 @@ pub mod keys {
     /// is made again once the viewer has left the setting alone for a second.
     pub const OPTION_CUSTOM_QUALITY_REMAKES_FIXED_ENCODER: &str =
         "custom-quality-remakes-fixed-encoder";
+    /// `N` makes the Windows user capture helper of a host built with `vram` hand its frames to
+    /// the service in RAM, as before, so that the encoder is fed through RAM. By default it
+    /// hands them over in textures shared on the GPU, and the encoder takes them from there.
+    pub const OPTION_CAPTURE_HELPER_GPU_TEXTURE: &str = "capture-helper-gpu-texture";
     /// `off`, `warn` (default) or `enforce` for file clipboard messages that cross against
     /// the clipboard direction policy.
     pub const OPTION_FILE_CLIPBOARD_DIRECTION_CHECK: &str = "file-clipboard-direction-check";
@@ -4205,6 +4209,7 @@ pub mod keys {
         OPTION_LOGON_UI_CHECK_OFF_CAPTURE_THREAD,
         OPTION_STANDARD_LOOP_DEADLINE,
         OPTION_CUSTOM_QUALITY_REMAKES_FIXED_ENCODER,
+        OPTION_CAPTURE_HELPER_GPU_TEXTURE,
         OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS,
         OPTION_ALLOW_AUTO_UPDATE,
     ];
@@ -4378,6 +4383,7 @@ mod tests {
             keys::OPTION_LOGON_UI_CHECK_OFF_CAPTURE_THREAD,
             keys::OPTION_STANDARD_LOOP_DEADLINE,
             keys::OPTION_CUSTOM_QUALITY_REMAKES_FIXED_ENCODER,
+            keys::OPTION_CAPTURE_HELPER_GPU_TEXTURE,
         ] {
             assert!(keys::KEYS_SETTINGS.contains(&key), "{key}");
         }
