@@ -47,6 +47,11 @@ struct IoProgressState {
     active_write: Option<(&'static str, usize, Instant)>,
     completed_messages: u64,
     completed_bytes: u64,
+    // The speed at which the writer gets rid of data, measured over the time it spends
+    // writing: bytes and time of the sample being collected, and the last result.
+    drain_sample_bytes: u64,
+    drain_sample_busy: Duration,
+    drain_bytes_per_second: u64,
 }
 
 impl IoProgressState {
@@ -58,6 +63,22 @@ impl IoProgressState {
             active_write: None,
             completed_messages: 0,
             completed_bytes: 0,
+            drain_sample_bytes: 0,
+            drain_sample_busy: Duration::ZERO,
+            drain_bytes_per_second: 0,
+        }
+    }
+
+    /// Counts a finished write towards the drain speed.
+    fn note_drained(&mut self, bytes: usize, busy: Duration) {
+        self.drain_sample_bytes = self.drain_sample_bytes.saturating_add(bytes as u64);
+        self.drain_sample_busy = self.drain_sample_busy.saturating_add(busy);
+        if self.drain_sample_busy >= DRAIN_SPEED_SAMPLE {
+            let micros = self.drain_sample_busy.as_micros().max(1);
+            self.drain_bytes_per_second = (u128::from(self.drain_sample_bytes) * 1_000_000 / micros)
+                .min(u128::from(u64::MAX)) as u64;
+            self.drain_sample_bytes = 0;
+            self.drain_sample_busy = Duration::ZERO;
         }
     }
 }
@@ -75,6 +96,19 @@ enum OutboundEntry {
     Video((i32, u64), OutboundMessage),
 }
 
+/// How many entries bulk file data may leave waiting in a duplex outbox.
+///
+/// File blocks are produced by a timer, far faster than a slow link drains them. Without a
+/// bound they fill the whole outbox: the next block is refused with `WouldBlock`, and input,
+/// control messages and video wait behind megabytes of file data. Sixteen 128 KiB blocks keep
+/// the writer busy between timer ticks and leave the rest of the queue to everything else.
+const BULK_OUTBOX_MAX_ENTRIES: usize = 16;
+/// How long the data waiting in a duplex outbox may take to leave before bulk producers
+/// stop adding to it. Input and video queue behind file blocks, so this is what a transfer
+/// adds to their delay on a slow link. On a fast link `BULK_OUTBOX_MAX_ENTRIES` is the bound.
+const BULK_OUTBOX_TARGET_DELAY: Duration = Duration::from_millis(100);
+/// Time spent writing that one measurement of the drain speed covers.
+const DRAIN_SPEED_SAMPLE: Duration = Duration::from_millis(50);
 const MAX_PENDING_VIDEO_TRACKS: usize = 16;
 const MAX_VIDEO_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_VIDEO_BYTES: usize = 64 * 1024 * 1024;
@@ -255,6 +289,42 @@ impl OutboundQueue {
 
     fn len(&self) -> usize {
         self.state.lock().unwrap().entries.len()
+    }
+
+    /// Whether a bulk producer may queue more now, given the speed at which the writer
+    /// drains the queue (zero: not measured yet).
+    ///
+    /// The queue may hold what leaves in `BULK_OUTBOX_TARGET_DELAY`, and never more than
+    /// `BULK_OUTBOX_MAX_ENTRIES` entries or half of its capacity. An empty queue always takes
+    /// one message, otherwise a link slower than one block per target delay would never get
+    /// any. A closed queue answers yes so that the producer's next send reports the real
+    /// error instead of waiting forever.
+    fn has_bulk_room(&self, drain_bytes_per_second: u64) -> bool {
+        let state = self.state.lock().unwrap();
+        if state.closed {
+            return true;
+        }
+        if state.entries.len() >= BULK_OUTBOX_MAX_ENTRIES.min((state.capacity / 2).max(1)) {
+            return false;
+        }
+        let queued: u64 = state
+            .entries
+            .iter()
+            .map(|entry| match entry {
+                OutboundEntry::Reliable(message) | OutboundEntry::Video(_, message) => {
+                    message.bytes.len() as u64
+                }
+                OutboundEntry::Latest(key) => state
+                    .latest
+                    .get(key)
+                    .map(|message| message.bytes.len() as u64)
+                    .unwrap_or(0),
+            })
+            .sum();
+        let budget = (u128::from(drain_bytes_per_second) * BULK_OUTBOX_TARGET_DELAY.as_millis()
+            / 1_000)
+            .min(u128::from(u64::MAX)) as u64;
+        queued == 0 || queued < budget
     }
 
     fn counters(&self) -> (u64, u64) {
@@ -475,6 +545,13 @@ impl DuplexStream {
     }
 }
 
+impl DuplexStream {
+    fn file_send_ready(&self) -> bool {
+        let drain_bytes_per_second = self.progress.lock().unwrap().drain_bytes_per_second;
+        self.outbox.has_bulk_room(drain_bytes_per_second)
+    }
+}
+
 impl Drop for DuplexStream {
     fn drop(&mut self) {
         self.outbox.close();
@@ -543,6 +620,7 @@ async fn run_stream_writer(
                             state.last_write_at = Instant::now();
                             state.completed_messages = state.completed_messages.saturating_add(1);
                             state.completed_bytes = state.completed_bytes.saturating_add(bytes as u64);
+                            state.note_drained(bytes, started.elapsed());
                             drop(state);
                             if started.elapsed() >= SLOW_ASYNC_WRITE_THRESHOLD {
                                 log::warn!(
@@ -1030,6 +1108,34 @@ impl Stream {
         })
     }
 
+    /// Whether file-transfer data can be handed to `send` now.
+    ///
+    /// `send` does not wait on a duplex or QUIC stream: it queues the message or fails with
+    /// `WouldBlock`. Code that reads file blocks on a timer must check this first and read
+    /// nothing when it is false, otherwise a block that was read cannot be delivered.
+    pub fn file_send_ready(&self) -> bool {
+        match self {
+            Self::Duplex(stream) => stream.file_send_ready(),
+            #[cfg(feature = "quic-transport")]
+            Self::Quic(stream) => stream.file_send_ready(),
+            _ => true,
+        }
+    }
+
+    /// The largest serialized file message (a file action or a file response) this stream
+    /// carries, when that is less than any other message. `None` means no such limit.
+    ///
+    /// Over QUIC a larger file message is refused by `send`. Whoever builds a reply that can
+    /// grow with the user's data, such as a directory listing, checks this first and answers
+    /// with an error the peer can show.
+    pub fn file_message_limit(&self) -> Option<usize> {
+        match self {
+            #[cfg(feature = "quic-transport")]
+            Self::Quic(stream) => Some(stream.file_message_limit()),
+            _ => None,
+        }
+    }
+
     pub fn async_writer_progress(&self) -> Option<AsyncStreamProgressSnapshot> {
         match self {
             Self::Duplex(stream) => Some(stream.progress_snapshot()),
@@ -1067,6 +1173,102 @@ mod tests {
         task::{Context, Poll},
     };
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    #[tokio::test]
+    async fn only_a_quic_stream_limits_file_messages() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+        let local = tcp.local_addr().unwrap();
+        let stream = Stream::from(tcp, local);
+        assert_eq!(stream.file_message_limit(), None);
+        assert_eq!(stream.into_duplex(8).file_message_limit(), None);
+    }
+
+    fn block_message() -> OutboundMessage {
+        OutboundMessage {
+            bytes: Bytes::from(vec![0u8; 128 * 1024]),
+            kind: "FileBlock",
+            encrypt: true,
+            completion: None,
+        }
+    }
+
+    #[test]
+    fn bulk_data_gets_a_bounded_share_of_the_outbox() {
+        // A link so fast that only the number of entries bounds the queue.
+        const FAST: u64 = 1 << 40;
+        let queue = OutboundQueue::new(256);
+        for _ in 0..BULK_OUTBOX_MAX_ENTRIES {
+            assert!(queue.has_bulk_room(FAST));
+            queue.enqueue(block_message()).unwrap();
+        }
+        assert!(
+            !queue.has_bulk_room(FAST),
+            "bulk producers stop at the watermark"
+        );
+        // Everything else still has the rest of the queue.
+        queue.enqueue(message(b"input", "Input")).unwrap();
+        assert_eq!(queue.len(), BULK_OUTBOX_MAX_ENTRIES + 1);
+
+        // A small queue is never handed over to bulk data entirely.
+        let small = OutboundQueue::new(8);
+        for _ in 0..4 {
+            assert!(small.has_bulk_room(FAST));
+            small.enqueue(block_message()).unwrap();
+        }
+        assert!(!small.has_bulk_room(FAST));
+
+        // A closed queue reports room so that the producer's send surfaces the error.
+        small.close();
+        assert!(small.has_bulk_room(FAST));
+        assert!(small.enqueue(block_message()).is_err());
+    }
+
+    #[test]
+    fn bulk_data_waits_no_longer_than_the_target_delay_on_a_slow_link() {
+        const BLOCK: u64 = 128 * 1024;
+        // Not measured yet: one message at a time.
+        let queue = OutboundQueue::new(256);
+        assert!(queue.has_bulk_room(0));
+        queue.enqueue(block_message()).unwrap();
+        assert!(!queue.has_bulk_room(0));
+
+        // 10 Mbit/s drains less than one block in the target delay: still one at a time,
+        // so that nothing waits behind more than one block.
+        let ten_mbit = 10_000_000 / 8;
+        assert!(!queue.has_bulk_room(ten_mbit));
+
+        // A link that drains five blocks in the target delay holds five.
+        let five_blocks = 5 * BLOCK * 1_000 / BULK_OUTBOX_TARGET_DELAY.as_millis() as u64;
+        let queue = OutboundQueue::new(256);
+        let mut queued = 0;
+        while queue.has_bulk_room(five_blocks) {
+            queue.enqueue(block_message()).unwrap();
+            queued += 1;
+            assert!(queued <= BULK_OUTBOX_MAX_ENTRIES);
+        }
+        assert_eq!(queued, 5);
+        // Other data in the queue counts: video waiting there leaves no room for a block.
+        let queue = OutboundQueue::new(256);
+        queue.enqueue_video(0, 1, block_message()).unwrap();
+        assert!(!queue.has_bulk_room(ten_mbit));
+    }
+
+    #[test]
+    fn drain_speed_is_measured_over_the_time_spent_writing() {
+        let mut progress = IoProgressState::new();
+        assert_eq!(progress.drain_bytes_per_second, 0);
+        // 20 ms of writing is not a sample yet.
+        progress.note_drained(100_000, Duration::from_millis(20));
+        assert_eq!(progress.drain_bytes_per_second, 0);
+        // 50 ms for 250,000 bytes: five megabytes per second.
+        progress.note_drained(150_000, Duration::from_millis(30));
+        assert_eq!(progress.drain_bytes_per_second, 5_000_000);
+        // The next sample replaces it.
+        progress.note_drained(50_000, Duration::from_millis(100));
+        assert_eq!(progress.drain_bytes_per_second, 500_000);
+    }
 
     fn message(value: &'static [u8], kind: &'static str) -> OutboundMessage {
         OutboundMessage {

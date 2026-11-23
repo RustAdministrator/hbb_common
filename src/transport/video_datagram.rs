@@ -3,7 +3,7 @@ use super::protocol::{
     HEADER_LEN,
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     convert::{TryFrom, TryInto},
     time::{Duration, Instant},
 };
@@ -78,6 +78,17 @@ pub struct VideoReassemblyConfig {
     pub require_initial_keyframe: bool,
     pub keyframe_request_after_drops: u32,
     pub keyframe_request_interval: Duration,
+    /// How long after a frame was completed a frame with a lower id may still arrive and be
+    /// assembled. All streams of a connection share one sequence of ids and the datagrams of
+    /// two frames can arrive in either order; zero is "a completed frame closes everything
+    /// below it at once".
+    pub reorder_grace: Duration,
+    /// An incomplete delta frame below a completed one is given up before the grace is over
+    /// once nothing has arrived for it for this long. The datagrams of one frame are sent in
+    /// one run, before those of the next frame: what has not arrived by the time a later
+    /// frame is complete and the run has gone quiet is lost, not late. Waiting the whole
+    /// grace for it would only delay the request for a keyframe.
+    pub reorder_idle: Duration,
 }
 
 impl Default for VideoReassemblyConfig {
@@ -93,9 +104,15 @@ impl Default for VideoReassemblyConfig {
             require_initial_keyframe: true,
             keyframe_request_after_drops: 1,
             keyframe_request_interval: Duration::from_millis(500),
+            reorder_grace: Duration::from_millis(100),
+            reorder_idle: Duration::from_millis(10),
         }
     }
 }
+
+/// The most completions that are remembered while their grace runs. Far above what any frame
+/// rate reaches in the grace time; a bound for a peer that sends nothing but tiny frames.
+const MAX_REMEMBERED_COMPLETIONS: usize = 256;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct VideoReassemblyStats {
@@ -121,6 +138,12 @@ pub struct VideoReassemblyOutcome {
     pub frame: Option<CompleteVideoFrame>,
     pub dropped_frames: u32,
     pub request_keyframe: bool,
+    /// The highest `presentation_timestamp_us` among the `dropped_frames` that were dropped
+    /// incomplete. A sender that puts the id of the keyframe a delta follows into that field
+    /// lets the receiver tell a frame lost before its current keyframe from one lost after.
+    pub dropped_newest_timestamp_us: Option<u64>,
+    /// One of the `dropped_frames` was a keyframe.
+    pub dropped_keyframe: bool,
 }
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -239,6 +262,17 @@ pub struct VideoReassembler {
     pending: BTreeMap<u64, PendingFrame>,
     pending_bytes: usize,
     last_completed_frame_id: u64,
+    /// Every frame up to this id is finished with: completed, dropped or given up.
+    closed_frame_id: u64,
+    /// Frames above `closed_frame_id` that were completed, and when; in order of completion.
+    recent_completions: VecDeque<(Instant, u64)>,
+    /// Frames above `closed_frame_id` that are finished with already: completed, or given up.
+    finished_above_closed: BTreeSet<u64>,
+    /// The highest `presentation_timestamp_us` of the frames dropped incomplete since the
+    /// last `expire`.
+    dropped_newest_timestamp_us: Option<u64>,
+    /// Whether one of them was a keyframe.
+    dropped_keyframe: bool,
     has_completed_keyframe: bool,
     consecutive_dropped_frames: u32,
     last_keyframe_request: Option<Instant>,
@@ -259,6 +293,11 @@ impl VideoReassembler {
             pending: BTreeMap::new(),
             pending_bytes: 0,
             last_completed_frame_id: 0,
+            closed_frame_id: 0,
+            recent_completions: VecDeque::new(),
+            finished_above_closed: BTreeSet::new(),
+            dropped_newest_timestamp_us: None,
+            dropped_keyframe: false,
             has_completed_keyframe,
             consecutive_dropped_frames: 0,
             last_keyframe_request: None,
@@ -267,6 +306,19 @@ impl VideoReassembler {
     }
 
     pub fn push(
+        &mut self,
+        datagram: &[u8],
+        now: Instant,
+    ) -> Result<VideoReassemblyOutcome, VideoDatagramError> {
+        let mut outcome = self.push_fragment(datagram, now)?;
+        if outcome.dropped_frames > 0 {
+            outcome.dropped_newest_timestamp_us = self.dropped_newest_timestamp_us;
+            outcome.dropped_keyframe = self.dropped_keyframe;
+        }
+        Ok(outcome)
+    }
+
+    fn push_fragment(
         &mut self,
         datagram: &[u8],
         now: Instant,
@@ -283,7 +335,13 @@ impl VideoReassembler {
         let (fragment_header, fragment_payload) = decode_fragment_payload(message.payload)?;
         self.validate_fragment_header(fragment_header)?;
 
-        if fragment_header.metadata.frame_id <= self.last_completed_frame_id {
+        // Finished with: below the closed mark, or completed or given up while its
+        // neighbours' grace runs.
+        if fragment_header.metadata.frame_id <= self.closed_frame_id
+            || self
+                .finished_above_closed
+                .contains(&fragment_header.metadata.frame_id)
+        {
             self.stats.obsolete_fragments = self.stats.obsolete_fragments.saturating_add(1);
             return Ok(outcome);
         }
@@ -393,11 +451,15 @@ impl VideoReassembler {
         for fragment in complete.fragments {
             payload.extend_from_slice(fragment.as_deref().expect("all fragments are present"));
         }
-        self.last_completed_frame_id = complete.header.metadata.frame_id;
+        let completed_frame_id = complete.header.metadata.frame_id;
+        self.last_completed_frame_id = self.last_completed_frame_id.max(completed_frame_id);
+        self.finished_above_closed.insert(completed_frame_id);
+        self.recent_completions.push_back((now, completed_frame_id));
         if is_keyframe {
             self.has_completed_keyframe = true;
         }
-        let obsolete_frames = self.drop_obsolete_pending();
+        // A frame with a lower id is not given up at once: its datagrams may be right behind.
+        let obsolete_frames = self.close_completed(now);
         if obsolete_frames > 0 {
             self.record_drops(obsolete_frames);
             outcome.dropped_frames = outcome.dropped_frames.saturating_add(obsolete_frames);
@@ -415,6 +477,8 @@ impl VideoReassembler {
     }
 
     pub fn expire(&mut self, now: Instant) -> VideoReassemblyOutcome {
+        self.dropped_newest_timestamp_us = None;
+        self.dropped_keyframe = false;
         let expired: Vec<u64> = self
             .pending
             .iter()
@@ -449,11 +513,19 @@ impl VideoReassembler {
             self.drop_frame(frame_id, false);
             self.stats.expired_frames = self.stats.expired_frames.saturating_add(1);
         }
+        // Frames that stayed incomplete below a completed one: until its grace was over, or
+        // until nothing arrived for them any more.
+        let obsolete_frames = self.close_completed(now);
+        let dropped_frames = dropped_frames.saturating_add(obsolete_frames);
         self.record_drops(dropped_frames);
         VideoReassemblyOutcome {
             frame: None,
             dropped_frames,
             request_keyframe: self.should_request_keyframe(now),
+            dropped_newest_timestamp_us: self
+                .dropped_newest_timestamp_us
+                .filter(|_| dropped_frames > 0),
+            dropped_keyframe: self.dropped_keyframe && dropped_frames > 0,
         }
     }
 
@@ -461,6 +533,11 @@ impl VideoReassembler {
         self.pending.clear();
         self.pending_bytes = 0;
         self.last_completed_frame_id = 0;
+        self.closed_frame_id = 0;
+        self.recent_completions.clear();
+        self.finished_above_closed.clear();
+        self.dropped_newest_timestamp_us = None;
+        self.dropped_keyframe = false;
         self.has_completed_keyframe = !self.config.require_initial_keyframe;
         self.consecutive_dropped_frames = 0;
         self.last_keyframe_request = None;
@@ -523,6 +600,12 @@ impl VideoReassembler {
     fn drop_frame(&mut self, frame_id: u64, record_drop: bool) {
         if let Some(frame) = self.pending.remove(&frame_id) {
             self.pending_bytes = self.pending_bytes.saturating_sub(frame.received_bytes);
+            let timestamp_us = frame.header.metadata.presentation_timestamp_us;
+            self.dropped_newest_timestamp_us = Some(
+                self.dropped_newest_timestamp_us
+                    .map_or(timestamp_us, |newest| newest.max(timestamp_us)),
+            );
+            self.dropped_keyframe |= frame.header.metadata.flags & FLAG_KEYFRAME != 0;
             let missing = frame
                 .header
                 .fragment_count
@@ -537,10 +620,58 @@ impl VideoReassembler {
         }
     }
 
+    /// Moves the closed mark up to the frames that were completed at least the grace time
+    /// ago, and drops what is still incomplete below it; then gives up the delta frames below
+    /// a completed one for which nothing arrives any more. Returns how many frames that was.
+    fn close_completed(&mut self, now: Instant) -> u32 {
+        let mut closed = self.closed_frame_id;
+        while let Some((completed_at, frame_id)) = self.recent_completions.front().copied() {
+            if self.recent_completions.len() <= MAX_REMEMBERED_COMPLETIONS
+                && now.saturating_duration_since(completed_at) < self.config.reorder_grace
+            {
+                break;
+            }
+            closed = closed.max(frame_id);
+            self.recent_completions.pop_front();
+        }
+        let mut dropped = 0;
+        if closed != self.closed_frame_id {
+            self.closed_frame_id = closed;
+            self.finished_above_closed = self.finished_above_closed.split_off(&(closed + 1));
+            dropped = self.drop_obsolete_pending();
+        }
+        dropped.saturating_add(self.give_up_idle_below_completed(now))
+    }
+
+    /// A delta frame below a completed one whose datagrams stopped arriving is lost: it is
+    /// reported now, not when the grace of the completed frame is over. What arrives for it
+    /// later is ignored, so it is reported once.
+    ///
+    /// A keyframe waits for the whole grace: it is large, and nothing replaces it.
+    fn give_up_idle_below_completed(&mut self, now: Instant) -> u32 {
+        let idle: Vec<u64> = self
+            .pending
+            .range(..self.last_completed_frame_id)
+            .filter_map(|(frame_id, frame)| {
+                (frame.header.metadata.flags & FLAG_KEYFRAME == 0
+                    && now.saturating_duration_since(frame.last_progress_at)
+                        >= self.config.reorder_idle)
+                    .then_some(*frame_id)
+            })
+            .collect();
+        for frame_id in &idle {
+            self.drop_frame(*frame_id, false);
+            self.finished_above_closed.insert(*frame_id);
+        }
+        let count = u32::try_from(idle.len()).unwrap_or(u32::MAX);
+        self.stats.obsolete_frames = self.stats.obsolete_frames.saturating_add(u64::from(count));
+        count
+    }
+
     fn drop_obsolete_pending(&mut self) -> u32 {
         let obsolete: Vec<u64> = self
             .pending
-            .range(..=self.last_completed_frame_id)
+            .range(..=self.closed_frame_id)
             .map(|(frame_id, _)| *frame_id)
             .collect();
         for frame_id in &obsolete {
@@ -697,6 +828,25 @@ mod tests {
 
     fn datagrams(frame_id: u64, bytes: &[u8], max_size: usize) -> Vec<Vec<u8>> {
         fragment_video_frame([7; 16], 1, 42, metadata(frame_id), bytes, max_size).unwrap()
+    }
+
+    /// A delta frame in datagrams of at most 700 bytes; `timestamp_us` is what a sender with
+    /// the keyframe barrier uses for the id of the keyframe the delta follows.
+    fn delta_datagrams(frame_id: u64, timestamp_us: u64, bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut metadata = metadata(frame_id);
+        metadata.flags = 0;
+        metadata.presentation_timestamp_us = timestamp_us;
+        fragment_video_frame([7; 16], 1, 42, metadata, bytes, 700).unwrap()
+    }
+
+    fn reassembler_without_initial_keyframe(config: VideoReassemblyConfig) -> VideoReassembler {
+        VideoReassembler::new(VideoReassemblyConfig {
+            require_initial_keyframe: false,
+            // Long enough not to expire an incomplete frame by itself in these tests.
+            fragment_deadline: Duration::from_secs(5),
+            ..config
+        })
+        .unwrap()
     }
 
     #[test]
@@ -914,16 +1064,20 @@ mod tests {
     }
 
     #[test]
-    fn completing_new_frame_discards_old_partial_frame() {
+    fn completing_new_frame_discards_old_partial_frame_after_the_grace() {
         let now = Instant::now();
-        let mut reassembler = VideoReassembler::new(VideoReassemblyConfig::default()).unwrap();
+        let config = VideoReassemblyConfig::default();
+        let after_grace = now + config.reorder_grace;
+        let mut reassembler = VideoReassembler::new(config).unwrap();
         let old = datagrams(1, &[1; 3000], 700);
         reassembler.push(&old[0], now).unwrap();
         for packet in datagrams(2, &[2; 100], 700) {
             reassembler.push(&packet, now).unwrap();
         }
+        // Not at once: the rest of its datagrams may be right behind those of the newer frame.
+        assert!(reassembler.pending_memory_bytes() > 0);
+        assert_eq!(reassembler.push(&old[1], after_grace).unwrap().frame, None);
         assert_eq!(reassembler.pending_memory_bytes(), 0);
-        assert_eq!(reassembler.push(&old[1], now).unwrap().frame, None);
         assert_eq!(reassembler.stats().obsolete_frames, 1);
         assert_eq!(reassembler.stats().obsolete_fragments, 2);
     }
@@ -969,5 +1123,310 @@ mod tests {
             fragment_video_frame([1; 16], u64::MAX, 1, metadata(1), &frame, 100),
             Err(VideoDatagramError::SequenceOverflow)
         );
+    }
+
+    /// A frame with a lower id whose datagrams arrive right after a frame with a higher id has
+    /// been completed: two displays share one sequence, and an older sender, or the network,
+    /// can deliver them in this order. Both are whole frames and both must be handed on; which
+    /// of them can be decoded is decided per stream by the layer above.
+    #[test]
+    fn frame_arriving_right_after_a_newer_one_is_still_delivered() {
+        let now = Instant::now();
+        let mut reassembler = VideoReassembler::new(VideoReassemblyConfig {
+            require_initial_keyframe: false,
+            ..VideoReassemblyConfig::default()
+        })
+        .unwrap();
+        let mut delivered = Vec::new();
+        let mut dropped = 0;
+        let mut push_all = |frame_id: u64, at: Instant, reassembler: &mut VideoReassembler| {
+            for packet in datagrams(frame_id, &[frame_id as u8; 2000], 700) {
+                let outcome = reassembler.push(&packet, at).unwrap();
+                dropped += outcome.dropped_frames;
+                if let Some(frame) = outcome.frame {
+                    delivered.push(frame.metadata.frame_id);
+                }
+            }
+        };
+        push_all(9, now, &mut reassembler);
+        push_all(11, now + Duration::from_millis(1), &mut reassembler);
+        push_all(10, now + Duration::from_millis(3), &mut reassembler);
+        assert_eq!(delivered, vec![9, 11, 10]);
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn frame_left_incomplete_below_a_completed_one_is_dropped_when_the_grace_is_over() {
+        let now = Instant::now();
+        let config = VideoReassemblyConfig {
+            require_initial_keyframe: false,
+            // Long enough not to expire the incomplete frame by itself in this test.
+            fragment_deadline: Duration::from_secs(5),
+            ..VideoReassemblyConfig::default()
+        };
+        let grace = config.reorder_grace;
+        let mut reassembler = VideoReassembler::new(config).unwrap();
+        let old = datagrams(10, &[1; 3000], 700);
+        reassembler.push(&old[0], now).unwrap();
+        let mut completed = None;
+        for packet in datagrams(11, &[2; 1000], 700) {
+            let outcome = reassembler.push(&packet, now).unwrap();
+            assert_eq!(outcome.dropped_frames, 0, "not given up at once");
+            completed = outcome.frame.or(completed);
+        }
+        assert_eq!(completed.unwrap().metadata.frame_id, 11);
+
+        // Within the grace the rest of the older frame still completes it.
+        let mut late = None;
+        for packet in &old[1..] {
+            late = reassembler
+                .push(packet, now + grace / 2)
+                .unwrap()
+                .frame
+                .or(late);
+        }
+        assert_eq!(late.unwrap().metadata.frame_id, 10);
+
+        // Another one stays incomplete: when the grace of the newer frame is over it is
+        // dropped and reported, as before.
+        let stuck = datagrams(12, &[3; 3000], 700);
+        reassembler.push(&stuck[0], now + grace / 2).unwrap();
+        for packet in datagrams(13, &[4; 1000], 700) {
+            reassembler.push(&packet, now + grace / 2).unwrap();
+        }
+        let outcome = reassembler.expire(now + grace * 2);
+        assert_eq!(outcome.dropped_frames, 1);
+        assert!(outcome.request_keyframe);
+        // Its remaining datagrams are now too late.
+        let before = reassembler.stats().obsolete_fragments;
+        assert!(reassembler
+            .push(&stuck[1], now + grace * 2)
+            .unwrap()
+            .frame
+            .is_none());
+        assert!(reassembler.stats().obsolete_fragments > before);
+    }
+
+    #[test]
+    fn datagram_of_a_completed_frame_is_ignored_during_the_grace() {
+        let now = Instant::now();
+        let mut reassembler = VideoReassembler::new(VideoReassemblyConfig {
+            require_initial_keyframe: false,
+            ..VideoReassemblyConfig::default()
+        })
+        .unwrap();
+        let packets = datagrams(5, &[7; 2000], 700);
+        let mut completions = 0;
+        for packet in packets.iter().chain(packets.iter()) {
+            if reassembler.push(packet, now).unwrap().frame.is_some() {
+                completions += 1;
+            }
+        }
+        assert_eq!(
+            completions, 1,
+            "a repeated datagram must not rebuild the frame"
+        );
+        assert_eq!(reassembler.stats().obsolete_fragments, packets.len() as u64);
+    }
+
+    #[test]
+    fn without_a_grace_a_completed_frame_closes_everything_below_it() {
+        let now = Instant::now();
+        let mut reassembler = VideoReassembler::new(VideoReassemblyConfig {
+            require_initial_keyframe: false,
+            reorder_grace: Duration::ZERO,
+            ..VideoReassemblyConfig::default()
+        })
+        .unwrap();
+        let mut delivered = Vec::new();
+        for frame_id in [9u64, 11, 10] {
+            for packet in datagrams(frame_id, &[frame_id as u8; 2000], 700) {
+                if let Some(frame) = reassembler.push(&packet, now).unwrap().frame {
+                    delivered.push(frame.metadata.frame_id);
+                }
+            }
+        }
+        assert_eq!(delivered, vec![9, 11]);
+    }
+
+    /// One stream at thirty frames a second. A datagram of frame 10 is lost; frame 11
+    /// arrives a frame time later. Nothing has come for frame 10 since: it is reported with
+    /// the completion of frame 11, not a grace time later, when the keyframe that was asked
+    /// for because of the gap may already be here.
+    #[test]
+    fn delta_that_stopped_arriving_is_given_up_when_a_later_frame_is_complete() {
+        let now = Instant::now();
+        let config = VideoReassemblyConfig::default();
+        let grace = config.reorder_grace;
+        let mut reassembler = reassembler_without_initial_keyframe(config);
+        let lost = delta_datagrams(10, 4, &[1; 3000]);
+        for packet in &lost[..lost.len() - 1] {
+            assert_eq!(reassembler.push(packet, now).unwrap().dropped_frames, 0);
+        }
+        let frame_time = Duration::from_millis(33);
+        let mut completed = None;
+        let mut dropped = 0;
+        let mut dropped_timestamp = None;
+        for packet in delta_datagrams(11, 4, &[2; 1000]) {
+            let outcome = reassembler.push(&packet, now + frame_time).unwrap();
+            dropped += outcome.dropped_frames;
+            dropped_timestamp = outcome.dropped_newest_timestamp_us.or(dropped_timestamp);
+            if outcome.frame.is_some() {
+                assert_eq!(outcome.dropped_frames, 1, "reported with the completion");
+                assert!(outcome.request_keyframe);
+            }
+            completed = outcome.frame.or(completed);
+        }
+        assert_eq!(completed.unwrap().metadata.frame_id, 11);
+        assert_eq!(dropped, 1);
+        assert_eq!(
+            dropped_timestamp,
+            Some(4),
+            "the keyframe the lost delta followed"
+        );
+        assert_eq!(reassembler.pending_memory_bytes(), 0);
+
+        // Its last datagram, should it still come, is ignored, and the frame is not
+        // reported a second time when the grace is over.
+        let before = reassembler.stats().obsolete_fragments;
+        let late = reassembler
+            .push(
+                &lost[lost.len() - 1],
+                now + frame_time + Duration::from_millis(1),
+            )
+            .unwrap();
+        assert!(late.frame.is_none());
+        assert_eq!(late.dropped_frames, 0);
+        assert_eq!(reassembler.stats().obsolete_fragments, before + 1);
+        assert_eq!(reassembler.pending_memory_bytes(), 0);
+        let after_grace = reassembler.expire(now + frame_time + grace * 2);
+        assert_eq!(after_grace.dropped_frames, 0);
+        assert_eq!(after_grace.dropped_newest_timestamp_us, None);
+    }
+
+    /// Two frames sent one right after the other, their datagrams mixed on the way: the
+    /// frame with the lower id is still arriving when the one above it is complete. It is
+    /// not given up, and it is delivered.
+    #[test]
+    fn delta_that_is_still_arriving_below_a_completed_frame_is_waited_for() {
+        let now = Instant::now();
+        let mut reassembler =
+            reassembler_without_initial_keyframe(VideoReassemblyConfig::default());
+        let lower = delta_datagrams(10, 4, &[1; 3000]);
+        for packet in &lower[..lower.len() - 1] {
+            reassembler.push(packet, now).unwrap();
+        }
+        let mut delivered = Vec::new();
+        for packet in delta_datagrams(11, 4, &[2; 1000]) {
+            let outcome = reassembler
+                .push(&packet, now + Duration::from_millis(1))
+                .unwrap();
+            assert_eq!(outcome.dropped_frames, 0);
+            delivered.extend(outcome.frame.map(|frame| frame.metadata.frame_id));
+        }
+        let outcome = reassembler
+            .push(&lower[lower.len() - 1], now + Duration::from_millis(3))
+            .unwrap();
+        assert_eq!(outcome.dropped_frames, 0);
+        delivered.extend(outcome.frame.map(|frame| frame.metadata.frame_id));
+        assert_eq!(delivered, vec![11, 10]);
+    }
+
+    /// A frame below a completed one for which a datagram keeps coming every few
+    /// milliseconds is never idle; the grace of the completed frame still bounds the wait.
+    #[test]
+    fn delta_that_keeps_arriving_below_a_completed_frame_is_given_up_after_the_grace() {
+        let now = Instant::now();
+        let config = VideoReassemblyConfig::default();
+        let grace = config.reorder_grace;
+        let step = config.reorder_idle / 2;
+        let mut reassembler = reassembler_without_initial_keyframe(config);
+        let slow = delta_datagrams(10, 4, &[1; 40_000]);
+        reassembler.push(&slow[0], now).unwrap();
+        for packet in delta_datagrams(11, 4, &[2; 500]) {
+            assert_eq!(reassembler.push(&packet, now).unwrap().dropped_frames, 0);
+        }
+        let mut dropped_at = None;
+        for (index, packet) in slow[1..slow.len() - 1].iter().enumerate() {
+            let at = now + step * (index as u32 + 1);
+            if reassembler.push(packet, at).unwrap().dropped_frames > 0 {
+                dropped_at = Some(at);
+                break;
+            }
+        }
+        let dropped_at = dropped_at.expect("given up when the grace was over");
+        assert!(
+            dropped_at >= now + grace,
+            "given up while it was still arriving"
+        );
+        assert!(dropped_at < now + grace + step * 2);
+    }
+
+    /// A keyframe sent in datagrams is large and nothing replaces it: below a completed
+    /// frame it waits for the whole grace, quiet or not.
+    #[test]
+    fn keyframe_below_a_completed_frame_waits_for_the_whole_grace() {
+        let now = Instant::now();
+        let config = VideoReassemblyConfig {
+            keyframe_fragment_deadline: Duration::from_secs(5),
+            ..VideoReassemblyConfig::default()
+        };
+        let grace = config.reorder_grace;
+        let mut reassembler = reassembler_without_initial_keyframe(config);
+        let keyframe = datagrams(10, &[1; 3000], 700);
+        for packet in &keyframe[..keyframe.len() - 1] {
+            reassembler.push(packet, now).unwrap();
+        }
+        for packet in delta_datagrams(11, 4, &[2; 500]) {
+            assert_eq!(reassembler.push(&packet, now).unwrap().dropped_frames, 0);
+        }
+        assert_eq!(reassembler.expire(now + grace / 2).dropped_frames, 0);
+        let outcome = reassembler
+            .push(&keyframe[keyframe.len() - 1], now + grace / 2)
+            .unwrap();
+        assert_eq!(outcome.frame.unwrap().metadata.frame_id, 10);
+    }
+
+    /// Of several frames dropped together the report names the newest timestamp.
+    #[test]
+    fn report_of_dropped_frames_names_the_newest_timestamp() {
+        let now = Instant::now();
+        let mut reassembler =
+            reassembler_without_initial_keyframe(VideoReassemblyConfig::default());
+        reassembler
+            .push(&delta_datagrams(10, 4, &[1; 3000])[0], now)
+            .unwrap();
+        reassembler
+            .push(&delta_datagrams(11, 9, &[1; 3000])[0], now)
+            .unwrap();
+        let mut dropped = 0;
+        let mut timestamp = None;
+        for packet in delta_datagrams(12, 9, &[2; 500]) {
+            let outcome = reassembler
+                .push(&packet, now + Duration::from_millis(33))
+                .unwrap();
+            dropped += outcome.dropped_frames;
+            timestamp = outcome.dropped_newest_timestamp_us.or(timestamp);
+        }
+        assert_eq!(dropped, 2);
+        assert_eq!(timestamp, Some(9));
+    }
+
+    /// A dropped keyframe is named as one: its timestamp field is not the id of a keyframe
+    /// it follows, and the receiver must not read it as that.
+    #[test]
+    fn report_of_a_dropped_keyframe_says_so() {
+        let now = Instant::now();
+        let config = VideoReassemblyConfig::default();
+        let deadline = config.keyframe_fragment_deadline;
+        let mut reassembler = VideoReassembler::new(config).unwrap();
+        let first = reassembler
+            .push(&datagrams(10, &[1; 3000], 700)[0], now)
+            .unwrap();
+        assert!(!first.dropped_keyframe);
+        let expired = reassembler.expire(now + deadline);
+        assert_eq!(expired.dropped_frames, 1);
+        assert!(expired.dropped_keyframe);
+        assert!(!reassembler.expire(now + deadline * 2).dropped_keyframe);
     }
 }

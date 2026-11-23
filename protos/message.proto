@@ -237,7 +237,9 @@ message MouseEvent {
 
 // Physical keyboard family metadata is independent of source language and IME.
 enum KeyboardFamily {
-  Unknown = 0;
+  // Enum values share the package scope in protoc, and `ControlKey` already
+  // declares `Unknown`; the number on the wire is unchanged.
+  KeyboardFamilyUnknown = 0;
   Ansi = 1;
   Iso = 2;
   Jis = 3;

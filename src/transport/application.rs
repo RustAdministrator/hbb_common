@@ -5,6 +5,10 @@ use super::{
         DatagramReceiveEvent, QuicDatagramReceiver, QuicDatagramSendCoordinator,
         QuicDatagramSender, VideoDatagramSendOutcome, DEFAULT_INTERACTIVE_DATAGRAM_RESERVE_BYTES,
     },
+    file_rate::{
+        cap_was_binding, next_file_rate_kbps, FileRateLimiter, FileRatePlan, FileRateShared,
+        FileRateSignals, MinRttWindow, FILE_RATE_TICK, FILE_RATE_VIDEO_IDLE,
+    },
     input::MouseMovementMode,
     protocol::MessageType,
     quic::{
@@ -50,6 +54,10 @@ const CONTROL_OUTBOUND_CAPACITY: usize = 128;
 const INPUT_OUTBOUND_CAPACITY: usize = 128;
 const CLIPBOARD_OUTBOUND_CAPACITY: usize = 16;
 const FILE_OUTBOUND_CAPACITY: usize = 32;
+/// Slots of the file channel queue that file blocks never take, so that file-manager
+/// requests and replies (listings, confirmations, cancel) still get through while a
+/// transfer is waiting for the channel to drain.
+const FILE_OUTBOUND_BULK_RESERVE: usize = 8;
 const DIAGNOSTICS_OUTBOUND_CAPACITY: usize = 64;
 const AUDIO_OUTBOUND_CAPACITY: usize = 64;
 const CHANNEL_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -178,6 +186,35 @@ struct QuicApplicationMetrics {
     video_delivery_lock: Mutex<()>,
     video_receive_recovery: Mutex<VideoReceiveRecovery>,
     video_epoch_holdback: Mutex<VideoEpochHoldback>,
+    // When video was last sent or received, on the clock of `process_clock_us`. Zero: never.
+    video_activity_us: AtomicU64,
+}
+
+/// Microseconds on a clock that starts when it is first read. Never zero.
+fn process_clock_us() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    (START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_micros()
+        .min(u128::from(u64::MAX - 1)) as u64)
+        + 1
+}
+
+impl QuicApplicationMetrics {
+    /// A video frame is being sent, or video data arrived.
+    fn note_video_activity(&self) {
+        self.video_activity_us
+            .store(process_clock_us(), Ordering::Relaxed);
+    }
+
+    /// Whether video was sent or received within `idle`.
+    fn video_active_within(&self, idle: Duration) -> bool {
+        let last = self.video_activity_us.load(Ordering::Relaxed);
+        last != 0
+            && process_clock_us().saturating_sub(last)
+                <= idle.as_micros().min(u128::from(u64::MAX)) as u64
+    }
 }
 
 struct VideoSendRecovery {
@@ -475,6 +512,23 @@ impl VideoEpochHoldback {
         self.streams.retain(|key, _| {
             key.display != info.key.display || key.stream_id == info.key.stream_id
         });
+        // The keyframe replaces every older epoch of its stream: those frames are not waited
+        // for any more, and a gap among them needs no keyframe of its own. Without this the gap
+        // that made the viewer ask for this keyframe asked for another one as it arrived.
+        if let Some(state) = self.streams.get_mut(&info.key) {
+            let superseded = state
+                .pending
+                .keys()
+                .copied()
+                .filter(|(epoch, _)| *epoch < info.frame_id)
+                .collect::<Vec<_>>();
+            for key in superseded {
+                if let Some(frame) = state.pending.remove(&key) {
+                    state.pending_bytes = state.pending_bytes.saturating_sub(frame.payload.len());
+                }
+            }
+            state.gap_started_at = None;
+        }
         let mut outcome = self.expire(now, reorder_window);
         self.prepare_stream(info.key, &mut outcome);
         let state = self.streams.entry(info.key).or_default();
@@ -606,6 +660,8 @@ impl VideoEpochHoldback {
 #[derive(Clone, Copy, Debug, Default)]
 struct VideoReceiveState {
     last_frame_id: u64,
+    /// The keyframe the stream is decoded from now; zero before the first one.
+    keyframe_id: u64,
     awaiting_keyframe: bool,
     codec: Option<VideoCodec>,
 }
@@ -707,6 +763,7 @@ impl VideoReceiveRecovery {
             let state = self.streams.entry(info.key).or_default();
             state.codec = Some(info.codec);
             state.last_frame_id = info.frame_id;
+            state.keyframe_id = info.frame_id;
             state.awaiting_keyframe = false;
             return VideoReceiveDecision::Accept;
         }
@@ -735,6 +792,41 @@ impl VideoReceiveRecovery {
         for state in self.streams.values_mut() {
             state.awaiting_keyframe = true;
         }
+    }
+
+    /// A frame was lost in reassembly. The datagram header has no stream key, so it cannot be
+    /// told whose it was.
+    ///
+    /// With one stream it is that stream's, and it waits for a keyframe at once. With several,
+    /// marking them all made every display wait for a keyframe because one of them lost a
+    /// frame. The stream that did lose it shows a gap in its own frame ids at its next frame,
+    /// and `observe` stops it there: a delta is only ever accepted when it follows the last
+    /// accepted frame of its own stream. A frame lost whole, with none of its datagrams
+    /// arriving, has always been found that way.
+    fn note_unattributed_loss(&mut self) {
+        if self.streams.len() <= 1 {
+            self.mark_reference_loss();
+        }
+    }
+
+    /// Whether a frame lost in reassembly can be one the picture decoded now depends on.
+    ///
+    /// `reference_keyframe_id` is the id of the keyframe the lost delta followed, where the
+    /// sender puts it on the wire. The report of a loss can come after the keyframe that
+    /// repaired it: a frame lost before the keyframe the one stream is decoded from now took
+    /// nothing from the picture, and stopping the stream for it would freeze a picture that
+    /// has just recovered. A frame that follows a keyframe still on its way is found by the
+    /// gap in the frame ids once that keyframe is here.
+    fn unattributed_loss_is_current(&self, reference_keyframe_id: Option<u64>) -> bool {
+        let Some(reference_keyframe_id) = reference_keyframe_id else {
+            return true;
+        };
+        if self.streams.len() != 1 {
+            return true;
+        }
+        self.streams.values().next().map_or(true, |state| {
+            state.keyframe_id == 0 || state.keyframe_id == reference_keyframe_id
+        })
     }
 
     fn mark_stream_reference_loss(&mut self, key: VideoStreamKey) {
@@ -1208,6 +1300,7 @@ pub struct QuicApplicationStream {
     video_send_recovery: Arc<VideoSendRecovery>,
     latest_mouse: Arc<LatestSlot<MouseOutbound>>,
     datagram_send: Arc<QuicDatagramSendCoordinator>,
+    file_rate: Arc<FileRateShared>,
     audio_format: Arc<AtomicU64>,
     next_transport_frame_id: AtomicU64,
     video_ordering: Arc<VideoOrderingGate>,
@@ -1293,6 +1386,13 @@ impl QuicApplicationStream {
             None,
         );
         tasks.extend(task_pair);
+        let file_rate_plan = FileRatePlan::new(
+            NetworkTransportConfig::load()
+                .map_err(|error| QuicTransportError::Configuration(error.to_string()))?
+                .file_bandwidth_limit,
+            agreement.max_file_bitrate_kbps,
+        );
+        let file_rate = Arc::new(FileRateShared::new(&file_rate_plan));
         let (file, task_pair) = spawn_reliable_channel(
             channels.file,
             ReliableChannelKind::FileTransfer,
@@ -1301,7 +1401,7 @@ impl QuicApplicationStream {
             connection.clone(),
             video_ordering.clone(),
             metrics.clone(),
-            Some(agreement.max_file_bitrate_kbps),
+            Some(file_rate.clone()),
         );
         tasks.extend(task_pair);
         let (diagnostics, task_pair) = spawn_reliable_channel(
@@ -1345,6 +1445,14 @@ impl QuicApplicationStream {
             DEFAULT_INTERACTIVE_DATAGRAM_RESERVE_BYTES,
             connection.datagram_send_buffer_space(),
         );
+        if file_rate_plan.automatic {
+            tasks.push(tokio::spawn(run_file_rate_controller(
+                file_rate.clone(),
+                connection.clone(),
+                datagram_send.clone(),
+                metrics.clone(),
+            )));
+        }
         let negotiated_datagram_size = usize::from(agreement.max_datagram_payload);
         tasks.push(tokio::spawn(run_video_writer(
             QuicDatagramSender::new(connection.clone(), session_id)
@@ -1398,13 +1506,15 @@ impl QuicApplicationStream {
         )));
 
         log::info!(
-            "QUIC application channels ready: role={role:?}, protocol={application_protocol:?}, reliable_keyframes={}, keyframe_barrier={}, local={local_addr}, peer={}, mtu={}, datagram_payload_live={:?}, datagram_payload_negotiated={}",
+            "QUIC application channels ready: role={role:?}, protocol={application_protocol:?}, reliable_keyframes={}, keyframe_barrier={}, local={local_addr}, peer={}, mtu={}, datagram_payload_live={:?}, datagram_payload_negotiated={}, file_rate_ceiling_kbps={:?}, file_rate_automatic={}",
             agreement.reliable_keyframes,
             agreement.reliable_keyframe_barrier,
             connection.remote_address(),
             connection.stats().path.current_mtu,
             connection.max_datagram_size(),
             agreement.max_datagram_payload,
+            file_rate_plan.ceiling_kbps,
+            file_rate_plan.automatic,
         );
         Ok(Self {
             connection,
@@ -1421,6 +1531,7 @@ impl QuicApplicationStream {
             video_send_recovery,
             latest_mouse,
             datagram_send,
+            file_rate,
             audio_format: Arc::new(AtomicU64::new(0)),
             next_transport_frame_id: AtomicU64::new(1),
             video_ordering,
@@ -1437,6 +1548,37 @@ impl QuicApplicationStream {
 
     pub fn enqueue(&self, payload: Bytes) -> crate::ResultType<()> {
         self.enqueue_with_latest_key(None, payload)
+    }
+
+    /// Whether the file channel can take another block of file data. `enqueue` never waits:
+    /// when the channel queue is full it returns `WouldBlock`. A closing or closed stream
+    /// answers yes so that the next `enqueue` reports the real error.
+    pub fn file_send_ready(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
+            || self.file.is_closed()
+            || self.file.capacity() > FILE_OUTBOUND_BULK_RESERVE
+    }
+
+    /// The cap the file channel applies right now, in kilobits per second. `None`: no cap.
+    pub fn file_rate_cap_kbps(&self) -> Option<u64> {
+        self.file_rate.cap_kbps()
+    }
+
+    /// Replaces the agreed ceiling of the file channel. For tests that need a known rate.
+    #[cfg(test)]
+    pub(crate) fn set_file_rate_ceiling_kbps(&self, kbps: Option<u64>) {
+        self.file_rate.set_ceiling_kbps(kbps);
+    }
+
+    /// The largest serialized file message (a file action or a file response) this stream
+    /// carries. A sender checks this before it builds a large reply such as a directory
+    /// listing, so that it can answer with an error instead.
+    pub fn file_message_limit(&self) -> usize {
+        if self.raw_mode.load(Ordering::Acquire) {
+            MessageType::ApplicationRaw.max_payload_len()
+        } else {
+            MessageType::FileChunk.max_payload_len()
+        }
     }
 
     pub fn enqueue_latest(&self, key: u64, payload: Bytes) -> crate::ResultType<()> {
@@ -1503,6 +1645,7 @@ impl QuicApplicationStream {
         }
         match classify_message(&message)? {
             ApplicationClass::Video(mut metadata) => {
+                self.metrics.note_video_activity();
                 metadata.frame_id = self
                     .next_transport_frame_id
                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
@@ -1575,6 +1718,20 @@ impl QuicApplicationStream {
             }
             class => {
                 let (sender, message_type) = reliable_sender(self, class);
+                if class == ApplicationClass::File && payload.len() > message_type.max_payload_len()
+                {
+                    // The writer cannot frame this message, and its failure closes the whole
+                    // connection. Refuse it here, where the caller can still answer its peer.
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        format!(
+                            "file message of {} bytes is above the {} bytes a QUIC file channel carries",
+                            payload.len(),
+                            message_type.max_payload_len()
+                        ),
+                    )
+                    .into());
+                }
                 sender
                     .try_send(ReliableOutbound {
                         message_type,
@@ -1958,11 +2115,7 @@ fn application_session_offer(
     } else {
         current_datagram_payload
     } as u16;
-    let file_kbps = if config.file_bandwidth_limit_mbps == 0 {
-        1_000_000
-    } else {
-        config.file_bandwidth_limit_mbps.saturating_mul(1_000)
-    };
+    let file_kbps = config.file_bandwidth_limit.advertised_kbps();
     Ok(SessionOffer {
         minimum_protocol_version: application_protocol as u16,
         maximum_protocol_version: application_protocol as u16,
@@ -2092,7 +2245,7 @@ fn spawn_reliable_channel(
     connection: Connection,
     video_ordering: Arc<VideoOrderingGate>,
     metrics: Arc<QuicApplicationMetrics>,
-    bandwidth_limit_kbps: Option<u32>,
+    rate: Option<Arc<FileRateShared>>,
 ) -> (mpsc::Sender<ReliableOutbound>, [JoinHandle<()>; 2]) {
     let (sender, receiver) = channel.into_split();
     let (outbound, outbound_rx) = mpsc::channel(capacity);
@@ -2103,7 +2256,7 @@ fn spawn_reliable_channel(
         outbound_rx,
         writer_inbound,
         writer_connection,
-        bandwidth_limit_kbps,
+        rate,
     ));
     let internal_control = (kind == ReliableChannelKind::Control).then(|| outbound.clone());
     let reader = tokio::spawn(run_reliable_reader(
@@ -2124,26 +2277,25 @@ async fn run_reliable_writer(
     mut outbound: mpsc::Receiver<ReliableOutbound>,
     inbound: mpsc::Sender<Result<BytesMut, Error>>,
     connection: Connection,
-    bandwidth_limit_kbps: Option<u32>,
+    rate: Option<Arc<FileRateShared>>,
 ) {
     let started = Instant::now();
+    let mut limiter = FileRateLimiter::default();
     while let Some(message) = outbound.recv().await {
         let ReliableOutbound {
             message_type,
             payload,
             completion,
         } = message;
-        if let Some(kbps) = bandwidth_limit_kbps.filter(|value| *value > 0) {
-            let bits = (payload.len() as u128).saturating_mul(8);
-            let delay_us = bits
-                .saturating_mul(1_000)
-                .div_ceil(u128::from(kbps))
-                .min(u128::from(u64::MAX)) as u64;
-            tokio::time::sleep(Duration::from_micros(delay_us)).await;
+        if let Some(rate) = rate.as_ref() {
+            limiter.pace(payload.len(), rate.cap_kbps()).await;
         }
         let timestamp = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         match sender.send(message_type, 0, timestamp, &payload).await {
             Ok(_) => {
+                if let Some(rate) = rate.as_ref() {
+                    rate.add_sent(payload.len());
+                }
                 if let Some(completion) = completion {
                     let _ = completion.send(Ok(()));
                 }
@@ -2159,6 +2311,70 @@ async fn run_reliable_writer(
         }
     }
     let _ = sender.finish();
+}
+
+/// The automatic mode of the file channel: once per tick it looks at the path and at the
+/// video, and sets what the file channel may send. See `file_rate`.
+async fn run_file_rate_controller(
+    rate: Arc<FileRateShared>,
+    connection: Connection,
+    datagram_send: Arc<QuicDatagramSendCoordinator>,
+    metrics: Arc<QuicApplicationMetrics>,
+) {
+    let mut ticks = tokio::time::interval(FILE_RATE_TICK);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut rtt_window = MinRttWindow::default();
+    let mut last_tick = Instant::now();
+    let mut last_rejected = datagram_send.stats().video_frames_rejected;
+    let mut last_congestion_events = connection.stats().path.congestion_events;
+    let mut last_sent = rate.sent_bytes();
+    loop {
+        ticks.tick().await;
+        if connection.close_reason().is_some() {
+            return;
+        }
+        let now = Instant::now();
+        let interval = now.saturating_duration_since(last_tick);
+        last_tick = now;
+        if interval.is_zero() {
+            continue;
+        }
+        let path = connection.stats().path;
+        let rejected = datagram_send.stats().video_frames_rejected;
+        let sent = rate.sent_bytes();
+        let signals = FileRateSignals {
+            video_active: metrics.video_active_within(FILE_RATE_VIDEO_IDLE),
+            smoothed_rtt: path.rtt,
+            min_rtt: rtt_window.update(now, path.rtt),
+            video_frames_rejected: rejected.saturating_sub(last_rejected),
+            congestion_events: path
+                .congestion_events
+                .saturating_sub(last_congestion_events),
+            cap_was_binding: cap_was_binding(
+                sent.saturating_sub(last_sent),
+                interval,
+                rate.cap_kbps(),
+            ),
+        };
+        last_rejected = rejected;
+        last_congestion_events = path.congestion_events;
+        last_sent = sent;
+        let current = rate.controller_kbps();
+        let next = next_file_rate_kbps(current, &signals);
+        if next != current {
+            log::debug!(
+                "QUIC file rate: {:?} -> {:?} kbps (video_active={}, rtt_ms={}, min_rtt_ms={}, video_frames_rejected={}, congestion_events={})",
+                current,
+                next,
+                signals.video_active,
+                signals.smoothed_rtt.as_millis(),
+                signals.min_rtt.as_millis(),
+                signals.video_frames_rejected,
+                signals.congestion_events,
+            );
+            rate.set_controller_kbps(next);
+        }
+    }
 }
 
 async fn run_reliable_reader(
@@ -2270,6 +2486,7 @@ async fn run_reliable_reader(
         };
         if let (Some(info), Some(context)) = (reliable_video, video_context.as_ref()) {
             if context.keyframe_barrier {
+                metrics.note_video_activity();
                 metrics
                     .reliable_keyframes_received
                     .fetch_add(1, Ordering::Relaxed);
@@ -2346,6 +2563,7 @@ async fn run_reliable_reader(
             return;
         }
         if let Some(info) = reliable_video {
+            metrics.note_video_activity();
             metrics
                 .reliable_keyframes_received
                 .fetch_add(1, Ordering::Relaxed);
@@ -2377,6 +2595,21 @@ async fn run_local_video_refresh(
     }
 }
 
+/// The frame id that goes on the wire for a frame that is about to be sent in datagrams: the
+/// next one in the order of sending.
+///
+/// The id a frame gets when it is queued (`metadata.frame_id`) follows the order of queueing
+/// and stays what the sender's own recovery bookkeeping compares. The writer does not send in
+/// that order: it serves the tracks by bytes, so with two displays a small frame queued later
+/// goes out before a large one queued earlier. The receiver has one sequence for all streams
+/// and drops a frame whose id is not above the last one it completed, so with the queueing id
+/// on the wire it silently discarded the large frame.
+fn wire_frame_id(_item: &VideoOutbound, next_wire_frame_id: &mut u64) -> u64 {
+    let id = *next_wire_frame_id;
+    *next_wire_frame_id = next_wire_frame_id.saturating_add(1);
+    id
+}
+
 async fn run_video_writer(
     mut sender: QuicDatagramSender,
     video: Arc<TrackLatestSlot>,
@@ -2390,6 +2623,7 @@ async fn run_video_writer(
 ) {
     let started = Instant::now();
     let mut reference_epochs = BTreeMap::<VideoStreamKey, u64>::new();
+    let mut next_wire_frame_id = 1u64;
     loop {
         let mut item = tokio::select! {
             item = video.take() => item,
@@ -2487,7 +2721,9 @@ async fn run_video_writer(
                 continue;
             }
         }
-        match sender.send_video_frame(item.metadata, &item.payload) {
+        let mut wire_metadata = item.metadata;
+        wire_metadata.frame_id = wire_frame_id(&item, &mut next_wire_frame_id);
+        match sender.send_video_frame(wire_metadata, &item.payload) {
             Ok(VideoDatagramSendOutcome::Sent { .. }) => {}
             Ok(VideoDatagramSendOutcome::RejectedNoSpace {
                 failure,
@@ -2601,6 +2837,49 @@ async fn run_audio_writer(
     }
 }
 
+/// Hands every audio packet that is due to the session, with the format message before the
+/// first one of a new format. `false` when the session is gone.
+async fn deliver_ready_audio(
+    receiver: &mut QuicDatagramReceiver,
+    inbound: &mpsc::Sender<Result<BytesMut, Error>>,
+    received_audio_format: &mut Option<(u32, u8)>,
+) -> bool {
+    while let Some(item) = receiver.pop_audio(Instant::now()) {
+        match item {
+            AudioPlayoutItem::Packet(packet) => {
+                let format = (packet.metadata.sample_rate_hz, packet.metadata.channels);
+                if *received_audio_format != Some(format) {
+                    let format_message = audio_format_message(format.0, format.1);
+                    if inbound
+                        .send(Ok(BytesMut::from(format_message.as_slice())))
+                        .await
+                        .is_err()
+                    {
+                        return false;
+                    }
+                    *received_audio_format = Some(format);
+                }
+                if validate_datagram_application_message(
+                    ApplicationClassTag::Audio,
+                    &packet.payload,
+                )
+                .is_ok()
+                    && inbound
+                        .send(Ok(BytesMut::from(packet.payload.as_slice())))
+                        .await
+                        .is_err()
+                {
+                    return false;
+                }
+            }
+            AudioPlayoutItem::PacketLoss { sequence_number } => {
+                log::debug!("QUIC audio packet loss: sequence={sequence_number}");
+            }
+        }
+    }
+    true
+}
+
 async fn run_datagram_reader(
     mut receiver: QuicDatagramReceiver,
     inbound: mpsc::Sender<Result<BytesMut, Error>>,
@@ -2626,6 +2905,12 @@ async fn run_datagram_reader(
                 }
             }
             _ = video_expiry.tick() => {
+                // The last packets of a burst wait for the playout delay; nothing arrives to
+                // ask for them again.
+                if !deliver_ready_audio(&mut receiver, &inbound, &mut received_audio_format).await
+                {
+                    return;
+                }
                 let outcome = receiver.expire_video(Instant::now());
                 if (keyframe_barrier
                     || outcome.dropped_frames > 0
@@ -2653,6 +2938,8 @@ async fn run_datagram_reader(
         };
         match event {
             DatagramReceiveEvent::Video(outcome) => {
+                // A video datagram arrived; the periodic expiry above is not video.
+                metrics.note_video_activity();
                 if !handle_video_outcome(
                     outcome,
                     receiver.video_stats(),
@@ -2669,38 +2956,8 @@ async fn run_datagram_reader(
                 }
             }
             DatagramReceiveEvent::AudioAccepted => {
-                while let Some(item) = receiver.pop_audio(Instant::now()) {
-                    match item {
-                        AudioPlayoutItem::Packet(packet) => {
-                            let format = (packet.metadata.sample_rate_hz, packet.metadata.channels);
-                            if received_audio_format != Some(format) {
-                                let format_message = audio_format_message(format.0, format.1);
-                                if inbound
-                                    .send(Ok(BytesMut::from(format_message.as_slice())))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                                received_audio_format = Some(format);
-                            }
-                            if validate_datagram_application_message(
-                                ApplicationClassTag::Audio,
-                                &packet.payload,
-                            )
-                            .is_ok()
-                                && inbound
-                                    .send(Ok(BytesMut::from(packet.payload.as_slice())))
-                                    .await
-                                    .is_err()
-                            {
-                                return;
-                            }
-                        }
-                        AudioPlayoutItem::PacketLoss { sequence_number } => {
-                            log::debug!("QUIC audio packet loss: sequence={sequence_number}");
-                        }
-                    }
+                if !deliver_ready_audio(&mut receiver, &inbound, &mut received_audio_format).await {
+                    return;
                 }
             }
             DatagramReceiveEvent::ApplicationMouse(Some((_movement, payload))) => {
@@ -2958,15 +3215,27 @@ fn handle_video_outcome(
         .video_reassembly_last_frame_fragments
         .store(video_stats.last_frame_fragments, Ordering::Relaxed);
     let _delivery_guard = metrics.video_delivery_lock.lock().unwrap();
-    let strict_reassembly_loss = outcome.dropped_frames > 0
+    // With the keyframe barrier a delta carries the id of the keyframe it follows where a
+    // frame without the barrier, and a keyframe, carries its timestamp.
+    let stale_reassembly_loss = keyframe_barrier
+        && outcome.dropped_frames > 0
+        && !outcome.dropped_keyframe
+        && !recovery
+            .lock()
+            .unwrap()
+            .unattributed_loss_is_current(outcome.dropped_newest_timestamp_us);
+    let reassembly_loss = outcome.dropped_frames > 0 && !stale_reassembly_loss;
+    let strict_reassembly_loss = reassembly_loss
         && recovery
             .lock()
             .unwrap()
             .latest_source()
             .is_some_and(|source| source.codec.is_reference_sensitive());
-    let mut needs_keyframe = outcome.request_keyframe || outcome.dropped_frames > 0;
-    if outcome.dropped_frames > 0 && (!keyframe_barrier || strict_reassembly_loss) {
-        recovery.lock().unwrap().mark_reference_loss();
+    // No keyframe is asked for a frame that was lost before the current one.
+    let mut needs_keyframe =
+        !stale_reassembly_loss && (outcome.request_keyframe || reassembly_loss);
+    if reassembly_loss && (!keyframe_barrier || strict_reassembly_loss) {
+        recovery.lock().unwrap().note_unattributed_loss();
     }
     let holdback_outcome = if keyframe_barrier {
         if let Some(frame) = outcome.frame {
@@ -4563,6 +4832,8 @@ mod tests {
             request_keyframe: true,
             dropped_frames: 1,
             frame: None,
+            dropped_newest_timestamp_us: None,
+            dropped_keyframe: false,
         };
         assert!(handle_video_outcome(
             outcome,
@@ -4605,6 +4876,8 @@ mod tests {
             request_keyframe: true,
             dropped_frames: 1,
             frame: None,
+            dropped_newest_timestamp_us: None,
+            dropped_keyframe: false,
         };
         assert!(handle_video_outcome(
             outcome,
@@ -4643,6 +4916,8 @@ mod tests {
             request_keyframe: true,
             dropped_frames: 1,
             frame: None,
+            dropped_newest_timestamp_us: None,
+            dropped_keyframe: false,
         };
         assert!(handle_video_outcome(
             outcome,
@@ -4674,6 +4949,8 @@ mod tests {
             request_keyframe: true,
             dropped_frames: 1,
             frame: None,
+            dropped_newest_timestamp_us: None,
+            dropped_keyframe: false,
         };
         assert!(handle_video_outcome(
             outcome,
@@ -4875,6 +5152,187 @@ mod tests {
             Some((48_000, 2))
         );
         assert_eq!(pack_audio_format(&AudioFormat::new()), 0);
+    }
+
+    /// A connected application stream pair over loopback, or `None` where UDP is not permitted.
+    async fn application_stream_pair() -> Option<(QuicApplicationStream, QuicApplicationStream)> {
+        let server_certificate = certificate();
+        let client_certificate = certificate();
+        let server_identity = device_identity();
+        let client_identity = device_identity();
+        let server_identity_key = server_identity.public_key_bytes();
+        let client_identity_key = client_identity.public_key_bytes();
+        let options = QuicTransportOptions {
+            connect_timeout: Duration::from_secs(2),
+            authentication_timeout: Duration::from_secs(2),
+            ..Default::default()
+        };
+        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let server = match QuicServerEndpoint::bind(
+            bind,
+            server_certificate.credentials(),
+            client_certificate.certificate.clone(),
+            &options,
+        ) {
+            Ok(server) => server,
+            Err(QuicTransportError::UdpBind(error))
+                if error.contains("Operation not permitted") =>
+            {
+                return None
+            }
+            Err(error) => panic!("server endpoint failed: {}", error),
+        };
+        let client = QuicClientEndpoint::bind(
+            bind,
+            client_certificate.credentials(),
+            server_certificate.certificate.clone(),
+            &options,
+        )
+        .unwrap();
+        let server_address = server.local_addr().unwrap();
+        let auth_timeout = options.authentication_timeout;
+        let server_task = tokio::spawn(async move {
+            let connection = server.accept().await.unwrap();
+            let local_addr = connection
+                .local_ip()
+                .map(|ip| SocketAddr::new(ip, server_address.port()))
+                .unwrap_or(bind);
+            let authentication = AuthenticatedControlChannel::authenticate_server_discover_session(
+                connection,
+                &server_identity,
+                client_identity_key,
+                auth_timeout,
+            )
+            .await
+            .unwrap();
+            QuicApplicationStream::establish(
+                authentication,
+                ApplicationQuicRole::Server,
+                local_addr,
+            )
+            .await
+            .unwrap()
+        });
+        let connection = client.connect(server_address).await.unwrap();
+        let local_addr = client.local_addr().unwrap();
+        let authentication = AuthenticatedControlChannel::authenticate_client(
+            connection,
+            &client_identity,
+            server_identity_key,
+            [9; 16],
+            auth_timeout,
+        )
+        .await
+        .unwrap();
+        let client_stream = QuicApplicationStream::establish(
+            authentication,
+            ApplicationQuicRole::Client,
+            local_addr,
+        )
+        .await
+        .unwrap();
+        Some((client_stream, server_task.await.unwrap()))
+    }
+
+    /// The file channel queue holds 32 messages and is drained at the negotiated file rate, while
+    /// a transfer reads a block every millisecond. Without the readiness check the 34th block of
+    /// any file was refused and the session ended.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_larger_than_the_file_channel_queue_is_delivered_complete() {
+        use crate::fs::{self, DataSource, JobType, TransferJob};
+        use crate::message_proto::{file_response, message, FileEntry};
+
+        const BLOCK: usize = 128 * 1024;
+        let Some((client_stream, server_stream)) = application_stream_pair().await else {
+            return;
+        };
+        let directory = std::env::temp_dir().join(format!(
+            "rustdesk_quic_file_queue_{}_{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("source.bin");
+        let result = directory.join("result.bin");
+        // 40 blocks: more than the queue, small enough to pass the default file rate quickly.
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut data = Vec::with_capacity(40 * BLOCK + 8);
+        while data.len() < 40 * BLOCK {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            data.extend_from_slice(&state.to_le_bytes());
+        }
+        data.truncate(40 * BLOCK);
+        std::fs::write(&source, &data).unwrap();
+
+        let size = data.len() as u64;
+        let receiver = {
+            let result = result.clone();
+            tokio::spawn(async move {
+                let mut stream = crate::Stream::from_quic(server_stream);
+                let mut job = TransferJob::new_write(
+                    3,
+                    JobType::Generic,
+                    "peer".to_owned(),
+                    DataSource::FilePath(result),
+                    0,
+                    true,
+                    false,
+                    false,
+                )
+                .with_files(vec![FileEntry {
+                    size,
+                    ..Default::default()
+                }])
+                .unwrap();
+                loop {
+                    let bytes = stream.next().await.expect("open").expect("readable");
+                    let parsed = Message::parse_from_bytes(&bytes).unwrap();
+                    let Some(message::Union::FileResponse(response)) = parsed.union else {
+                        continue;
+                    };
+                    match response.union {
+                        Some(file_response::Union::Block(block)) => job.write(block).await.unwrap(),
+                        Some(file_response::Union::Done(_)) => {
+                            job.modify_time();
+                            return;
+                        }
+                        other => panic!("unexpected file response: {:?}", other),
+                    }
+                }
+            })
+        };
+
+        // The fixed cap of the builds before the automatic mode: with it the queue fills.
+        client_stream.set_file_rate_ceiling_kbps(Some(20_000));
+        let mut stream = crate::Stream::from_quic(client_stream);
+        let mut jobs = vec![TransferJob::new_read(
+            3,
+            JobType::Generic,
+            "peer".to_owned(),
+            DataSource::FilePath(source),
+            0,
+            true,
+            false,
+            false,
+        )
+        .unwrap()];
+        let mut waited = false;
+        while !jobs.is_empty() {
+            waited |= !stream.file_send_ready();
+            fs::handle_read_jobs(&mut jobs, &mut stream)
+                .await
+                .expect("a full file channel must not end the transfer");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        tokio::time::timeout(Duration::from_secs(60), receiver)
+            .await
+            .expect("receiver finished")
+            .unwrap();
+        assert!(waited, "the test must exercise a full file channel");
+        assert!(std::fs::read(&result).unwrap() == data, "content differs");
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[tokio::test]
@@ -5249,5 +5707,733 @@ mod tests {
         assert!(client_stream
             .enqueue(Bytes::from(delta.write_to_bytes().unwrap()))
             .is_err());
+    }
+
+    /// A directory listing whose serialized message is exactly `size` bytes.
+    fn listing_message_of_size(size: usize) -> Message {
+        use crate::message_proto::{FileDirectory, FileEntry, FileResponse};
+        let entries = (0..(size.saturating_sub(4096)) / 32)
+            .map(|index| FileEntry {
+                name: format!("entry-{:020}", index),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let build = |padding: usize| {
+            let mut response = FileResponse::new();
+            response.set_dir(FileDirectory {
+                id: 1,
+                path: "p".repeat(padding),
+                entries: entries.clone(),
+                ..Default::default()
+            });
+            let mut message = Message::new();
+            message.set_file_response(response);
+            message
+        };
+        let mut padding = 1;
+        for _ in 0..16 {
+            let current = build(padding).compute_size() as usize;
+            if current == size {
+                return build(padding);
+            }
+            padding = (padding + size).saturating_sub(current).max(1);
+        }
+        panic!("cannot build a listing of {} bytes", size);
+    }
+
+    fn listing_entries(bytes: &[u8]) -> usize {
+        use crate::message_proto::{file_response, message};
+        match Message::parse_from_bytes(bytes).unwrap().union {
+            Some(message::Union::FileResponse(response)) => match response.union {
+                Some(file_response::Union::Dir(directory)) => directory.entries.len(),
+                other => panic!("unexpected file response: {:?}", other),
+            },
+            other => panic!("unexpected message: {:?}", other),
+        }
+    }
+
+    /// A listing above what the file channel carries used to be queued; the writer then failed
+    /// on it and closed the connection, which ended the session on a normal user action.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oversize_file_message_is_refused_and_the_connection_stays_usable() {
+        const LIMIT: usize = 1024 * 1024;
+        let Some((client_stream, server_stream)) = application_stream_pair().await else {
+            return;
+        };
+        let mut sender = crate::Stream::from_quic(server_stream);
+        let mut receiver = crate::Stream::from_quic(client_stream);
+        let too_large = listing_message_of_size(LIMIT + 1);
+        let largest = listing_message_of_size(LIMIT);
+        let expected_entries = listing_entries(&largest.write_to_bytes().unwrap());
+
+        let refused = sender.send(&too_large).await;
+        sender
+            .send(&largest)
+            .await
+            .expect("a listing of exactly the limit is accepted");
+        let received = tokio::time::timeout(Duration::from_secs(10), receiver.next())
+            .await
+            .expect("the connection must stay usable");
+        let bytes = received
+            .expect("the connection was closed")
+            .expect("the connection failed");
+
+        assert_eq!(listing_entries(&bytes), expected_entries);
+        assert!(
+            refused.is_err(),
+            "the oversize listing must be refused where the caller can still react"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_message_limit_is_reported_for_the_file_channel() {
+        let Some((client_stream, _server_stream)) = application_stream_pair().await else {
+            return;
+        };
+        assert_eq!(client_stream.file_message_limit(), 1024 * 1024);
+        let stream = crate::Stream::from_quic(client_stream);
+        assert_eq!(stream.file_message_limit(), Some(1024 * 1024));
+    }
+
+    /// Sends `blocks` file blocks of 128 KiB through the file channel and returns how long
+    /// they took to arrive. The sender waits for room as a transfer does.
+    async fn time_file_blocks(
+        sender: QuicApplicationStream,
+        receiver: QuicApplicationStream,
+        blocks: usize,
+    ) -> Duration {
+        use crate::message_proto::{FileResponse, FileTransferBlock};
+
+        const BLOCK: usize = 128 * 1024;
+        let mut response = FileResponse::new();
+        response.set_block(FileTransferBlock {
+            id: 1,
+            data: vec![0x5a; BLOCK].into(),
+            ..Default::default()
+        });
+        let mut block = Message::new();
+        block.set_file_response(response);
+
+        let receive = tokio::spawn(async move {
+            let mut stream = crate::Stream::from_quic(receiver);
+            for _ in 0..blocks {
+                stream.next().await.expect("open").expect("readable");
+            }
+            Instant::now()
+        });
+        let mut stream = crate::Stream::from_quic(sender);
+        let started = Instant::now();
+        for _ in 0..blocks {
+            while !stream.file_send_ready() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            stream.send(&block).await.expect("queued");
+        }
+        let finished = tokio::time::timeout(Duration::from_secs(120), receive)
+            .await
+            .expect("receiver finished")
+            .unwrap();
+        finished - started
+    }
+
+    /// The achieved rate of `blocks` blocks with a cap of `kbps` must be the cap: not above
+    /// it, and not far below it (the first block is free, and the clock of a loaded test
+    /// machine is not exact).
+    async fn assert_file_blocks_keep_the_cap(blocks: usize, kbps: u64) {
+        let Some((client_stream, server_stream)) = application_stream_pair().await else {
+            return;
+        };
+        client_stream.set_file_rate_ceiling_kbps(Some(kbps));
+        assert_eq!(client_stream.file_rate_cap_kbps(), Some(kbps));
+        let elapsed = time_file_blocks(client_stream, server_stream, blocks).await;
+        let achieved_kbps = blocks as f64 * 128.0 * 1024.0 * 8.0 / elapsed.as_secs_f64() / 1e3;
+        println!(
+            "cap {} kbps: {} MiB in {:?} = {:.0} kbps",
+            kbps,
+            blocks / 8,
+            elapsed,
+            achieved_kbps
+        );
+        assert!(
+            achieved_kbps <= kbps as f64 * 1.05 && achieved_kbps >= kbps as f64 * 0.85,
+            "{:.0} kbps with a cap of {} kbps",
+            achieved_kbps,
+            kbps
+        );
+    }
+
+    /// A number in the option is a cap, and the channel runs at it. The cap is far below
+    /// what this channel carries over loopback in a test build (about 500 Mbit/s when the
+    /// machine does nothing else), so it is the limiter and not the machine that sets the
+    /// rate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_channel_runs_at_the_cap_that_is_set() {
+        assert_file_blocks_keep_the_cap(64, 20_000).await;
+    }
+
+    /// 256 MiB at 80 Mbit/s. It takes about half a minute and wants the machine to itself,
+    /// so it is run on request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn file_channel_runs_at_the_cap_that_is_set_for_256_mib() {
+        assert_file_blocks_keep_the_cap(2048, 80_000).await;
+    }
+
+    /// The automatic mode on a real connection: no cap without video, the cap of the earlier
+    /// builds when video starts, no cap again when it has stopped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn automatic_file_rate_follows_the_video() {
+        let Some((client_stream, _server_stream)) = application_stream_pair().await else {
+            return;
+        };
+        async fn cap_becomes(
+            stream: &QuicApplicationStream,
+            expected: Option<u64>,
+            within: Duration,
+        ) -> bool {
+            let deadline = Instant::now() + within;
+            while Instant::now() < deadline {
+                if stream.file_rate_cap_kbps() == expected {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            false
+        }
+        // Both ends are automatic: nothing was agreed as a ceiling.
+        assert_eq!(client_stream.file_rate_cap_kbps(), None);
+        tokio::time::sleep(FILE_RATE_TICK * 2).await;
+        assert_eq!(client_stream.file_rate_cap_kbps(), None, "no video, no cap");
+
+        client_stream.metrics.note_video_activity();
+        assert!(
+            cap_becomes(&client_stream, Some(20_000), FILE_RATE_TICK * 4).await,
+            "video started: {:?}",
+            client_stream.file_rate_cap_kbps()
+        );
+        // Nothing is sent on the file channel, so the cap is not reached and stays.
+        client_stream.metrics.note_video_activity();
+        tokio::time::sleep(FILE_RATE_TICK * 2).await;
+        assert_eq!(client_stream.file_rate_cap_kbps(), Some(20_000));
+
+        assert!(
+            cap_becomes(
+                &client_stream,
+                None,
+                FILE_RATE_VIDEO_IDLE + FILE_RATE_TICK * 4
+            )
+            .await,
+            "video stopped: {:?}",
+            client_stream.file_rate_cap_kbps()
+        );
+    }
+
+    /// Measurement, not a check: what the file channel carries over loopback without a cap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn measure_uncapped_file_channel_over_loopback() {
+        let Some((client_stream, server_stream)) = application_stream_pair().await else {
+            return;
+        };
+        client_stream.set_file_rate_ceiling_kbps(None);
+        let blocks = 2048;
+        let elapsed = time_file_blocks(client_stream, server_stream, blocks).await;
+        println!(
+            "uncapped: {} MiB in {:?} = {:.0} Mbit/s",
+            blocks / 8,
+            elapsed,
+            blocks as f64 * 128.0 * 1024.0 * 8.0 / elapsed.as_secs_f64() / 1e6
+        );
+    }
+
+    /// Two displays: a large frame queued first and small frames of the other display queued
+    /// after it. The writer serves the tracks by bytes, so the small, later frames go out
+    /// first. The receiver drops a frame whose id is not above the last completed one, so the
+    /// ids on the wire must rise in the order of sending.
+    #[tokio::test]
+    async fn wire_frame_ids_rise_in_the_order_of_sending() {
+        let slot = TrackLatestSlot::new(2);
+        let mut enqueue_id = 0u64;
+        let mut queue = |display: i32, stream: u64, size: usize| {
+            enqueue_id += 1;
+            let mut value = sized_video(display, stream, size);
+            value.metadata.frame_id = enqueue_id;
+            assert!(admit_video(&slot, value));
+        };
+        queue(0, 1, 1000);
+        queue(1, 2, 100);
+        let mut next_wire_frame_id = 1u64;
+        let mut on_the_wire = Vec::new();
+        let mut large_sent = false;
+        for _ in 0..12 {
+            let item = slot.take().await;
+            let display = item.source_info.unwrap().key.display;
+            on_the_wire.push(wire_frame_id(&item, &mut next_wire_frame_id));
+            if display == 0 {
+                large_sent = true;
+                break;
+            }
+            queue(1, 2, 100);
+        }
+        assert!(large_sent, "the large frame was never served");
+        assert!(on_the_wire.len() >= 3, "{:?}", on_the_wire);
+        assert!(
+            on_the_wire.windows(2).all(|pair| pair[0] < pair[1]),
+            "ids on the wire in the order of sending: {:?}",
+            on_the_wire
+        );
+    }
+
+    /// Two displays. A frame is lost in reassembly; the datagram header does not say whose it
+    /// was. The display that lost nothing must go on without a keyframe; the one that did is
+    /// stopped by the gap in its own frame ids.
+    #[test]
+    fn reassembly_loss_stops_only_the_stream_that_shows_a_gap() {
+        let (inbound, _inbound_rx) = mpsc::channel(4);
+        let (control, _control_rx) = mpsc::channel(4);
+        let metrics = QuicApplicationMetrics::default();
+        let recovery = Mutex::new(VideoReceiveRecovery::default());
+        let frame = |display: i32, stream_id: u64, frame_id: u64, keyframe: bool| VideoSourceInfo {
+            key: VideoStreamKey { display, stream_id },
+            frame_id,
+            keyframe,
+            codec: VideoCodec::H264,
+        };
+        {
+            let mut recovery = recovery.lock().unwrap();
+            assert_eq!(
+                recovery.observe(frame(0, 7, 4, true), true),
+                VideoReceiveDecision::Accept
+            );
+            assert_eq!(
+                recovery.observe(frame(1, 8, 1, true), true),
+                VideoReceiveDecision::Accept
+            );
+        }
+        // Frame 5 of display 0 never completes.
+        let outcome = super::super::video_datagram::VideoReassemblyOutcome {
+            request_keyframe: true,
+            dropped_frames: 1,
+            frame: None,
+            dropped_newest_timestamp_us: None,
+            dropped_keyframe: false,
+        };
+        assert!(handle_video_outcome(
+            outcome,
+            &super::super::video_datagram::VideoReassemblyStats::default(),
+            &inbound,
+            &control,
+            true,
+            true,
+            &metrics,
+            &recovery,
+            Instant::now(),
+            VIDEO_EPOCH_REORDER_MIN,
+        ));
+        let mut recovery = recovery.lock().unwrap();
+        assert_eq!(
+            recovery.observe(frame(1, 8, 2, false), true),
+            VideoReceiveDecision::Accept,
+            "the display that lost nothing"
+        );
+        assert_eq!(
+            recovery.observe(frame(0, 7, 6, false), true),
+            VideoReceiveDecision::SuppressAfterGap,
+            "the display that lost frame 5"
+        );
+        assert!(recovery.stream_awaiting_keyframe(frame(0, 7, 6, false).key));
+        assert!(!recovery.stream_awaiting_keyframe(frame(1, 8, 2, false).key));
+    }
+
+    /// With one stream the lost frame can only be its own: it is stopped at once, as before.
+    #[test]
+    fn reassembly_loss_with_one_stream_stops_it_at_once() {
+        let (inbound, _inbound_rx) = mpsc::channel(4);
+        let (control, _control_rx) = mpsc::channel(4);
+        let metrics = QuicApplicationMetrics::default();
+        let recovery = Mutex::new(VideoReceiveRecovery::default());
+        let key = VideoStreamKey {
+            display: 0,
+            stream_id: 7,
+        };
+        recovery.lock().unwrap().observe(
+            VideoSourceInfo {
+                key,
+                frame_id: 4,
+                keyframe: true,
+                codec: VideoCodec::H264,
+            },
+            true,
+        );
+        let outcome = super::super::video_datagram::VideoReassemblyOutcome {
+            request_keyframe: true,
+            dropped_frames: 1,
+            frame: None,
+            dropped_newest_timestamp_us: None,
+            dropped_keyframe: false,
+        };
+        assert!(handle_video_outcome(
+            outcome,
+            &super::super::video_datagram::VideoReassemblyStats::default(),
+            &inbound,
+            &control,
+            true,
+            true,
+            &metrics,
+            &recovery,
+            Instant::now(),
+            VIDEO_EPOCH_REORDER_MIN,
+        ));
+        assert!(recovery.lock().unwrap().stream_awaiting_keyframe(key));
+    }
+
+    /// One H.264 stream is decoded from keyframe `keyframe_id` and has accepted the delta
+    /// after it. Then the reassembler reports a frame it dropped incomplete, a delta that
+    /// followed keyframe `lost_after_keyframe`. Returns whether the stream now waits for a
+    /// keyframe, whether one was asked for, and what the next delta of the stream gets.
+    fn one_stream_after_a_report_of_a_dropped_frame(
+        keyframe_id: u64,
+        lost_after_keyframe: u64,
+        lost_keyframe: bool,
+    ) -> (bool, bool, VideoReceiveDecision) {
+        let (inbound, _inbound_rx) = mpsc::channel(4);
+        let (control, mut control_rx) = mpsc::channel(4);
+        let metrics = QuicApplicationMetrics::default();
+        let recovery = Mutex::new(VideoReceiveRecovery::default());
+        let frame = |frame_id: u64, keyframe: bool| VideoSourceInfo {
+            key: VideoStreamKey {
+                display: 0,
+                stream_id: 7,
+            },
+            frame_id,
+            keyframe,
+            codec: VideoCodec::H264,
+        };
+        {
+            let mut recovery = recovery.lock().unwrap();
+            assert_eq!(
+                recovery.observe(frame(keyframe_id, true), true),
+                VideoReceiveDecision::Accept
+            );
+            assert_eq!(
+                recovery.observe(frame(keyframe_id + 1, false), true),
+                VideoReceiveDecision::Accept
+            );
+        }
+        let outcome = super::super::video_datagram::VideoReassemblyOutcome {
+            request_keyframe: true,
+            dropped_frames: 1,
+            frame: None,
+            dropped_newest_timestamp_us: Some(lost_after_keyframe),
+            dropped_keyframe: lost_keyframe,
+        };
+        assert!(handle_video_outcome(
+            outcome,
+            &super::super::video_datagram::VideoReassemblyStats::default(),
+            &inbound,
+            &control,
+            true,
+            true,
+            &metrics,
+            &recovery,
+            Instant::now(),
+            VIDEO_EPOCH_REORDER_MIN,
+        ));
+        let mut recovery = recovery.lock().unwrap();
+        let waits = recovery.stream_awaiting_keyframe(frame(keyframe_id, true).key);
+        let asked = control_rx.try_recv().is_ok();
+        let next = recovery.observe(frame(keyframe_id + 2, false), true);
+        (waits, asked, next)
+    }
+
+    /// The report of a dropped frame can come after the keyframe that repaired the loss: the
+    /// reassembler waits for the rest of a frame before it gives it up, and meanwhile the
+    /// gap was seen, a keyframe was asked for and has arrived. The stream decoded from that
+    /// keyframe lost nothing: it must go on, and no second keyframe is asked for.
+    #[test]
+    fn late_report_of_a_frame_lost_before_the_current_keyframe_does_not_stop_the_stream() {
+        let (waits, asked, next) = one_stream_after_a_report_of_a_dropped_frame(20, 10, false);
+        assert!(
+            !waits,
+            "the stream was stopped for a frame of an older keyframe"
+        );
+        assert!(
+            !asked,
+            "a keyframe was asked for although the picture is whole"
+        );
+        assert_eq!(next, VideoReceiveDecision::Accept);
+    }
+
+    /// A frame lost after the keyframe the stream is decoded from stops it at once, without
+    /// waiting for the gap in the frame ids to show.
+    #[test]
+    fn report_of_a_frame_lost_after_the_current_keyframe_stops_the_stream_at_once() {
+        let (waits, asked, next) = one_stream_after_a_report_of_a_dropped_frame(20, 20, false);
+        assert!(waits);
+        assert!(asked);
+        assert_eq!(next, VideoReceiveDecision::Suppress);
+    }
+
+    /// A delta that follows a keyframe still on its way: the stream shown now lost nothing.
+    /// When that keyframe is here, the gap in the frame ids after it is what stops the stream.
+    #[test]
+    fn report_of_a_frame_lost_after_a_keyframe_still_on_its_way_does_not_stop_the_stream() {
+        let (waits, asked, next) = one_stream_after_a_report_of_a_dropped_frame(20, 30, false);
+        assert!(!waits);
+        assert!(!asked);
+        assert_eq!(next, VideoReceiveDecision::Accept);
+    }
+
+    /// A keyframe that was sent in datagrams and lost is always a loss of the stream shown
+    /// now, whatever its timestamp field holds: the deltas after it cannot be decoded.
+    #[test]
+    fn report_of_a_dropped_keyframe_stops_the_stream() {
+        let (waits, asked, next) = one_stream_after_a_report_of_a_dropped_frame(20, 10, true);
+        assert!(waits);
+        assert!(asked);
+        assert_eq!(next, VideoReceiveDecision::Suppress);
+    }
+
+    /// The session of 2026-11-21 (revision 280, one H.264 stream at thirty frames a second),
+    /// through the real reassembler. A datagram of a delta is lost. The next frame arrives a
+    /// frame time later; the gap is seen, a keyframe is asked for and arrives about 110 ms
+    /// after the loss. The reassembler must have reported the lost frame by then, and must
+    /// not report it after the keyframe: a report that came then stopped the stream that had
+    /// just recovered, and the host, which had just sent a keyframe, did not send another
+    /// for three seconds.
+    #[test]
+    fn lost_delta_is_reported_at_once_and_not_after_the_keyframe_that_repaired_it() {
+        use super::super::video_datagram::{
+            fragment_video_frame, VideoFrameMetadata, VideoReassembler, VideoReassemblyConfig,
+            VideoReassemblyOutcome,
+        };
+        let (inbound, _inbound_rx) = mpsc::channel(4);
+        let (control, _control_rx) = mpsc::channel(8);
+        let metrics = QuicApplicationMetrics::default();
+        let recovery = Mutex::new(VideoReceiveRecovery::default());
+        let key = VideoStreamKey {
+            display: 0,
+            stream_id: 7,
+        };
+        let frame = |frame_id: u64, keyframe: bool| VideoSourceInfo {
+            key,
+            frame_id,
+            keyframe,
+            codec: VideoCodec::H264,
+        };
+        // A delta on the wire: `wire_id` in the order of sending, the id of the keyframe it
+        // follows where a frame without the barrier has its timestamp.
+        let delta = |wire_id: u64, keyframe_id: u64, size: usize| {
+            fragment_video_frame(
+                [7; 16],
+                1,
+                42,
+                VideoFrameMetadata {
+                    frame_id: wire_id,
+                    codec: VideoCodec::H264,
+                    flags: 0,
+                    presentation_timestamp_us: keyframe_id,
+                },
+                &vec![1; size],
+                700,
+            )
+            .unwrap()
+        };
+        let mut reassembler = VideoReassembler::new(VideoReassemblyConfig {
+            require_initial_keyframe: false,
+            ..VideoReassemblyConfig::default()
+        })
+        .unwrap();
+        let report = |outcome: VideoReassemblyOutcome, at: Instant| {
+            // Only what the reassembler says about lost frames; the frames themselves are
+            // handed to `observe` below.
+            assert!(handle_video_outcome(
+                VideoReassemblyOutcome {
+                    frame: None,
+                    ..outcome
+                },
+                &super::super::video_datagram::VideoReassemblyStats::default(),
+                &inbound,
+                &control,
+                true,
+                true,
+                &metrics,
+                &recovery,
+                at,
+                VIDEO_EPOCH_REORDER_MIN,
+            ));
+        };
+        let start = Instant::now();
+        let ms = Duration::from_millis;
+        assert_eq!(
+            recovery.lock().unwrap().observe(frame(4, true), true),
+            VideoReceiveDecision::Accept
+        );
+        assert_eq!(
+            recovery.lock().unwrap().observe(frame(5, false), true),
+            VideoReceiveDecision::Accept
+        );
+
+        // Frame 6 (wire id 10) loses its last datagram.
+        let lost = delta(10, 4, 3000);
+        for packet in &lost[..lost.len() - 1] {
+            report(reassembler.push(packet, start).unwrap(), start);
+        }
+        // Frame 7 (wire id 11) arrives whole, a frame time later.
+        let mut reported_with_the_next_frame = 0;
+        for packet in delta(11, 4, 1000) {
+            let outcome = reassembler.push(&packet, start + ms(33)).unwrap();
+            reported_with_the_next_frame += outcome.dropped_frames;
+            report(outcome, start + ms(33));
+        }
+        assert_eq!(
+            reported_with_the_next_frame, 1,
+            "the lost frame is known when the next one is complete"
+        );
+        assert!(recovery.lock().unwrap().stream_awaiting_keyframe(key));
+
+        // The keyframe that was asked for arrives 110 ms after the loss, and a delta after it.
+        assert_eq!(
+            recovery.lock().unwrap().observe(frame(10, true), true),
+            VideoReceiveDecision::Accept
+        );
+        assert_eq!(
+            recovery.lock().unwrap().observe(frame(11, false), true),
+            VideoReceiveDecision::Accept
+        );
+        // The reassembler is asked every 25 ms; nothing it says now may stop the stream.
+        for tick in 0..12u64 {
+            let at = start + ms(115 + tick * 25);
+            report(reassembler.expire(at), at);
+        }
+        assert!(
+            !recovery.lock().unwrap().stream_awaiting_keyframe(key),
+            "a late report stopped the stream after its keyframe had arrived"
+        );
+        assert_eq!(
+            recovery.lock().unwrap().observe(frame(12, false), true),
+            VideoReceiveDecision::Accept
+        );
+    }
+
+    /// A burst of sound that ends: the last packets wait in the jitter buffer for the playout
+    /// delay, but the buffer was only asked when a packet arrived. With nothing arriving after
+    /// the burst, those packets were never played. Two packets, then silence: both must reach
+    /// the session within a few ticks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn last_audio_packets_of_a_burst_are_delivered_without_a_next_packet() {
+        let Some((client_stream, mut server_stream)) = application_stream_pair().await else {
+            return;
+        };
+        let mut format = Message::new();
+        let mut misc = Misc::new();
+        misc.set_audio_format(AudioFormat {
+            sample_rate: 48_000,
+            channels: 2,
+            ..Default::default()
+        });
+        format.set_misc(misc);
+        client_stream
+            .enqueue(Bytes::from(format.write_to_bytes().unwrap()))
+            .unwrap();
+        for value in 1..=2u8 {
+            let mut audio = Message::new();
+            audio.set_audio_frame(AudioFrame {
+                data: Bytes::from(vec![value; 80]),
+                ..Default::default()
+            });
+            client_stream
+                .enqueue(Bytes::from(audio.write_to_bytes().unwrap()))
+                .unwrap();
+        }
+        let mut delivered = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_millis(300), async {
+            while delivered.len() < 2 {
+                let bytes = server_stream.next().await.unwrap().unwrap();
+                if let Ok(message) = Message::parse_from_bytes(&bytes) {
+                    if let Some(message::Union::AudioFrame(frame)) = message.union {
+                        delivered.push(frame.data[0]);
+                    }
+                }
+            }
+        })
+        .await;
+        assert_eq!(
+            delivered,
+            vec![1, 2],
+            "audio packets still held after the burst"
+        );
+        drop(client_stream);
+    }
+
+    /// Epoch 10 of stream 7 waits for its missing delta 11 when the keyframe of a recovery
+    /// (20) arrives, just as the reorder window of the gap is over. The keyframe replaces the
+    /// whole older epoch: that gap needs no keyframe of its own. Asking for one here put a
+    /// needless request behind every such recovery.
+    #[test]
+    fn keyframe_of_a_stream_supersedes_a_gap_in_its_older_epoch() {
+        let now = Instant::now();
+        let mut holdback = VideoEpochHoldback::default();
+        holdback.accept_keyframe(
+            source_video(7, 10, true),
+            Bytes::from_static(b"keyframe-10"),
+            now,
+            VIDEO_EPOCH_REORDER_MIN,
+        );
+        let held = holdback.admit_delta(
+            source_video(7, 12, false),
+            10,
+            Bytes::from_static(b"delta-12"),
+            now,
+            VIDEO_EPOCH_REORDER_MIN,
+        );
+        assert_eq!(held.held_frames, 1);
+
+        let recovered = holdback.accept_keyframe(
+            source_video(7, 20, true),
+            Bytes::from_static(b"keyframe-20"),
+            now + VIDEO_EPOCH_REORDER_MIN,
+            VIDEO_EPOCH_REORDER_MIN,
+        );
+        assert!(
+            !recovered.recovery_required,
+            "a keyframe was asked for although one had just arrived"
+        );
+        assert_eq!(
+            recovered
+                .ready
+                .iter()
+                .map(|(info, _)| info.frame_id)
+                .collect::<Vec<_>>(),
+            vec![20]
+        );
+    }
+
+    /// A gap in another display's stream still asks for its keyframe.
+    #[test]
+    fn keyframe_of_one_display_does_not_hide_a_gap_of_another() {
+        let now = Instant::now();
+        let mut holdback = VideoEpochHoldback::default();
+        holdback.accept_keyframe(
+            source_video_for_display(1, 8, 30, true),
+            Bytes::from_static(b"keyframe-30"),
+            now,
+            VIDEO_EPOCH_REORDER_MIN,
+        );
+        holdback.admit_delta(
+            source_video_for_display(1, 8, 32, false),
+            30,
+            Bytes::from_static(b"delta-32"),
+            now,
+            VIDEO_EPOCH_REORDER_MIN,
+        );
+        let other = holdback.accept_keyframe(
+            source_video(7, 20, true),
+            Bytes::from_static(b"keyframe-20"),
+            now + VIDEO_EPOCH_REORDER_MIN,
+            VIDEO_EPOCH_REORDER_MIN,
+        );
+        assert!(other.recovery_required, "the gap of display 1 was hidden");
+        assert_eq!(other.gap_events, 1);
     }
 }
