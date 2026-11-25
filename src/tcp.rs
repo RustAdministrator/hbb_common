@@ -643,6 +643,12 @@ impl FramedStream {
 }
 
 impl FramedReadHalf {
+    /// The read half of `FramedStream::set_raw`: bytes arrive unframed and unencrypted.
+    pub fn set_raw(&mut self) {
+        self.stream.decoder_mut().set_raw();
+        self.decrypt = None;
+    }
+
     pub async fn next(&mut self) -> Option<Result<BytesMut, Error>> {
         let mut result = self.stream.next().await;
         if let Some(Ok(bytes)) = result.as_mut() {
@@ -657,6 +663,12 @@ impl FramedReadHalf {
 }
 
 impl FramedWriteHalf {
+    /// The write half of `FramedStream::set_raw`: bytes leave unframed and unencrypted.
+    pub fn set_raw(&mut self) {
+        self.raw = true;
+        self.encrypt = None;
+    }
+
     pub async fn send(&mut self, msg: &impl Message) -> ResultType<()> {
         self.send_raw(msg.write_to_bytes()?).await
     }

@@ -88,6 +88,9 @@ struct OutboundMessage {
     kind: &'static str,
     encrypt: bool,
     completion: Option<oneshot::Sender<Result<(), String>>>,
+    /// Not a message: the writer switches its half to raw bytes here, after everything
+    /// queued before (`DuplexStream::set_raw`).
+    switch_to_raw: bool,
 }
 
 enum OutboundEntry {
@@ -372,6 +375,15 @@ impl StreamReader {
             Self::Tcp(stream) => stream.next().await,
         }
     }
+
+    fn set_raw(&mut self) {
+        match self {
+            #[cfg(feature = "webrtc")]
+            Self::WebRTC(stream) => stream.set_raw(),
+            Self::WebSocket(stream) => stream.set_raw(),
+            Self::Tcp(stream) => stream.set_raw(),
+        }
+    }
 }
 
 enum StreamWriter {
@@ -406,6 +418,15 @@ impl StreamWriter {
                     stream.send_bytes(bytes).await
                 }
             }
+        }
+    }
+
+    fn set_raw(&mut self) {
+        match self {
+            #[cfg(feature = "webrtc")]
+            Self::WebRTC(stream) => stream.set_raw(),
+            Self::WebSocket(stream) => stream.set_raw(),
+            Self::Tcp(stream) => stream.set_raw(),
         }
     }
 
@@ -468,7 +489,24 @@ impl DuplexStream {
             kind,
             encrypt,
             completion: None,
+            switch_to_raw: false,
         })
+    }
+
+    /// Raw bytes from here on, as `FramedStream::set_raw` does. The read half switches now: it
+    /// is read by the caller. The write half switches in the writer task, after the messages
+    /// queued before; they still leave framed and encrypted. Queued as a barrier, so that no
+    /// "latest" message queued before can be replaced by one queued after.
+    fn set_raw(&mut self) -> ResultType<()> {
+        self.outbox.enqueue_barrier(OutboundMessage {
+            bytes: Bytes::new(),
+            kind: "SwitchToRaw",
+            encrypt: false,
+            completion: None,
+            switch_to_raw: true,
+        })?;
+        self.reader.set_raw();
+        Ok(())
     }
 
     fn enqueue_barrier(&self, bytes: Bytes, kind: &'static str) -> ResultType<()> {
@@ -477,6 +515,7 @@ impl DuplexStream {
             kind,
             encrypt: true,
             completion: None,
+            switch_to_raw: false,
         })
     }
 
@@ -488,6 +527,7 @@ impl DuplexStream {
                 kind,
                 encrypt: true,
                 completion: None,
+                switch_to_raw: false,
             },
         )
     }
@@ -499,6 +539,7 @@ impl DuplexStream {
             kind,
             encrypt: true,
             completion: Some(completion),
+            switch_to_raw: false,
         })?;
         match completed.await {
             Ok(Ok(())) => Ok(()),
@@ -573,7 +614,15 @@ async fn run_stream_writer(
             kind,
             encrypt,
             completion,
+            switch_to_raw,
         } = message;
+        if switch_to_raw {
+            writer.set_raw();
+            if let Some(completion) = completion {
+                let _ = completion.send(Ok(()));
+            }
+            continue;
+        }
         let started = Instant::now();
         let bytes = payload.len();
         progress.lock().unwrap().active_write = Some((kind, bytes, started));
@@ -806,7 +855,11 @@ impl Stream {
             Stream::WebRTC(s) => s.set_raw(),
             Stream::WebSocket(s) => s.set_raw(),
             Stream::Tcp(s) => s.set_raw(),
-            Stream::Duplex(_) => log::warn!("set_raw ignored after stream split"),
+            Stream::Duplex(s) => {
+                if let Err(error) = s.set_raw() {
+                    log::warn!("set_raw could not be queued after stream split: {error}");
+                }
+            }
             #[cfg(feature = "quic-transport")]
             Stream::Quic(stream) => stream.set_raw(),
         }
@@ -994,6 +1047,7 @@ impl Stream {
                     kind,
                     encrypt: true,
                     completion: None,
+                    switch_to_raw: false,
                 },
             ),
             #[cfg(feature = "quic-transport")]
@@ -1191,6 +1245,7 @@ mod tests {
             kind: "FileBlock",
             encrypt: true,
             completion: None,
+            switch_to_raw: false,
         }
     }
 
@@ -1276,6 +1331,7 @@ mod tests {
             kind,
             encrypt: true,
             completion: None,
+            switch_to_raw: false,
         }
     }
 
@@ -1441,6 +1497,7 @@ mod tests {
                 kind: "close",
                 encrypt: true,
                 completion: Some(completion),
+                switch_to_raw: false,
             })
             .unwrap();
 
@@ -1469,6 +1526,46 @@ mod tests {
         remote.set_key(key);
         stream.send_raw(b"encrypted".to_vec()).await.unwrap();
         assert_eq!(&remote.next().await.unwrap().unwrap()[..], b"encrypted");
+    }
+
+    /// Port forwarding and `--rdp` carry raw bytes after login: the viewer calls `set_raw`, and
+    /// so does the host. The host's stream has been split into a duplex since 2026-07-30, and
+    /// `set_raw` on a duplex only logged a warning: the host kept framing and encrypting while
+    /// the viewer sent and expected raw bytes, so every forwarded TCP or relay connection broke.
+    #[tokio::test]
+    async fn duplex_switches_to_raw_bytes_after_what_was_queued_before() {
+        let (left, right) = tokio::io::duplex(4096);
+        let addr = "127.0.0.1:0".parse().unwrap();
+        let key = Key([31; sodiumoxide::crypto::secretbox::KEYBYTES]);
+        let mut host = Stream::Tcp(tcp::FramedStream::from(left, addr));
+        host.set_key(key.clone());
+        let mut host = host.into_duplex(8);
+        let mut viewer = tcp::FramedStream::from(right, addr);
+        viewer.set_key(key);
+        let wait = Duration::from_secs(2);
+
+        // The answer to the login is queued before the switch: it still goes framed and
+        // encrypted, everything after it goes raw.
+        host.send_raw(b"login response".to_vec()).await.unwrap();
+        host.set_raw();
+        host.send_bytes(Bytes::from_static(b"to the viewer"))
+            .await
+            .unwrap();
+
+        let login = tokio::time::timeout(wait, viewer.next()).await.unwrap();
+        assert_eq!(&login.unwrap().unwrap()[..], b"login response");
+        viewer.set_raw();
+        let forwarded = tokio::time::timeout(wait, viewer.next()).await.unwrap();
+        assert_eq!(&forwarded.unwrap().unwrap()[..], b"to the viewer");
+
+        viewer
+            .send_bytes(Bytes::from_static(b"to the host"))
+            .await
+            .unwrap();
+        let forwarded = tokio::time::timeout(wait, host.next())
+            .await
+            .expect("the host must read the viewer's raw bytes");
+        assert_eq!(&forwarded.unwrap().unwrap()[..], b"to the host");
     }
 
     #[tokio::test]
