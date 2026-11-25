@@ -451,6 +451,8 @@ pub struct DuplexStream {
     context: String,
     progress: Arc<Mutex<IoProgressState>>,
     send_timeout_ms: Arc<AtomicU64>,
+    /// After `set_raw`: the stream carries a tunnel.
+    raw: bool,
 }
 
 impl DuplexStream {
@@ -506,7 +508,31 @@ impl DuplexStream {
             switch_to_raw: true,
         })?;
         self.reader.set_raw();
+        self.raw = true;
         Ok(())
+    }
+
+    /// A tunnel's bytes (`Stream::send_bytes` after `set_raw`): queued, and waited for until
+    /// written, so that a tunnel that produces faster than the link drains waits instead of
+    /// finding the outbox full, which ended it.
+    async fn send_tunnel_bytes(&self, bytes: Bytes) -> ResultType<()> {
+        let (completion, completed) = oneshot::channel();
+        self.outbox.enqueue(OutboundMessage {
+            bytes,
+            kind: "Bytes",
+            encrypt: false,
+            completion: Some(completion),
+            switch_to_raw: false,
+        })?;
+        match completed.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(Error::new(ErrorKind::BrokenPipe, error).into()),
+            Err(_) => Err(Error::new(
+                ErrorKind::BrokenPipe,
+                "async stream writer stopped before completing the send",
+            )
+            .into()),
+        }
     }
 
     fn enqueue_barrier(&self, bytes: Bytes, kind: &'static str) -> ResultType<()> {
@@ -872,9 +898,10 @@ impl Stream {
             Stream::WebRTC(s) => s.send_bytes(bytes).await,
             Stream::WebSocket(s) => s.send_bytes(bytes).await,
             Stream::Tcp(s) => s.send_bytes(bytes).await,
+            Stream::Duplex(s) if s.raw => s.send_tunnel_bytes(bytes).await,
             Stream::Duplex(s) => s.enqueue(bytes, "Bytes", false),
             #[cfg(feature = "quic-transport")]
-            Stream::Quic(s) => s.enqueue(bytes),
+            Stream::Quic(s) => s.send_bytes(bytes).await,
         }
     }
 
@@ -1159,6 +1186,7 @@ impl Stream {
             context,
             progress,
             send_timeout_ms,
+            raw: false,
         })
     }
 
@@ -1566,6 +1594,35 @@ mod tests {
             .await
             .expect("the host must read the viewer's raw bytes");
         assert_eq!(&forwarded.unwrap().unwrap()[..], b"to the host");
+    }
+
+    /// A forwarded connection produces as fast as its local socket reads. The host's duplex
+    /// outbox refused the chunk that found it full, and the host ended the tunnel.
+    #[tokio::test]
+    async fn duplex_tunnel_waits_for_room_instead_of_failing() {
+        let (left, right) = tokio::io::duplex(1024);
+        let addr = "127.0.0.1:0".parse().unwrap();
+        let mut host = Stream::Tcp(tcp::FramedStream::from(left, addr)).into_duplex(4);
+        let mut viewer = tcp::FramedStream::from(right, addr);
+        host.set_raw();
+        viewer.set_raw();
+        let reader = tokio::spawn(async move {
+            // Starts late, so that the host finds its outbox full.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut received = 0usize;
+            while received < 64 * 1024 {
+                received += viewer.next().await.unwrap().unwrap().len();
+            }
+            received
+        });
+        for _ in 0..64 {
+            host.send_bytes(Bytes::from(vec![7u8; 1024])).await.unwrap();
+        }
+        let received = tokio::time::timeout(Duration::from_secs(5), reader)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, 64 * 1024);
     }
 
     #[tokio::test]

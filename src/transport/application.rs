@@ -50,6 +50,36 @@ use tokio::{
 };
 
 const APPLICATION_INBOUND_CAPACITY: usize = 256;
+
+/// What the reading tasks hand to `QuicApplicationStream::next`: bytes or an error, and
+/// whether the bytes came as raw tunnel bytes (`MessageType::ApplicationRaw`).
+struct Inbound {
+    raw: bool,
+    item: Result<BytesMut, Error>,
+}
+
+impl Inbound {
+    fn message(bytes: BytesMut) -> Self {
+        Self {
+            raw: false,
+            item: Ok(bytes),
+        }
+    }
+
+    fn raw(bytes: BytesMut) -> Self {
+        Self {
+            raw: true,
+            item: Ok(bytes),
+        }
+    }
+
+    fn error(error: Error) -> Self {
+        Self {
+            raw: false,
+            item: Err(error),
+        }
+    }
+}
 const CONTROL_OUTBOUND_CAPACITY: usize = 128;
 const INPUT_OUTBOUND_CAPACITY: usize = 128;
 const CLIPBOARD_OUTBOUND_CAPACITY: usize = 16;
@@ -1289,7 +1319,7 @@ pub struct QuicApplicationStream {
     connection: Connection,
     _authentication: AuthenticatedControlChannel,
     peer_binding: QuicPeerBinding,
-    inbound: mpsc::Receiver<Result<BytesMut, Error>>,
+    inbound: mpsc::Receiver<Inbound>,
     control: mpsc::Sender<ReliableOutbound>,
     input: mpsc::Sender<ReliableOutbound>,
     clipboard: mpsc::Sender<ReliableOutbound>,
@@ -1548,6 +1578,37 @@ impl QuicApplicationStream {
 
     pub fn enqueue(&self, payload: Bytes) -> crate::ResultType<()> {
         self.enqueue_with_latest_key(None, payload)
+    }
+
+    /// `enqueue` for `Stream::send_bytes`. In raw mode (a tunnel) it waits for room in the
+    /// control queue instead of refusing the chunk: a tunnel's producer reads a local socket
+    /// as fast as it can, and a refused chunk was a hole in the tunneled stream (the viewer
+    /// ignored the error) or ended the tunnel (the host did not).
+    pub async fn send_bytes(&self, payload: Bytes) -> crate::ResultType<()> {
+        if !self.raw_mode.load(Ordering::Acquire) || self.closing.load(Ordering::Acquire) {
+            return self.enqueue(payload);
+        }
+        if let Some(reason) = self.connection.close_reason() {
+            return Err(Error::new(
+                ErrorKind::BrokenPipe,
+                format!("QUIC application connection closed: {reason}"),
+            )
+            .into());
+        }
+        self.control
+            .send(ReliableOutbound {
+                message_type: MessageType::ApplicationRaw,
+                payload,
+                completion: None,
+            })
+            .await
+            .map_err(|_| {
+                Error::new(
+                    ErrorKind::BrokenPipe,
+                    "QUIC reliable application queue is closed",
+                )
+                .into()
+            })
     }
 
     /// Whether the file channel can take another block of file data. `enqueue` never waits:
@@ -1838,7 +1899,16 @@ impl QuicApplicationStream {
     }
 
     pub async fn next(&mut self) -> Option<Result<BytesMut, Error>> {
-        self.inbound.recv().await
+        loop {
+            let inbound = self.inbound.recv().await?;
+            // After `set_raw` the stream carries a tunnel (port forwarding, `--rdp`). Session
+            // messages that still arrive on the other channels - a `TestDelay` sent before
+            // login, or its late answer - are not the tunnel's bytes and are not delivered.
+            if self.raw_mode.load(Ordering::Acquire) && !inbound.raw && inbound.item.is_ok() {
+                continue;
+            }
+            return Some(inbound.item);
+        }
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -2241,7 +2311,7 @@ fn spawn_reliable_channel(
     channel: ReliableChannel,
     kind: ReliableChannelKind,
     capacity: usize,
-    inbound: mpsc::Sender<Result<BytesMut, Error>>,
+    inbound: mpsc::Sender<Inbound>,
     connection: Connection,
     video_ordering: Arc<VideoOrderingGate>,
     metrics: Arc<QuicApplicationMetrics>,
@@ -2275,7 +2345,7 @@ fn spawn_reliable_channel(
 async fn run_reliable_writer(
     mut sender: ReliableChannelSender,
     mut outbound: mpsc::Receiver<ReliableOutbound>,
-    inbound: mpsc::Sender<Result<BytesMut, Error>>,
+    inbound: mpsc::Sender<Inbound>,
     connection: Connection,
     rate: Option<Arc<FileRateShared>>,
 ) {
@@ -2380,7 +2450,7 @@ async fn run_file_rate_controller(
 async fn run_reliable_reader(
     mut receiver: ReliableChannelReceiver,
     expected_kind: ReliableChannelKind,
-    inbound: mpsc::Sender<Result<BytesMut, Error>>,
+    inbound: mpsc::Sender<Inbound>,
     connection: Connection,
     internal_control: Option<mpsc::Sender<ReliableOutbound>>,
     video_ordering: Arc<VideoOrderingGate>,
@@ -2407,7 +2477,7 @@ async fn run_reliable_reader(
             match message.header.message_type {
                 MessageType::ApplicationRaw => {
                     if inbound
-                        .send(Ok(BytesMut::from(message.payload.as_slice())))
+                        .send(Inbound::raw(BytesMut::from(message.payload.as_slice())))
                         .await
                         .is_err()
                     {
@@ -2418,7 +2488,7 @@ async fn run_reliable_reader(
                 MessageType::VideoOrdering => {
                     let epoch = read_ordering_epoch(&message.payload).unwrap_or_default();
                     if inbound
-                        .send(Ok(BytesMut::from(&message.payload[8..])))
+                        .send(Inbound::message(BytesMut::from(&message.payload[8..])))
                         .await
                         .is_err()
                     {
@@ -2556,7 +2626,7 @@ async fn run_reliable_reader(
             }
         }
         if inbound
-            .send(Ok(BytesMut::from(message.payload.as_slice())))
+            .send(Inbound::message(BytesMut::from(message.payload.as_slice())))
             .await
             .is_err()
         {
@@ -2578,7 +2648,7 @@ async fn run_reliable_reader(
 
 async fn run_local_video_refresh(
     mut refresh: mpsc::Receiver<LocalVideoRefresh>,
-    inbound: mpsc::Sender<Result<BytesMut, Error>>,
+    inbound: mpsc::Sender<Inbound>,
 ) {
     while let Some(refresh) = refresh.recv().await {
         let message = match refresh {
@@ -2586,7 +2656,7 @@ async fn run_local_video_refresh(
             LocalVideoRefresh::Reference(refresh) => video_reference_refresh_message(refresh),
         };
         if inbound
-            .send(Ok(BytesMut::from(message.as_slice())))
+            .send(Inbound::message(BytesMut::from(message.as_slice())))
             .await
             .is_err()
         {
@@ -2614,7 +2684,7 @@ async fn run_video_writer(
     mut sender: QuicDatagramSender,
     video: Arc<TrackLatestSlot>,
     video_ordering: Arc<VideoOrderingGate>,
-    inbound: mpsc::Sender<Result<BytesMut, Error>>,
+    inbound: mpsc::Sender<Inbound>,
     connection: Connection,
     mut reliable_sender: Option<ReliableChannelSender>,
     recovery: Arc<VideoSendRecovery>,
@@ -2790,7 +2860,7 @@ async fn run_video_writer(
 async fn run_mouse_writer(
     mut sender: QuicDatagramSender,
     mouse: Arc<LatestSlot<MouseOutbound>>,
-    inbound: mpsc::Sender<Result<BytesMut, Error>>,
+    inbound: mpsc::Sender<Inbound>,
     connection: Connection,
 ) {
     loop {
@@ -2815,7 +2885,7 @@ async fn run_mouse_writer(
 async fn run_audio_writer(
     mut sender: QuicDatagramSender,
     mut audio: mpsc::Receiver<AudioOutbound>,
-    inbound: mpsc::Sender<Result<BytesMut, Error>>,
+    inbound: mpsc::Sender<Inbound>,
     connection: Connection,
 ) {
     let started = Instant::now();
@@ -2841,7 +2911,7 @@ async fn run_audio_writer(
 /// first one of a new format. `false` when the session is gone.
 async fn deliver_ready_audio(
     receiver: &mut QuicDatagramReceiver,
-    inbound: &mpsc::Sender<Result<BytesMut, Error>>,
+    inbound: &mpsc::Sender<Inbound>,
     received_audio_format: &mut Option<(u32, u8)>,
 ) -> bool {
     while let Some(item) = receiver.pop_audio(Instant::now()) {
@@ -2851,7 +2921,7 @@ async fn deliver_ready_audio(
                 if *received_audio_format != Some(format) {
                     let format_message = audio_format_message(format.0, format.1);
                     if inbound
-                        .send(Ok(BytesMut::from(format_message.as_slice())))
+                        .send(Inbound::message(BytesMut::from(format_message.as_slice())))
                         .await
                         .is_err()
                     {
@@ -2865,7 +2935,7 @@ async fn deliver_ready_audio(
                 )
                 .is_ok()
                     && inbound
-                        .send(Ok(BytesMut::from(packet.payload.as_slice())))
+                        .send(Inbound::message(BytesMut::from(packet.payload.as_slice())))
                         .await
                         .is_err()
                 {
@@ -2882,7 +2952,7 @@ async fn deliver_ready_audio(
 
 async fn run_datagram_reader(
     mut receiver: QuicDatagramReceiver,
-    inbound: mpsc::Sender<Result<BytesMut, Error>>,
+    inbound: mpsc::Sender<Inbound>,
     control: mpsc::Sender<ReliableOutbound>,
     connection: Connection,
     scoped_reference_refresh: bool,
@@ -2964,7 +3034,7 @@ async fn run_datagram_reader(
                 if validate_datagram_application_message(ApplicationClassTag::Mouse, &payload)
                     .is_ok()
                 {
-                    let _ = inbound.try_send(Ok(BytesMut::from(payload.as_slice())));
+                    let _ = inbound.try_send(Inbound::message(BytesMut::from(payload.as_slice())));
                 }
             }
             DatagramReceiveEvent::ApplicationMouse(None) | DatagramReceiveEvent::Mouse(_) => {}
@@ -3020,7 +3090,7 @@ fn record_video_holdback_metrics(outcome: &VideoHoldbackOutcome, metrics: &QuicA
 fn deliver_video_payload(
     info: VideoSourceInfo,
     payload: Bytes,
-    inbound: &mpsc::Sender<Result<BytesMut, Error>>,
+    inbound: &mpsc::Sender<Inbound>,
     metrics: &QuicApplicationMetrics,
     recovery: &Mutex<VideoReceiveRecovery>,
     strict_gap_recovery: bool,
@@ -3044,7 +3114,7 @@ fn deliver_video_payload(
                     .video_source_frame_gaps
                     .fetch_add(1, Ordering::Relaxed);
             }
-            match inbound.try_send(Ok(BytesMut::from(payload.as_ref()))) {
+            match inbound.try_send(Inbound::message(BytesMut::from(payload.as_ref()))) {
                 Ok(()) => {
                     let needs_keyframe = accepted_after_gap
                         || (info.keyframe
@@ -3164,7 +3234,7 @@ fn request_video_keyframe(
 fn handle_video_outcome(
     outcome: super::video_datagram::VideoReassemblyOutcome,
     video_stats: &super::video_datagram::VideoReassemblyStats,
-    inbound: &mpsc::Sender<Result<BytesMut, Error>>,
+    inbound: &mpsc::Sender<Inbound>,
     control: &mpsc::Sender<ReliableOutbound>,
     scoped_reference_refresh: bool,
     keyframe_barrier: bool,
@@ -3305,14 +3375,14 @@ fn handle_video_outcome(
 }
 
 async fn report_terminal_error(
-    inbound: &mpsc::Sender<Result<BytesMut, Error>>,
+    inbound: &mpsc::Sender<Inbound>,
     connection: &Connection,
     error: String,
 ) {
     log::warn!("QUIC application transport failed: {error}");
     connection.close(1u32.into(), b"application transport failed");
     let _ = inbound
-        .send(Err(Error::new(ErrorKind::BrokenPipe, error)))
+        .send(Inbound::error(Error::new(ErrorKind::BrokenPipe, error)))
         .await;
 }
 
@@ -4217,7 +4287,7 @@ mod tests {
         let metrics = QuicApplicationMetrics::default();
         let recovery = Mutex::new(VideoReceiveRecovery::default());
         inbound
-            .try_send(Ok(BytesMut::from(&b"occupied"[..])))
+            .try_send(Inbound::message(BytesMut::from(&b"occupied"[..])))
             .unwrap();
 
         let delivery = deliver_video_payload(
@@ -4257,7 +4327,7 @@ mod tests {
             );
         }
         inbound
-            .try_send(Ok(BytesMut::from(&b"occupied"[..])))
+            .try_send(Inbound::message(BytesMut::from(&b"occupied"[..])))
             .unwrap();
 
         let delivery = deliver_video_payload(
@@ -5232,6 +5302,74 @@ mod tests {
         .await
         .unwrap();
         Some((client_stream, server_task.await.unwrap()))
+    }
+
+    /// Port forwarding over QUIC: after `set_raw` the stream carries a tunnel, but session
+    /// messages still arrive on the other channels. A `TestDelay` sent before login (or its
+    /// late answer) was delivered as if it were the tunnel's first bytes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_raw_stream_delivers_only_the_tunnel_bytes() {
+        let Some((client_stream, mut server_stream)) = application_stream_pair().await else {
+            return;
+        };
+        let mut test_delay = Message::new();
+        test_delay.set_test_delay(crate::message_proto::TestDelay {
+            time: 1,
+            ..Default::default()
+        });
+        client_stream
+            .enqueue(Bytes::from(test_delay.write_to_bytes().unwrap()))
+            .unwrap();
+        // The session message is already waiting when both sides switch to the tunnel.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        server_stream.set_raw();
+        client_stream.set_raw();
+        client_stream
+            .enqueue(Bytes::from_static(b"tunnel"))
+            .unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(2), server_stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(&first[..], b"tunnel");
+    }
+
+    /// A tunnel reads its local socket as fast as it can. The control queue holds 128 entries,
+    /// and `enqueue` refused the next chunk: a hole in the tunneled stream for the viewer, the
+    /// end of the tunnel for the host.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_raw_stream_waits_for_room_instead_of_refusing_a_chunk() {
+        const CHUNK: usize = 8 * 1024;
+        const CHUNKS: usize = 2_000;
+        let Some((client_stream, mut server_stream)) = application_stream_pair().await else {
+            return;
+        };
+        client_stream.set_raw();
+        server_stream.set_raw();
+        let reader = tokio::spawn(async move {
+            // Starts late, so that the sender finds the queue full.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let mut received = Vec::with_capacity(CHUNK * CHUNKS);
+            while received.len() < CHUNK * CHUNKS {
+                received.extend_from_slice(&server_stream.next().await.unwrap().unwrap());
+            }
+            received
+        });
+        let mut client = crate::Stream::from_quic(client_stream);
+        for index in 0..CHUNKS {
+            client
+                .send_bytes(Bytes::from(vec![(index % 251) as u8; CHUNK]))
+                .await
+                .unwrap();
+        }
+        let received = tokio::time::timeout(Duration::from_secs(20), reader)
+            .await
+            .unwrap()
+            .unwrap();
+        for (index, chunk) in received.chunks(CHUNK).enumerate() {
+            assert!(chunk.iter().all(|byte| *byte == (index % 251) as u8));
+        }
     }
 
     /// The file channel queue holds 32 messages and is drained at the negotiated file rate, while
