@@ -361,6 +361,11 @@ impl WsFramedStream {
 }
 
 impl WsReadHalf {
+    /// The read half of `WsFramedStream::set_raw`: messages arrive unencrypted.
+    pub fn set_raw(&mut self) {
+        self.decrypt = None;
+    }
+
     pub async fn next(&mut self) -> Option<Result<BytesMut, Error>> {
         while let Some(msg) = self.stream.next().await {
             let msg = match msg {
@@ -398,6 +403,11 @@ impl WsReadHalf {
 }
 
 impl WsWriteHalf {
+    /// The write half of `WsFramedStream::set_raw`: messages leave unencrypted.
+    pub fn set_raw(&mut self) {
+        self.encrypt = None;
+    }
+
     pub async fn send(&mut self, msg: &impl Message) -> ResultType<()> {
         self.send_raw(msg.write_to_bytes()?).await
     }

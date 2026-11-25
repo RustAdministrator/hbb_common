@@ -19,6 +19,12 @@ pub struct LocalTlsIdentity {
 
 impl LocalTlsIdentity {
     pub fn load_or_create(directory: impl AsRef<Path>) -> Result<Self, QuicTransportError> {
+        // The direct server and the first certificate request create the identity at the same
+        // start-up: one creates it, the other loads it.
+        static CREATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _creating = CREATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let directory = directory.as_ref();
         fs::create_dir_all(directory)
             .map_err(|error| QuicTransportError::Configuration(error.to_string()))?;
@@ -117,13 +123,16 @@ fn write_atomic(
     contents: &[u8],
     private: bool,
 ) -> Result<(), QuicTransportError> {
+    // A name of its own for every write: a file left by one that died must not refuse it.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let temporary = directory.join(format!(
-        ".{}.tmp-{}",
+        ".{}.tmp-{}-{}",
         destination
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("identity"),
-        std::process::id()
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let mut file = OpenOptions::new()
         .create_new(true)
@@ -192,6 +201,56 @@ mod tests {
         assert_eq!(second.certificate_bytes(), first_certificate);
         fs::remove_file(directory.join(CERTIFICATE_FILE)).unwrap();
         assert!(LocalTlsIdentity::load_or_create(&directory).is_err());
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A file left by a write that died, under the name this process would use, made the
+    /// identity impossible to create.
+    #[test]
+    fn a_left_temporary_file_does_not_block_the_identity() {
+        let directory = std::env::temp_dir().join(format!(
+            "rustadmin-quic-identity-{}-{}",
+            std::process::id(),
+            crate::rand::random::<u64>()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join(format!(".{}.tmp-{}", CERTIFICATE_FILE, std::process::id())),
+            b"left",
+        )
+        .unwrap();
+        assert!(LocalTlsIdentity::load_or_create(&directory).is_ok());
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// The direct server and the first certificate request create the identity at the same
+    /// start-up. Both must get the one that ends up on disk.
+    #[test]
+    fn identities_created_at_once_are_the_same() {
+        let directory = std::env::temp_dir().join(format!(
+            "rustadmin-quic-identity-{}-{}",
+            std::process::id(),
+            crate::rand::random::<u64>()
+        ));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let directory = directory.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    LocalTlsIdentity::load_or_create(&directory)
+                        .map(|identity| identity.certificate_bytes().to_vec())
+                })
+            })
+            .collect();
+        let certificates: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap().unwrap())
+            .collect();
+        assert!(certificates.windows(2).all(|pair| pair[0] == pair[1]));
+        let on_disk = LocalTlsIdentity::load_or_create(&directory).unwrap();
+        assert_eq!(on_disk.certificate_bytes(), certificates[0]);
         fs::remove_dir_all(&directory).unwrap();
     }
 }

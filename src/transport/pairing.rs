@@ -10,6 +10,17 @@ use std::{
 };
 
 const MAX_PEER_ID_BYTES: usize = 128;
+
+/// A temporary file name of its own for every write: two writes of a record in this process,
+/// or a file left by one that died, must not refuse each other (`create_new`).
+fn temporary_suffix() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
 const MAX_CERTIFICATE_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -154,8 +165,19 @@ impl FileTrustedPeerStore {
             if records.len() >= 4_096 {
                 return Err(PairingError::InvalidRecord);
             }
-            let encoded = fs::read(&path).map_err(PairingError::Io)?;
-            records.push(decode_record(&encoded)?);
+            let record = fs::read(&path)
+                .map_err(PairingError::Io)
+                .and_then(|encoded| decode_record(&encoded));
+            match record {
+                Ok(record) => records.push(record),
+                // Every incoming QUIC connection reads all records: one that cannot be read
+                // must not turn away every peer. Its peer is unknown until paired again.
+                Err(error) => log::warn!(
+                    "trusted peer record {} skipped: {:?}",
+                    path.display(),
+                    error
+                ),
+            }
         }
         records.sort_by(|left, right| left.peer_id.cmp(&right.peer_id));
         Ok(records)
@@ -234,7 +256,7 @@ impl FileTrustedPeerStore {
         let persisted = PersistedTrustedPeer::from_record(&record);
         let encoded =
             serde_json::to_vec_pretty(&persisted).map_err(|_| PairingError::InvalidRecord)?;
-        let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+        let temporary = path.with_extension(temporary_suffix());
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -468,6 +490,63 @@ mod tests {
         let records = store.load_all().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].peer_id, "peer-1");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Every incoming QUIC connection reads all trusted peers; one truncated record made the
+    /// whole read fail, and with it every incoming QUIC session, paired or not.
+    #[test]
+    fn a_corrupt_record_does_not_hide_the_others() {
+        let directory = std::env::temp_dir().join(format!(
+            "rustadmin-quic-trust-{}-{}",
+            std::process::id(),
+            crate::rand::random::<u64>()
+        ));
+        let mut store = FileTrustedPeerStore::new(&directory).unwrap();
+        let candidate = candidate();
+        store
+            .insert(
+                candidate
+                    .clone()
+                    .confirm(&candidate.fingerprint(), 1)
+                    .unwrap(),
+            )
+            .unwrap();
+        fs::write(directory.join("truncated.json"), b"{\"peer_id\": \"pe").unwrap();
+        fs::write(directory.join("empty.json"), b"").unwrap();
+        let records = store.load_all().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].peer_id, "peer-1");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// The temporary file of a record was named after the process only: a second write of the
+    /// same record in this process, or a file left by a write that died, made every later
+    /// write fail.
+    #[test]
+    fn a_left_temporary_file_does_not_block_the_record() {
+        let directory = std::env::temp_dir().join(format!(
+            "rustadmin-quic-trust-{}-{}",
+            std::process::id(),
+            crate::rand::random::<u64>()
+        ));
+        let mut store = FileTrustedPeerStore::new(&directory).unwrap();
+        let path = store.record_path("peer-1").unwrap();
+        fs::write(
+            path.with_extension(format!("tmp-{}", std::process::id())),
+            b"left",
+        )
+        .unwrap();
+        let candidate = candidate();
+        store
+            .insert(
+                candidate
+                    .clone()
+                    .confirm(&candidate.fingerprint(), 1)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(store.load_all().unwrap().len(), 1);
         fs::remove_dir_all(directory).unwrap();
     }
 
